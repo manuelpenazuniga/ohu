@@ -73,12 +73,12 @@ Rail B, no escrow.
 ## Tests (offline, reproducible desde clon limpio)
 
 ```bash
-pnpm --filter @ohu/agents test   # 5 archivos, 14 tests (verdes)
+pnpm --filter @ohu/agents test   # 5 archivos, 18 tests (verdes)
 ```
 
 - `x402-402-shape.test.ts` — 402 con `PAYMENT-REQUIRED` sobre el token CEP-18 (Rail B), asset ≠ OhuVault.
 - `x402-paid-flow.test.ts` — flujo 402→firma→settle→recurso; **negativo**: firma inválida (facilitator la rechaza) no sirve reputación.
-- `x402-failover-facilitator.test.ts` — el **fallback local** reemplaza al hosteado caído.
+- `x402-failover-facilitator.test.ts` — el **fallback local** reemplaza al hosteado caído para `verify`/`getSupported`; **S4-b**: `settle` NO reintenta en el fallback (anti-doble-pago) y propaga el error etiquetado.
 - `x402-non-escrow-invariant.test.ts` — INV-4: config rechaza asset==OhuVault; el recurso es reputación sin entrypoints de escrow.
 
 La verificación **on-chain** (settle real en Testnet, visible en CSPR.cloud) es
@@ -86,10 +86,45 @@ manual y requiere material fuera de git (cuentas fondeadas + token CEP-18); los
 tests CI validan la forma del flujo, los invariantes y el fallback sin tocar la
 red.
 
+## Idempotencia de `settle` (S4-b) — anti-doble-pago
+
+`FailoverFacilitatorClient.settle` **NO reintenta en el fallback**. Solo
+`verify` y `getSupported` hacen failover. Motivo:
+
+- `settle` emite un deploy `transfer_with_authorization` on-chain y *espera* la
+  confirmación. Si el primario **ya envió** el deploy y muere devolviendo la
+  respuesta (timeout/crash/5xx tardío), reintentar el **mismo** payload contra
+  el facilitator local dispararía un segundo deploy con la misma autorización.
+- El mensaje EIP-712 `TransferWithAuthorization` incluye `nonce` (32 bytes) +
+  `validBefore`/`validAfter`. El `verify` del `ExactCasperScheme`
+  (`@make-software/casper-x402` 1.0.0) rechaza `validBefore` vencido o con < 6 s
+  de ventana (frescura) y exige `nonce` de 32 bytes — pero el `validBefore` no
+  vence entre el primer y el segundo settle (misma ventana de minutos): NO
+  protege contra replay dentro de la ventana.
+- La unicidad del nonce la impone el **contrato CEP-18 asset** dentro de su
+  entry point `transfer_with_authorization` (patrón ERC-3009). Se verificó que
+  el `Cep18X402.wasm` que shippea `make-software/casper-x402`
+  (`infra/local/deployer/`) mantiene un diccionario `used_nonces` y emite
+  `event_AuthorizationUsed` — para **ese** token un segundo settle con la misma
+  autorización reverte on-chain. PERO esta garantía es **dependiente del
+  contrato asset desplegado**, no del facilitator; no se asume a esta capa.
+- Regla de seguridad tomada (alineada con el brief S4-b): **ante la duda, no
+  reintentar settle**. La capa superior reintenta **idempotente** con una
+  autorización **nueva** (nonce aleatorio + `validBefore` fresco). Es preferible
+  un pago que se reintenta arriba a un doble pago.
+
+El error que propaga `settle` se etiqueta `FailoverFacilitatorClient(settle)`
+con el mensaje del primario y `cause` preservando la excepción original (ver
+`agents/src/x402/failover-client.ts` y `agents/test/x402-failover-facilitator.test.ts`).
+
 ## TODO(audit)
 
 - Verificar `limitedPaymentMotes` por defecto del facilitator contra la
   tarifa vigente de Testnet (`FACILITATOR_PAYMENT_MOTES`) al correr la demo live.
-- Confirmar que el `ExactCasperScheme` facilitator exige `validBefore` fresco
-  (anti-replay) y que el nonce es único por `transfer_with_authorization` —
-  depende de `casper-eip-712`/`casper-x402`, no asumido en este spike.
+- **S4-b (abierto):** al desplegar la demo live, confirmar on-chain (CSPR.cloud)
+  que el `ASSET_PACKAGE` usado reverte un segundo `transfer_with_authorization`
+  con el mismo nonce (inspeccionar el `used_nonces` del contrato desplegado
+  — p.ej. con el `Cep18X402.wasm` de `make-software/casper-x402`). Confirmado
+  eso, evaluar relajar `settle` a un reintento **solo tras error demostrablemente
+  anterior al `putTransaction`**; mientras tanto, settle no reintenta en el
+  fallback (decisión S4-b, ya implementada y testeada).
