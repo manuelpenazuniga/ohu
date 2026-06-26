@@ -55,6 +55,8 @@ Casper AI Toolkit https://www.casper.network/ai
 - Corre el build y los tests (just build && just test, o el equivalente) y déjalos en verde antes
   de declarar la tarea lista.
 - No metas lógica de otras tareas. No toques los invariantes.
+- HAZ COMMIT de tu trabajo en tu rama (git add -A && git commit) — NO dejes cambios sin commitear:
+  si no commiteas, tu trabajo se MEZCLA con el de otros agentes en el mismo working tree.
 - Al terminar, RESUME: qué hiciste, qué tests pasan, y cada TODO(audit) que dejaste pendiente.
 
 == SERÁS AUDITADO CONTRA ==
