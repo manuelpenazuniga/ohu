@@ -1,0 +1,16 @@
+{
+  "name": "@ohu/web",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Ohu web dashboard (placeholder for Fase 3)",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "vitest": "4.1.9",
+    "vite": "8.1.0"
+  }
+}

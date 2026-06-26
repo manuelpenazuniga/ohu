@@ -1,0 +1,6 @@
+packages:
+  - 'agents'
+  - 'web'
+allowBuilds:
+  esbuild: true
+verifyDepsBeforeRun: false

@@ -1,2 +1,26 @@
 # Ideación / historial de brainstorming — no versionado
 docs/brainstorming/
+
+# Secrets
+.env
+.env.*.local
+
+# Rust build artifacts
+contracts/target/
+contracts/wasm/
+**/target/
+*.wasm
+
+# Node / pnpm
+node_modules/
+**/dist/
+**/.turbo/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
