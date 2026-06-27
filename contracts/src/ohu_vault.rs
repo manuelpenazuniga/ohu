@@ -21,16 +21,31 @@
 //! `execute` (admin). Ningún paso mueve capital hasta `execute`, y `execute`
 //! está doblemente gateado (caller admin + M-de-N on-chain).
 //!
-//! ### Defensa en profundidad (dos capas de co-firma)
-//! 1. **Capa nativa (off-chain):** la cuenta `admin` es un multisig Casper
-//!    (associated keys + threshold). Firmar el deploy de `execute` requiere
-//!    co-firma off-chain. Configurada en `infra/scripts/setup_admin_account.sh`.
-//! 2. **Capa on-chain (este contrato):** `execute` exige M aprobaciones
-//!    **distintas** registradas en el contrato, independientes del threshold
-//!    nativo. Sobrevive aunque el admin sea una clave única.
+//! ### Defensa en profundidad
+//! 1. **Capa on-chain (este contrato, activa):** `execute` exige M aprobaciones
+//!    **distintas** registradas en el contrato. Adicionalmente, `route_micropayment`
+//!    tiene dos topes: por llamada (`micropayment_cap`) y acumulado por ventana de
+//!    epoch (`epoch_cap`) — el acumulado es lo que materializa INV-1 en el contrato.
+//! 2. **Capa nativa (off-chain): TODO(audit)** — la cuenta `admin` debería ser
+//!    un multisig Casper (associated keys + deployment threshold > peso individual)
+//!    para forzar co-firma en cada deploy de `execute`. Ver
+//!    `infra/scripts/setup_admin_account.sh`. Actualmente el script no opera
+//!    porque falta `KEYS_MANAGER_WASM`; la capa nativa está en pausa hasta
+//!    resolver ese TODO. Mientras tanto, la capa on-chain (este contrato) es la
+//!    única defensa activa.
 //!
 //! Invariantes aplicables: INV-1, INV-2 (la aritmética de aprobaciones es la
 //! condición on-chain), INV-3, INV-4. INV-5/INV-6 entran en S3.
+//!
+//! ## TODO(audit) — diferidos de la auditoría
+//! - Rotación/remoción de approvers post-init (hoy son inmutables; riesgo si
+//!   una clave se compromete).
+//! - Expiry de proposals (un request aprobado pero sin fondos del vault queda
+//!   abierto indefinidamente).
+//! - Limpieza de storage post-`execute` (`request_recipient`, `request_amount`,
+//!   `has_approved`, `approval_count` permanecen sin liberar).
+//! - Binding de `approve` a `(recipient, amount)` (hoy solo recibe `request_id`;
+//!   el approver no firma criptográficamente el destino y monto).
 
 use odra::casper_types::U512;
 use odra::prelude::*;
@@ -68,6 +83,14 @@ pub enum Error {
     NotAnAccount = 13,
     /// La lista de approvers contiene duplicados.
     DuplicateApprover = 14,
+    /// El total acumulado en la ventana de epoch supera el `epoch_cap` (INV-1).
+    EpochCapExceeded = 15,
+    /// El parámetro `epoch_window_ms` debe ser > 0.
+    InvalidEpochWindow = 16,
+    /// `admin` no puede ser approver (separación de roles).
+    AdminIsApprover = 17,
+    /// Demasiados approvers (máx 255, por `approval_count: u8`).
+    ApproversTooMany = 18,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -123,6 +146,14 @@ pub struct OhuVault {
     operator: Var<Address>,
     /// Tope de motes por llamada a `route_micropayment` (INV-1).
     micropayment_cap: Var<U512>,
+    /// Tope acumulado de motes en la ventana de epoch (INV-1, capa on-chain).
+    epoch_cap: Var<U512>,
+    /// Ventana del epoch en milisegundos (`get_block_time()`).
+    epoch_window_ms: Var<u64>,
+    /// Marca de tiempo de inicio de la ventana actual.
+    window_start: Var<u64>,
+    /// Total acumulado de motes enrutados en la ventana actual.
+    accumulated: Var<U512>,
     /// M: número de aprobaciones **distintas** requeridas para `execute`.
     required_approvals: Var<u8>,
     /// Miembros del conjunto de firmantes M-de-N.
@@ -145,16 +176,19 @@ pub struct OhuVault {
 impl OhuVault {
     /// Inicializa el vault con el modelo de seguridad de S2.
     ///
-    /// Valida (revert `InvalidSetup`/`NotAnAccount`/`DuplicateApprover`):
+    /// Valida (revert con error específico):
     /// - `admin` y `operator` son cuentas (no contratos) y distintos entre sí.
+    /// - `admin` no está en `approvers` (separación: quien ejecuta no vota).
     /// - `operator` no está en `approvers` (separación de roles del agente).
-    /// - `approvers` no vacío, sin duplicados, todos cuentas.
+    /// - `approvers` no vacío, sin duplicados, todos cuentas, ≤ 255.
     /// - `required_approvals` en `[1, approvers.len()]`.
-    /// - `micropayment_cap > 0`.
+    /// - `micropayment_cap > 0`, `epoch_cap > 0`, `epoch_window_ms > 0`.
+    /// - El contador de epoch arranca en el bloque actual.
     ///
     /// TODO(audit): verificar contra <https://odra.dev/docs/basics/native-token>
     /// si para S2+ se requiere un purse secundario aislado. El purse principal
     /// (creado por el runtime) basta para este spike.
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         &mut self,
         admin: Address,
@@ -162,6 +196,8 @@ impl OhuVault {
         approvers: Vec<Address>,
         required_approvals: u8,
         micropayment_cap: U512,
+        epoch_cap: U512,
+        epoch_window_ms: u64,
     ) {
         if admin.is_contract() || operator.is_contract() {
             self.env().revert(Error::NotAnAccount);
@@ -172,11 +208,20 @@ impl OhuVault {
         if approvers.is_empty() {
             self.env().revert(Error::InvalidSetup);
         }
+        if approvers.len() > u8::MAX as usize {
+            self.env().revert(Error::ApproversTooMany);
+        }
         if required_approvals == 0 || (required_approvals as usize) > approvers.len() {
             self.env().revert(Error::InvalidSetup);
         }
         if micropayment_cap == U512::zero() {
             self.env().revert(Error::InvalidSetup);
+        }
+        if epoch_cap == U512::zero() {
+            self.env().revert(Error::InvalidSetup);
+        }
+        if epoch_window_ms == 0 {
+            self.env().revert(Error::InvalidEpochWindow);
         }
 
         for i in 0..approvers.len() {
@@ -186,6 +231,9 @@ impl OhuVault {
             }
             if a == operator {
                 self.env().revert(Error::InvalidSetup);
+            }
+            if a == admin {
+                self.env().revert(Error::AdminIsApprover);
             }
             for j in (i + 1)..approvers.len() {
                 if approvers[i] == approvers[j] {
@@ -198,6 +246,12 @@ impl OhuVault {
         self.admin.set(admin);
         self.operator.set(operator);
         self.micropayment_cap.set(micropayment_cap);
+        self.epoch_cap.set(epoch_cap);
+        self.epoch_window_ms.set(epoch_window_ms);
+        // TODO(audit): confirmar que `get_block_time()` funciona durante el
+        // deploy (está documentado en Odra 2.8.2). Ver <https://odra.dev/docs/>.
+        self.window_start.set(self.env().get_block_time());
+        self.accumulated.set(U512::zero());
         self.required_approvals.set(required_approvals);
         self.next_request_id.set(0u64);
     }
@@ -224,23 +278,23 @@ impl OhuVault {
     /// Gates:
     /// - `caller == operator`.
     /// - `0 < amount <= micropayment_cap` (tope **por llamada**).
+    /// - `recipient` debe ser cuenta, no contrato (consistencia con release).
+    /// - `accumulated + amount <= epoch_cap` (tope **acumulado on-chain** por
+    ///   ventana de epoch — esto es lo que materializa INV-1 en el contrato).
     /// - `amount <= self_balance`.
     ///
-    /// No hay estado mutable post-transfer que un hipotético callback podría
-    /// corromper, y `caller` se re-chequea en cada entrada (un reentrante
-    /// tendría como caller al contrato receptor, no al `operator`). Ver nota de
-    /// reentrancia en `execute`.
-    ///
-    /// El tope es **por llamada** (definición de INV-1): no existe un path que
-    /// mueva más que `micropayment_cap` en una sola invocación. Un operator
-    /// comprometido podría emitir muchas llamadas acotadas; acotar el daño
-    /// acumulado es responsabilidad off-chain (cap pequeño + monitoring de
-    /// `MicropaymentRouted` en CSPR.cloud), no un invariante de contrato.
+    /// La ventana de epoch se mide con `get_block_time()` (ms): cuando el bloque
+    /// actual ≥ `window_start + epoch_window_ms`, la ventana se resetea y el
+    /// contador acumulado vuelve a cero. Esto acota el daño incluso si el
+    /// operator se comporta maliciosamente y emite muchas llamadas.
     ///
     /// TODO(audit): confirmar contra los docs de Casper que
     /// `transfer_tokens` es un *balance move* sin callback al receptor (sí lo
     /// es en el runtime de Casper). Mientras tanto, `execute` aplica CEI por
     /// defensa en profundidad.
+    /// TODO(audit): `get_block_time()` está documentado en Odra 2.8.2; confirmar
+    /// que la resolución en Testnet es suficiente para ventanas de epoch de
+    /// ~minutos/horas. Ver <https://odra.dev/docs/>.
     pub fn route_micropayment(&mut self, recipient: Address, amount: U512) {
         let caller = self.env().caller();
         let operator = self.operator.get_or_revert_with(Error::NotInitialized);
@@ -256,12 +310,37 @@ impl OhuVault {
         if amount > cap {
             self.env().revert(Error::CapExceeded);
         }
+        if recipient.is_contract() {
+            self.env().revert(Error::NotAnAccount);
+        }
+
+        // --- Epoch window: cap acumulado on-chain (INV-1) ---
+        let epoch_cap = self.epoch_cap.get_or_revert_with(Error::NotInitialized);
+        let epoch_window_ms = self
+            .epoch_window_ms
+            .get_or_revert_with(Error::NotInitialized);
+        let mut window_start = self.window_start.get_or_revert_with(Error::NotInitialized);
+        let mut accumulated = self.accumulated.get_or_revert_with(Error::NotInitialized);
+        let now = self.env().get_block_time();
+
+        if now >= window_start + epoch_window_ms {
+            window_start = now;
+            accumulated = U512::zero();
+            self.window_start.set(window_start);
+        }
+
+        let new_accumulated = accumulated + amount;
+        if new_accumulated > epoch_cap {
+            self.env().revert(Error::EpochCapExceeded);
+        }
+
         let balance = self.env().self_balance();
         if amount > balance {
             self.env().revert(Error::InsufficientBalance);
         }
 
         self.env().transfer_tokens(&recipient, &amount);
+        self.accumulated.set(new_accumulated);
         self.env().emit_event(MicropaymentRouted {
             operator: caller,
             recipient,
@@ -415,6 +494,22 @@ impl OhuVault {
             .get_or_revert_with(Error::NotInitialized)
     }
 
+    /// Tope acumulado por ventana de epoch para `route_micropayment`.
+    pub fn epoch_cap(&self) -> U512 {
+        self.epoch_cap.get_or_revert_with(Error::NotInitialized)
+    }
+
+    /// Ventana del epoch en milisegundos.
+    pub fn epoch_window_ms(&self) -> u64 {
+        self.epoch_window_ms
+            .get_or_revert_with(Error::NotInitialized)
+    }
+
+    /// Total acumulado en la ventana de epoch actual.
+    pub fn accumulated(&self) -> U512 {
+        self.accumulated.get_or_revert_with(Error::NotInitialized)
+    }
+
     /// M (aprobaciones distintas requeridas).
     pub fn required_approvals(&self) -> u8 {
         self.required_approvals
@@ -466,7 +561,8 @@ mod tests {
     const ONE_CSPR: u64 = 1_000_000_000;
 
     /// Fixture: admin=acct0, operator=acct1, approvers=acct2..4 (M=2),
-    /// cap=1 CSPR/llamada, depositor=acct5. Vault fondeado con 100 CSPR.
+    /// cap=1 CSPR/llamada, epoch_cap=5 CSPR/ventana, depositor=acct5.
+    /// Vault fondeado con 100 CSPR.
     struct Fixture {
         contract: OhuVaultHostRef,
         env: HostEnv,
@@ -478,13 +574,15 @@ mod tests {
         depositor: Address,
         recipient: Address,
         cap: U512,
+        epoch_cap: U512,
+        epoch_window_ms: u64,
     }
 
     fn setup() -> Fixture {
-        setup_with(U512::from(ONE_CSPR), 2)
+        setup_with(U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000)
     }
 
-    fn setup_with(cap: U512, required: u8) -> Fixture {
+    fn setup_with(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64) -> Fixture {
         let env = odra_test::env();
         let admin = env.get_account(0);
         let operator = env.get_account(1);
@@ -502,6 +600,8 @@ mod tests {
                 approvers: vec![approver0, approver1, approver2],
                 required_approvals: required,
                 micropayment_cap: cap,
+                epoch_cap,
+                epoch_window_ms,
             },
         );
 
@@ -520,6 +620,8 @@ mod tests {
             depositor,
             recipient,
             cap,
+            epoch_cap,
+            epoch_window_ms,
         }
     }
 
@@ -842,7 +944,161 @@ mod tests {
         assert!(!f.contract.request_executed(id));
     }
 
-    // ---- Proposed events y flujo de eventos ----
+    // ---- Micropayment: validaciones nuevas ----
+
+    #[test]
+    fn route_micropayment_zero_amount_reverts() {
+        let mut f = setup();
+        f.env.set_caller(f.operator);
+        let result = f.contract.try_route_micropayment(f.recipient, U512::zero());
+        assert_eq!(result.unwrap_err(), Error::ZeroAmount.into());
+        assert_eq!(f.env.balance_of(&f.contract), U512::from(100 * ONE_CSPR));
+    }
+
+    #[test]
+    fn route_micropayment_insufficient_balance_reverts() {
+        let mut f = setup_with(
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(10 * ONE_CSPR), // epoch_cap holgado
+            3_600_000,
+        );
+        // Vacía el vault con una transferencia grande vía M-de-N
+        f.env.set_caller(f.admin);
+        let id = f
+            .contract
+            .propose_withdraw(f.recipient, U512::from(99 * ONE_CSPR));
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id);
+        f.env.set_caller(f.admin);
+        f.contract.execute(id);
+        // Queda ~1 CSPR. Usamos el cap (1 CSPR) → ok.
+        f.env.set_caller(f.operator);
+        f.contract
+            .route_micropayment(f.recipient, U512::from(ONE_CSPR));
+        // Ahora el vault está prácticamente vacío; el siguiente revierte.
+        let result = f
+            .contract
+            .try_route_micropayment(f.recipient, U512::from(ONE_CSPR));
+        assert_eq!(result.unwrap_err(), Error::InsufficientBalance.into());
+    }
+
+    #[test]
+    fn route_micropayment_to_contract_reverts() {
+        let mut f = setup();
+        // El propio vault es un contrato: `is_contract()` devuelve true.
+        let vault_addr = f.contract.contract_address();
+        f.env.set_caller(f.operator);
+        let result = f.contract.try_route_micropayment(vault_addr, U512::one());
+        assert_eq!(result.unwrap_err(), Error::NotAnAccount.into());
+    }
+
+    // ---- Epoch cap acumulado (INV-1 on-chain) ----
+
+    #[test]
+    fn operator_routes_two_micropayments_within_epoch_cap_succeeds() {
+        let mut f = setup(); // cap=1 CSPR/llamada, epoch_cap=5 CSPR
+        let amount = U512::from(ONE_CSPR);
+        let recipient_before = f.env.balance_of(&f.recipient);
+
+        f.env.set_caller(f.operator);
+        f.contract.route_micropayment(f.recipient, amount);
+        f.contract.route_micropayment(f.recipient, amount); // 2ª llamada, acumulado=2 <= 5
+
+        assert_eq!(
+            f.env.balance_of(&f.recipient),
+            recipient_before + U512::from(2 * ONE_CSPR)
+        );
+    }
+
+    #[test]
+    fn operator_third_micropayment_exceeds_epoch_cap_reverts() {
+        let mut f = setup_with(
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(2 * ONE_CSPR), // epoch_cap = 2 CSPR
+            3_600_000,
+        );
+        let amount = U512::from(ONE_CSPR);
+        let recipient_before = f.env.balance_of(&f.recipient);
+
+        f.env.set_caller(f.operator);
+        f.contract.route_micropayment(f.recipient, amount); // acumulado=1
+        f.contract.route_micropayment(f.recipient, amount); // acumulado=2, justo en el tope
+
+        // La tercera llamada haría acumulado=3 > epoch_cap=2 → revierte.
+        let result = f.contract.try_route_micropayment(f.recipient, amount);
+        assert_eq!(result.unwrap_err(), Error::EpochCapExceeded.into());
+        // La tercera no aplicó: balance del destinatario no cambió más.
+        assert_eq!(
+            f.env.balance_of(&f.recipient),
+            recipient_before + U512::from(2 * ONE_CSPR)
+        );
+    }
+
+    #[test]
+    fn epoch_resets_after_window_allows_new_micropayment() {
+        let mut f = setup_with(
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(ONE_CSPR), // epoch_cap = 1 CSPR
+            60_000,               // ventana corta: 60s (60000 ms)
+        );
+        let amount = U512::from(ONE_CSPR);
+        let recipient_before = f.env.balance_of(&f.recipient);
+
+        f.env.set_caller(f.operator);
+        f.contract.route_micropayment(f.recipient, amount);
+        // acumulado == epoch_cap == 1 CSPR → siguiente debe revertir.
+
+        let result = f.contract.try_route_micropayment(f.recipient, amount);
+        assert_eq!(result.unwrap_err(), Error::EpochCapExceeded.into());
+
+        // Avanzar el tiempo de bloque más allá de la ventana.
+        f.env.advance_block_time(60_001);
+
+        // Ahora la ventana se resetea: acumulado vuelve a 0.
+        f.contract.route_micropayment(f.recipient, amount);
+
+        assert_eq!(
+            f.env.balance_of(&f.recipient),
+            recipient_before + U512::from(2 * ONE_CSPR)
+        );
+    }
+
+    // ---- propose_withdraw: validaciones nuevas ----
+
+    #[test]
+    fn propose_withdraw_by_random_caller_reverts() {
+        let mut f = setup();
+        let random = f.env.get_account(9);
+        f.env.set_caller(random);
+        let result = f
+            .contract
+            .try_propose_withdraw(f.recipient, U512::from(5 * ONE_CSPR));
+        assert_eq!(result.unwrap_err(), Error::NotApprover.into());
+    }
+
+    #[test]
+    fn propose_withdraw_zero_amount_reverts() {
+        let mut f = setup();
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_propose_withdraw(f.recipient, U512::zero());
+        assert_eq!(result.unwrap_err(), Error::ZeroAmount.into());
+    }
+
+    #[test]
+    fn propose_withdraw_contract_recipient_reverts() {
+        let mut f = setup();
+        let vault_addr = f.contract.contract_address();
+        f.env.set_caller(f.admin);
+        let result = f
+            .contract
+            .try_propose_withdraw(vault_addr, U512::from(5 * ONE_CSPR));
+        assert_eq!(result.unwrap_err(), Error::NotAnAccount.into());
+    }
 
     #[test]
     fn propose_and_approve_emit_expected_events() {
@@ -889,6 +1145,8 @@ mod tests {
                 approvers: vec![env.get_account(2), env.get_account(3)],
                 required_approvals: 1,
                 micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -907,6 +1165,8 @@ mod tests {
                 approvers: vec![operator, env.get_account(3)],
                 required_approvals: 1,
                 micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -926,6 +1186,8 @@ mod tests {
                 approvers: vec![approver, approver],
                 required_approvals: 1,
                 micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::DuplicateApprover.into());
@@ -942,6 +1204,8 @@ mod tests {
                 approvers: vec![env.get_account(2), env.get_account(3)],
                 required_approvals: 0,
                 micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -958,6 +1222,8 @@ mod tests {
                 approvers: vec![env.get_account(2), env.get_account(3)],
                 required_approvals: 3,
                 micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -974,6 +1240,8 @@ mod tests {
                 approvers: vec![],
                 required_approvals: 1,
                 micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -990,9 +1258,89 @@ mod tests {
                 approvers: vec![env.get_account(2), env.get_account(3)],
                 required_approvals: 1,
                 micropayment_cap: U512::zero(),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
+    }
+
+    // ---- Init: validaciones nuevas post-auditoría (S2) ----
+
+    #[test]
+    fn init_reverts_when_zero_epoch_cap() {
+        let env = odra_test::env();
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin: env.get_account(0),
+                operator: env.get_account(1),
+                approvers: vec![env.get_account(2), env.get_account(3)],
+                required_approvals: 1,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::zero(),
+                epoch_window_ms: 3_600_000,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
+    }
+
+    #[test]
+    fn init_reverts_when_zero_epoch_window() {
+        let env = odra_test::env();
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin: env.get_account(0),
+                operator: env.get_account(1),
+                approvers: vec![env.get_account(2), env.get_account(3)],
+                required_approvals: 1,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 0,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::InvalidEpochWindow.into());
+    }
+
+    #[test]
+    fn init_reverts_when_admin_is_approver() {
+        let env = odra_test::env();
+        let admin = env.get_account(0);
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin,
+                operator: env.get_account(1),
+                approvers: vec![admin, env.get_account(3)],
+                required_approvals: 1,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::AdminIsApprover.into());
+    }
+
+    #[test]
+    fn init_reverts_when_too_many_approvers() {
+        let env = odra_test::env();
+        let one = env.get_account(0);
+        // El check de longitud (>255) ocurre antes que el de duplicados.
+        let many_approvers: Vec<Address> = vec![one; 256];
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin: env.get_account(0),
+                operator: env.get_account(1),
+                approvers: many_approvers,
+                required_approvals: 200,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::ApproversTooMany.into());
     }
 
     // ===============================================================
@@ -1032,6 +1380,9 @@ mod tests {
         assert_eq!(f.contract.admin(), f.admin);
         assert_eq!(f.contract.operator(), f.operator);
         assert_eq!(f.contract.micropayment_cap(), f.cap);
+        assert_eq!(f.contract.epoch_cap(), f.epoch_cap);
+        assert_eq!(f.contract.epoch_window_ms(), f.epoch_window_ms);
+        assert_eq!(f.contract.accumulated(), U512::zero());
         assert_eq!(f.contract.required_approvals(), 2);
         assert!(f.contract.is_approver(f.approver0));
         assert!(f.contract.is_approver(f.approver1));
