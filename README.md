@@ -1,8 +1,11 @@
-# Ohu — Fase 0 (S0 + S1)
+# Ohu — Fase 0 (S0 + S1 + S2)
 
 > Ohu = agentic cooperative procurement + parametric mutual en Casper Testnet.
 > Este repositorio es la **Fase 0 (de-risk)**. S0 entregó el esqueleto
-> reproducible; S1 añade `OhuVault`, el ladrillo base de custodia en `purse`.
+> reproducible; S1 añadió `OhuVault`, el ladrillo base de custodia en `purse`;
+> **S2 añade el modelo de seguridad "el agente no drena" (INV-1)**: cuenta
+> admin (multisig nativo) + cuenta operator con entrypoint capado + releases
+> grandes gateados por `caller==admin` + aprobación M-de-N on-chain.
 
 ## Layout
 
@@ -67,25 +70,60 @@ El Makefile es un fallback si `just` no está instalado.
 
 ### `OhuVault` (`contracts/src/ohu_vault.rs`)
 
-Custodia en `purse` del contrato (sin Addressable Entity):
+Custodia en `purse` del contrato (sin Addressable Entity, INV-3) con el modelo
+de seguridad de S2 (INV-1). Tres roles on-chain, todos **cuentas**:
 
-- `deposit()` — recibe CSPR en el purse del contrato (`#[odra(payable)]`).
-- `withdraw_to(recipient, amount)` — **temporalmente abierto** en S1 para el
-  test E2E; S2 lo cerrará tras `caller == admin` + aprobación M-de-N.
-- `balance()` — saldo actual del purse.
-- Emite eventos `Deposit` y `Withdraw` (visibles en CSPR.cloud).
+- **`admin`** — ejecuta los releases grandes (`execute`; `caller == admin`).
+  En Testnet es además un multisig nativo (associated keys + deployment
+  threshold alto) → co-firma off-chain para siquiera submitir `execute`.
+- **`operator`** (agente/LLM) — solo puede llamar `route_micropayment`, con
+  **tope por llamada** (`micropayment_cap`). No puede proponer, aprobar ni
+  ejecutar.
+- **`approvers`** — firmantes M-de-N que `approve(id)` un release.
 
-> Ver los `TODO(S2)` y `TODO(audit)` en el código para los próximos pasos.
+Entry points:
+
+- `init(admin, operator, approvers, required_approvals, micropayment_cap)` —
+  valida el setup (admin≠operator, approvers distintos y no contienen al
+  operator, `required_approvals ∈ [1, len(approvers)]`, cap>0).
+- `deposit()` — `#[odra(payable)]`; cualquiera puede fondear el vault.
+- `route_micropayment(recipient, amount)` — **capado**: solo `operator`,
+  `0 < amount ≤ micropayment_cap`. Emite `MicropaymentRouted`.
+- `propose_withdraw(recipient, amount) -> u64` — solo admin o approvers (no el
+  operator). No mueve capital. Emite `WithdrawProposed`.
+- `approve(request_id)` — solo approvers; un approver no aprueba dos veces la
+  misma solicitud (`AlreadyApproved`), garantizando aprobaciones **distintas**.
+  Emite `WithdrawApproved`.
+- `execute(request_id)` — **doble gate**: `caller == admin` **+**
+  `approval_count ≥ required_approvals`. Aplica checks-effects-interactions
+  (marca `request_executed` antes de la transferencia). Emite `WithdrawExecuted`.
+- Getters: `balance`, `admin`, `operator`, `micropayment_cap`,
+  `required_approvals`, `is_approver`, `approval_count`, `request_executed`,
+  `request_recipient`, `request_amount`.
+
+Eventos (`Deposit`, `MicropaymentRouted`, `WithdrawProposed`, `WithdrawApproved`,
+`WithdrawExecuted`) visibles en CSPR.cloud.
+
+> Defensa en profundidad: (1) multisig nativo del admin (off-chain) fuerza
+> co-firma para deployar; (2) el contrato exige M aprobaciones **distintas**
+> on-chain. Sobrevive aunque el admin sea una clave única.
+> Ver los `TODO(audit)` en el código para los próximos pasos (S3: atestaciones
+> EIP-712; purse secundario; indexación de eventos en CSPR.cloud).
 
 ## Deploy a Testnet
 
 ```bash
+# 1. (Recomendado) configura la cuenta admin como multisig nativo
+#    (associated keys + weights + deployment threshold). Plan + recipe en:
+bash infra/scripts/setup_admin_account.sh
+
+# 2. Deploya OhuVault con los init args de S2
 just deploy
 ```
 
-Requiere `.env` configurado. El script de deploy despliega `OhuVault`; la
-configuración de cuentas admin/agente para S2 está documentada en
-`infra/scripts/deploy.sh`.
+Requiere `.env` configurado. El deploy de `OhuVault` pasa los init args
+(`admin`, `operator`, `approvers`, `required_approvals`, `micropayment_cap`)
+definidos en `.env`; un setup inválido revierte on-chain con `Error::InvalidSetup`.
 
 ## CI
 
@@ -99,8 +137,12 @@ GitHub Actions corre:
 ## Notas de seguridad / auditoría
 
 - Ningún secreto se commitea: `.env` está en `.gitignore`.
-- S1 mueve capital real en testnet: `OhuVault` custodia CSPR en su `purse`.
-- `withdraw_to` está abierto temporalmente; S2 añade el gating de admin+M-de-N.
+- S1/S2 mueven capital real en testnet: `OhuVault` custodia CSPR en su `purse`.
+- **S2 / INV-1**: el `operator` (agente) solo puede llamar `route_micropayment`
+  (tope por llamada); los releases grandes exigen `caller == admin` + M
+  aprobaciones **distintas** on-chain, y la cuenta `admin` es a su vez un
+  multisig nativo (co-firma off-chain). Tests negativos en
+  `contracts/src/ohu_vault.rs` prueban que el agente **no** puede drenar.
 - Los invariantes INV-1…INV-6 se aplican desde S1 en adelante.
 
 ## S4 — Riel B (x402)
