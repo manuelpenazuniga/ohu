@@ -33,7 +33,9 @@
 | 📚 **Contexto largo / multi-archivo** | **MiniMax M3** | leer todo el spec, refactors amplios, orquestación |
 | 🔁 **Reserva / segunda opinión** | GLM-5.1, MiMo-V2.5-Pro, MiniMax M2.7, Qwen3.7 Plus | rotación para auditoría cruzada |
 
-**Regla de auditoría:** el modelo auditor ≠ el modelo implementador. Si DeepSeek V4 Pro implementó S2, audita Qwen3.7 Max (y yo encima).
+**Fuente de verdad del routing:** `docs/plan/model-routing.md` (derivado del bench) **gobierna** las asignaciones. Corrección clave post-bench: **contratos que tocan fondos (S2, S3, mutual) = web3-crítico → GLM-5.2** (no el genérico de "razonamiento → DeepSeek/Qwen").
+
+**Regla de auditoría:** el modelo auditor ≠ el implementador. **Contratos = auditoría DUAL:** **Qwen3.7 Max + DeepSeek V4 Pro** en paralelo (se diffean hallazgos) + Claude a fondo.
 
 ---
 
@@ -75,7 +77,7 @@ Toolchain (pinear a último estable y dejarlo en README): Rust stable + `cargo-o
 - **Objetivo:** demostrar **INV-1**: una **cuenta admin** con claves asociadas ponderadas + threshold alto controla el capital; una **cuenta agente** puede llamar un entrypoint **capado** (micropago con tope) pero **NO** puede ejecutar un retiro grande.
 - **Entregable:** script/infra que configura la cuenta admin (associated keys + weights + deploy threshold); en `OhuVault`: `route_micropayment(...)` (invocable por `operator`/agente, con **tope por llamada**) y gating de `withdraw_to`/`release` a `caller == admin` **+ patrón `approve(id)` de M firmantes antes de `execute(id)`**; tests que prueban **ambos lados**.
 - **Aceptación:** (a) el agente ejecuta un micropago dentro del tope ✔; (b) el agente intentando retirar capital **revierte** ✔; (c) un release grande **solo** procede con M aprobaciones distintas + caller admin ✔.
-- **Dependencias:** S1. **Modelo:** **DeepSeek V4 Pro** o **Qwen3.7 Max** (lo más fuerte). **Audita:** el otro de esos dos + yo (a fondo).
+- **Dependencias:** S1. **Modelo:** **GLM-5.2** (web3-crítico). **Audita (dual):** **Qwen3.7 Max + DeepSeek V4 Pro** en paralelo + Claude (a fondo). *(supersede: ver `model-routing.md`)*
 - **Auditoría:** intentar **romperlo** — ¿hay algún path donde el operator mueva más que el tope? ¿reentrancy? ¿el threshold real fuerza co-firma? ¿`execute` valida que las M aprobaciones son de firmantes **distintos** y vigentes? Esta tarea no pasa con dudas.
 - **Brief opencode:** *"Implementa el modelo de seguridad de OhuVault SIN Addressable Entity: cuenta admin con claves asociadas ponderadas + threshold alto; cuenta agente (operator) que solo puede llamar route_micropayment con tope por llamada; withdraw/release grande gateado por caller==admin + aprobación M-de-N (approve(id) de M firmantes distintos → execute(id)). Tests que prueben que el agente NO puede drenar y que el release grande exige M-de-N. Adjunta los tests negativos."*
 
@@ -83,7 +85,7 @@ Toolchain (pinear a último estable y dejarlo en README): Rust stable + `cargo-o
 - **Objetivo:** verificar **dentro del contrato** un mensaje **EIP-712** firmado off-chain (INV-5) — base de la atestación "recibí/no recibí" sin que el comprador tenga gas.
 - **Entregable:** port del ejemplo `permit` de `casper-eip-712` a Odra: `verify_attestation(payload, signature, signer)` que valida la firma on-chain; test con vector firmado off-chain. **Fallback** documentado: validación ed25519 simple si EIP-712 se atasca.
 - **Aceptación:** firma válida → `true` y registra atestación; firma manipulada/replay → revierte. Gasless desde la perspectiva del firmante (lo retransmite el agente).
-- **Dependencias:** S1. **Modelo:** **DeepSeek V4 Pro** o **Qwen3.7 Max**. **Audita:** el otro.
+- **Dependencias:** S1. **Modelo:** **GLM-5.2** (web3-crítico/cripto). **Audita (dual):** **Qwen3.7 Max + DeepSeek V4 Pro** + Claude. *(supersede: ver `model-routing.md`)*
 - **Auditoría:** dominio/typehash correctos; **anti-replay** (nonce/lote); que no se pueda reusar una atestación en otro lote; correcta recuperación del signer. Validar contra el repo `casper-eip-712`.
 - **Brief opencode:** *"Porta el ejemplo permit de casper-ecosystem/casper-eip-712 a Odra: verify_attestation(payload, signature, signer) verificada on-chain, con anti-replay por (lote, nonce). Test con un mensaje firmado off-chain. Si te bloqueas con EIP-712, implementa el fallback ed25519 y déjalo marcado. No inventes el typehash: cópialo del repo oficial."*
 
