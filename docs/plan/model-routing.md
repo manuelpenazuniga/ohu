@@ -7,7 +7,7 @@
 1. **La cuota (peticiones/5h) es el muro, no el $.** Reservar **T2** (GLM-5.2 ~880/5h, Qwen3.7 Max ~950/5h) para el **10-20% más duro**. Ratio workers:premium **≥ 10:1**.
 2. **MiniMax M3 tiene promo x3 AHORA** (~9.600/5h) → úsalo como **caballo de batalla** para agents/backend/CI/tests/docs/comprensión mientras dure.
 3. **Empate costo-beneficio → gana calidad.** En **web3-crítico y audit, nunca escatimar.**
-4. **Kimi K2.7 Code:** sin benchmarks independientes → **no usar en el router hasta validarlo en nuestro repo.** **GLM-5.1** dominado por 5.2 → solo overflow.
+4. **Validaciones en repo (2026-06-26):** **Kimi K2.7 Code** implementó **S1 (OhuVault), el mejor de los 3 spikes** → validado para **coding de contratos** (seguir observando en más tareas). **GLM-5.2** hizo **S4 + fixes S4a/S4b** limpios (incluso atrapó un bug de interacción S4a↔S4b) → confirmado para **x402/web3-crítico**. **GLM-5.1** dominado por 5.2 → solo overflow.
 
 ## Mapa por tipo de trabajo en Ohu
 | Trabajo | Primario | Escalar a | Auditar |
