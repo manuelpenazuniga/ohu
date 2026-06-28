@@ -85,7 +85,7 @@ Toolchain (pinear a último estable y dejarlo en README): Rust stable + `cargo-o
 - **Objetivo:** verificar **dentro del contrato** un mensaje **EIP-712** firmado off-chain (INV-5) — base de la atestación "recibí/no recibí" sin que el comprador tenga gas.
 - **Entregable:** port del ejemplo `permit` de `casper-eip-712` a Odra: `verify_attestation(payload, signature, signer)` que valida la firma on-chain; test con vector firmado off-chain. **Fallback** documentado: validación ed25519 simple si EIP-712 se atasca.
 - **Aceptación:** firma válida → `true` y registra atestación; firma manipulada/replay → revierte. Gasless desde la perspectiva del firmante (lo retransmite el agente).
-- **Dependencias:** S1. **Modelo:** **GLM-5.2** (web3-crítico/cripto). **Audita (dual):** **Qwen3.7 Max + DeepSeek V4 Pro** + Claude. *(supersede: ver `model-routing.md`)*
+- **Dependencias:** S1. **Modelo:** **DeepSeek V4 Pro** (primario contratos, validado en S2-fix) → escalación **GLM-5.2**. **Audita (dual):** **Qwen3.7 Max + GLM-5.2** + Claude. *(ver `model-routing.md`)*
 - **Auditoría:** dominio/typehash correctos; **anti-replay** (nonce/lote); que no se pueda reusar una atestación en otro lote; correcta recuperación del signer. Validar contra el repo `casper-eip-712`.
 - **Brief opencode:** *"Porta el ejemplo permit de casper-ecosystem/casper-eip-712 a Odra: verify_attestation(payload, signature, signer) verificada on-chain, con anti-replay por (lote, nonce). Test con un mensaje firmado off-chain. Si te bloqueas con EIP-712, implementa el fallback ed25519 y déjalo marcado. No inventes el typehash: cópialo del repo oficial."*
 

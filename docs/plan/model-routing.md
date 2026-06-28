@@ -7,12 +7,12 @@
 1. **La cuota (peticiones/5h) es el muro, no el $.** Reservar **T2** (GLM-5.2 ~880/5h, Qwen3.7 Max ~950/5h) para el **10-20% más duro**. Ratio workers:premium **≥ 10:1**.
 2. **MiniMax M3 tiene promo x3 AHORA** (~9.600/5h) → úsalo como **caballo de batalla** para agents/backend/CI/tests/docs/comprensión mientras dure.
 3. **Empate costo-beneficio → gana calidad.** En **web3-crítico y audit, nunca escatimar.**
-4. **Validaciones en repo (2026-06-26):** **Kimi K2.7 Code** implementó **S1 (OhuVault), el mejor de los 3 spikes** → validado para **coding de contratos** (seguir observando en más tareas). **GLM-5.2** hizo **S4 + fixes S4a/S4b** limpios (incluso atrapó un bug de interacción S4a↔S4b) → confirmado para **x402/web3-crítico**. **GLM-5.1** dominado por 5.2 → solo overflow.
+4. **Validaciones en repo (2026-06-26):** **Kimi K2.7 Code** implementó **S1 (OhuVault), el mejor de los 3 spikes** → validado para **coding de contratos**. **GLM-5.2** hizo **S4 + fixes S4a/S4b** limpios (atrapó un bug de interacción S4a↔S4b) → confirmado para **x402/web3-crítico**. **DeepSeek V4 Pro** hizo el **fix-round de S2** limpio (epoch cap on-chain correcto + 13 tests reales, clippy limpio) → **PROMOVIDO a primario de contratos** (calidad comparable a GLM, ~4× su cuota); GLM-5.2 pasa a **escalación** de contratos. **GLM-5.1** dominado por 5.2 → solo overflow.
 
 ## Mapa por tipo de trabajo en Ohu
 | Trabajo | Primario | Escalar a | Auditar |
 |---|---|---|---|
-| **Contratos Odra que tocan fondos** (vault, multisig, EIP-712, settlement, mutual) = **web3-crítico** | **GLM-5.2** | Qwen3.7 Max | **dual Qwen3.7 Max + DeepSeek V4 Pro** |
+| **Contratos Odra que tocan fondos** (vault, multisig, EIP-712, settlement, mutual) = **web3-crítico** | **DeepSeek V4 Pro** *(validado S2-fix; ~4× cuota vs GLM)* | GLM-5.2 | **dual Qwen3.7 Max + GLM-5.2** (auditor ≠ implementador) |
 | Contrato Rust no-crítico / refactor de lifetimes | DeepSeek V4 Pro | GLM-5.2 | — |
 | **Agentes TS** (orquestación, MCP, CSPR.cloud, x402) | **MiniMax M3** ⚡ | DeepSeek V4 Pro | — |
 | RFQ clearing (algoritmo determinista) | **DeepSeek V4 Pro** | GLM-5.2 | revisión 1× |
@@ -22,7 +22,7 @@
 | Debug / tests rojos | **DeepSeek V4 Pro** | GLM-5.2 | — |
 | Comprensión de repo (extender, NO reconstruir) | **DeepSeek V4 Pro** (1M ctx, MRCR 83.5) | MiniMax M3 | — |
 | Workers (boilerplate, codemods, format masivo) | **DeepSeek V4 Flash** | MiMo V2.5 | — |
-| **Audit de seguridad** (cada hito de contrato) | **dual: Qwen3.7 Max + DeepSeek V4 Pro** | GLM-5.2 (desempate) | — |
+| **Audit de seguridad** (cada hito de contrato) | **dual, auditor ≠ implementador** (si implementa DeepSeek → audita Qwen3.7 Max + GLM-5.2) | el 3º como desempate + Claude | — |
 
 ## Por etapa
 | Etapa | Implementa | Audita |
