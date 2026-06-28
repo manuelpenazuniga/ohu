@@ -3,12 +3,26 @@
 //! ## Ruta actual: Ed25519
 //!
 //! El firmante (comprador) produce una firma Ed25519 off-chain sobre el mensaje
-//! `"OhuAttestation:" || lote_id || nonce || received` (sin gas). El agente la
-//! retransmite on-chain llamando [`OhuVault::verify_attestation`].
+//! `"OhuAttestation:" || lote_id || nonce || received || verifying_contract ||
+//! chain_id` (sin gas). El agente la retransmite on-chain llamando
+//! [`OhuVault::verify_attestation`].
 //!
 //! La verificación on-chain usa `casper_types::crypto::verify` (pura, sin host
 //! function) y deriva la identidad del firmante del `PublicKey → AccountHash`.
-//! Anti-replay: cada par `(signer, nonce)` se consume una única vez.
+//!
+//! ### Anti-replay (fix #3)
+//!
+//! Scoped a (signer, lote_id): una atestación por comprador por lote.
+//! `nonce` va DENTRO del mensaje firmado (binding) pero NO se impone monotonicidad
+//! global sobre el nonce. El replay se bloquea vía `attestation_recorded[(lote_id,
+//! signer)]`. Un comprador que atesta en lote B no bloquea su atestación en lote A.
+//!
+//! ### Domain separation (fix #4)
+//!
+//! El mensaje incluye `verifyingContract` (la dirección del propio vault) y
+//! `chain_id` (fijado por el deployer en init). Esto impide que una firma
+//! válida en una instancia de OhuVault se reutilice en otra instancia o en
+//! otra cadena.
 //!
 //! ## Ruta target: EIP-712 (verificación ECDSA/Secp256k1)
 //!
@@ -76,9 +90,6 @@ pub const ED25519_SIG_LEN: usize = Signature::ED25519_LENGTH; // 64
 const ATTESTATION_MSG_PREFIX: &[u8] = b"OhuAttestation:";
 
 /// Errores específicos del módulo de atestación.
-///
-/// Los códigos 30–35 se reservan para S3 (atestación), sin colisión con
-/// los errores 1–18 de OhuVault (S1/S2).
 #[odra::odra_error]
 pub enum AttestationError {
     /// Clave pública inválida (no se pudo decodificar como Ed25519).
@@ -87,12 +98,6 @@ pub enum AttestationError {
     InvalidSignatureBytes = 31,
     /// La firma Ed25519 no es válida para este mensaje y clave pública.
     InvalidSignature = 32,
-    /// Este nonce ya fue usado por este firmante (anti-replay).
-    NonceAlreadyUsed = 33,
-    /// El nonce es menor o igual al último usado (debe ser estrictamente creciente).
-    InvalidNonce = 34,
-    /// No se pudo derivar AccountHash de la clave pública.
-    InvalidAccountHash = 35,
 }
 
 /// Evento emitido cuando se registra una atestación válida.
@@ -106,14 +111,40 @@ pub struct AttestationRecorded {
 
 // ─── Funciones de utilidad (no mutan storage) ──────────────────────────────
 
+/// Extrae el hash subyacente de 32 bytes de un `Address`.
+///
+/// TODO(audit): confirmar que `AccountHash::value()` y
+/// `ContractPackageHash::value()` devuelven `HashAddr` ([u8; 32]) en
+/// casper-types 6.1.0. Ver <https://docs.cspr.cloud/>.
+fn address_hash_bytes(addr: &Address) -> [u8; 32] {
+    match addr {
+        Address::Account(hash) => hash.value(),
+        Address::Contract(hash) => hash.value(),
+    }
+}
+
 /// Construye el mensaje que el firmante debe firmar con su clave Ed25519.
 ///
-/// Formato: `"OhuAttestation:" || lote_id (BE u64) || nonce (BE u64) || received (1 byte)`
-pub fn build_attestation_message(lote_id: u64, nonce: u64, received: bool) -> Vec<u8> {
+/// Formato:
+/// `"OhuAttestation:" || lote_id (BE u64) || nonce (BE u64) || received (1 byte)
+///  || verifying_contract_hash (32 bytes) || chain_id (BE u64)`
+///
+/// `verifying_contract` es la dirección del propio vault (self_address()).
+/// `chain_id` lo fija el deployer en init y se guarda en el contrato.
+/// Ambos se incluyen para prevenir replay cross-contract/cross-chain (fix #4).
+pub fn build_attestation_message(
+    lote_id: u64,
+    nonce: u64,
+    received: bool,
+    verifying_contract: Address,
+    chain_id: u64,
+) -> Vec<u8> {
     let mut msg = Vec::from(ATTESTATION_MSG_PREFIX);
     msg.extend_from_slice(&lote_id.to_be_bytes());
     msg.extend_from_slice(&nonce.to_be_bytes());
     msg.push(received as u8);
+    msg.extend_from_slice(&address_hash_bytes(&verifying_contract));
+    msg.extend_from_slice(&chain_id.to_be_bytes());
     msg
 }
 
@@ -121,6 +152,8 @@ pub fn build_attestation_message(lote_id: u64, nonce: u64, received: bool) -> Ve
 ///
 /// # Argumentos
 /// - `lote_id`, `nonce`, `received`: el payload de la atestación.
+/// - `verifying_contract`: dirección del vault (incluida en el mensaje, fix #4).
+/// - `chain_id`: identificador de cadena (incluido en el mensaje, fix #4).
 /// - `public_key_bytes`: 32 bytes de la clave pública Ed25519 (raw, sin tag).
 /// - `signature_bytes`: 64 bytes de la firma Ed25519 (raw, sin tag).
 ///
@@ -136,6 +169,8 @@ pub fn verify_attestation_signature(
     lote_id: u64,
     nonce: u64,
     received: bool,
+    verifying_contract: Address,
+    chain_id: u64,
     public_key_bytes: [u8; ED25519_PK_LEN],
     signature_bytes: [u8; ED25519_SIG_LEN],
 ) -> Result<Address, AttestationError> {
@@ -145,7 +180,7 @@ pub fn verify_attestation_signature(
     let signature = Signature::ed25519(signature_bytes)
         .map_err(|_| AttestationError::InvalidSignatureBytes)?;
 
-    let message = build_attestation_message(lote_id, nonce, received);
+    let message = build_attestation_message(lote_id, nonce, received, verifying_contract, chain_id);
 
     crypto::verify(&message, &signature, &public_key)
         .map_err(|_| AttestationError::InvalidSignature)?;

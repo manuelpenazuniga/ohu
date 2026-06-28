@@ -24,11 +24,15 @@
 //! ## S3: atestaciones gasless (INV-5)
 //!
 //! Un firmante (comprador) produce una firma Ed25519 off-chain sobre el payload
-//! `"OhuAttestation:" || lote_id || nonce || received`. El agente retransmite
-//! la firma on-chain vía `verify_attestation`. La verificación on-chain usa
-//! `casper_types::crypto::verify` (Ed25519 pura) y deriva la identidad del
-//! firmante de `PublicKey → AccountHash`. Anti-replay: cada par `(signer, nonce)`
-//! se consume una única vez; nonces estrictamente crecientes por signer.
+//! `"OhuAttestation:" || lote_id || nonce || received || verifying_contract ||
+//! chain_id`. El agente retransmite la firma on-chain vía `verify_attestation`.
+//! La verificación on-chain usa `casper_types::crypto::verify` (Ed25519 pura)
+//! y deriva la identidad del firmante de `PublicKey → AccountHash`.
+//!
+//! **Anti-replay (fix #3):** scoped a `(signer, lote_id)` — una atestación por
+//! comprador por lote. No se impone monotonicidad global sobre el nonce.
+//! **Domain separation (fix #4):** el mensaje incluye `verifyingContract`
+//! (la dirección del propio vault) y `chain_id` (fijado por el deployer en init).
 //!
 //! Ruta target (no implementada aún): EIP-712 con recuperación ECDSA/Secp256k1
 //! vía `casper-eip-712`. Ver `attestation.rs` para los typehash y el diseño.
@@ -114,8 +118,6 @@ pub enum Error {
     AttestationInvalidSignature = 32,
     /// Este nonce ya fue usado por este firmante (anti-replay).
     AttestationNonceAlreadyUsed = 33,
-    /// El nonce es menor o igual al último usado (debe ser estrictamente creciente).
-    AttestationInvalidNonce = 34,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -204,10 +206,10 @@ pub struct OhuVault {
     approval_count: Mapping<u64, u8>,
     /// `(request_id, approver) -> true`: registro anti doble-aprobación.
     has_approved: Mapping<(u64, Address), bool>,
-    /// S3: último nonce usado por este firmante (anti-replay, INV-5).
-    attestation_nonce: Mapping<Address, u64>,
-    /// S3: atestación registrada para `(lote_id, signer)`.
+    /// S3: atestación registrada para `(lote_id, signer)` (anti-replay, fix #3).
     attestation_recorded: Mapping<(u64, Address), bool>,
+    /// S3: identificador de cadena para domain separation (fix #4).
+    chain_id: Var<u64>,
 }
 
 #[odra::module]
@@ -221,6 +223,7 @@ impl OhuVault {
     /// - `approvers` no vacío, sin duplicados, todos cuentas, ≤ 255.
     /// - `required_approvals` en `[1, approvers.len()]`.
     /// - `micropayment_cap > 0`, `epoch_cap > 0`, `epoch_window_ms > 0`.
+    /// - `chain_id > 0` (se fija en deploy, domain separation fix #4).
     /// - El contador de epoch arranca en el bloque actual.
     ///
     /// TODO(audit): verificar contra <https://odra.dev/docs/basics/native-token>
@@ -236,6 +239,7 @@ impl OhuVault {
         micropayment_cap: U512,
         epoch_cap: U512,
         epoch_window_ms: u64,
+        chain_id: u64,
     ) {
         if admin.is_contract() || operator.is_contract() {
             self.env().revert(Error::NotAnAccount);
@@ -292,6 +296,7 @@ impl OhuVault {
         self.accumulated.set(U512::zero());
         self.required_approvals.set(required_approvals);
         self.next_request_id.set(0u64);
+        self.chain_id.set(chain_id);
     }
 
     /// Deposita CSPR en el purse del contrato.
@@ -514,20 +519,26 @@ impl OhuVault {
     /// Verifica una atestación Ed25519 firmada off-chain y la registra on-chain.
     ///
     /// El firmante (comprador) firma el mensaje `"OhuAttestation:" || lote_id ||
-    /// nonce || received` con su clave Ed25519. El agente retransmite la firma
-    /// pagando el gas (gasless para el firmante).
+    /// nonce || received || verifying_contract || chain_id` con su clave Ed25519.
+    /// El agente retransmite la firma pagando el gas (gasless para el firmante).
     ///
     /// # Verificación
     /// 1. Decodifica `public_key_bytes` (32 bytes) y `signature_bytes` (64 bytes).
-    /// 2. Reconstruye el mensaje y verifica la firma Ed25519.
+    /// 2. Reconstruye el mensaje (con `verifyingContract = self_address()` y el
+    ///    `chain_id` guardado en init) y verifica la firma Ed25519.
     /// 3. Deriva `AccountHash` de la clave pública → identidad del firmante.
-    /// 4. Anti-replay: `nonce` debe ser estrictamente mayor que el último usado
-    ///    por este firmante.
-    /// 5. Registra la atestación en `attestation_recorded[(lote_id, signer)]`.
+    /// 4. Anti-replay (fix #3): scoped a `(signer, lote_id)` vía
+    ///    `attestation_recorded`. Una atestación por comprador por lote.
+    /// 5. Domain separation (fix #4): `verifyingContract` y `chain_id` van en el
+    ///    mensaje firmado, impidiendo replay cross-contract/cross-chain.
     ///
     /// # Retorna
     /// `true` si la atestación es válida y se registró; revierte en caso
     /// contrario (firma inválida, replay, etc.).
+    ///
+    /// ATENCIÓN: NO autorizada (no verifica signer ∈ compradores(lote)) ni con
+    /// expiry (valid_before). NO conectar settlement a esto hasta Semana 2, que
+    /// añade autorización ponderada + valid_before.
     ///
     /// TODO(audit): migrar a EIP-712 cuando `casper-eip-712` (v1.2.0+) sea
     /// compatible con Odra 2.8.2. El mensaje sería el digest EIP-712 en lugar
@@ -542,10 +553,15 @@ impl OhuVault {
     ) -> bool {
         use crate::attestation::verify_attestation_signature;
 
+        let verifying_contract = self.env().self_address();
+        let chain_id = self.chain_id.get_or_revert_with(Error::NotInitialized);
+
         let signer = verify_attestation_signature(
             lote_id,
             nonce,
             received,
+            verifying_contract,
+            chain_id,
             public_key_bytes,
             signature_bytes,
         );
@@ -553,8 +569,6 @@ impl OhuVault {
         let signer = match signer {
             Ok(s) => s,
             Err(e) => match e {
-                // TODO(audit): mapear errores del módulo a errores del contrato.
-                // Por ahora mapeamos genéricamente.
                 crate::attestation::AttestationError::InvalidPublicKey => {
                     self.env().revert(Error::AttestationInvalidPublicKey)
                 }
@@ -564,24 +578,16 @@ impl OhuVault {
                 crate::attestation::AttestationError::InvalidSignature => {
                     self.env().revert(Error::AttestationInvalidSignature)
                 }
-                _ => self.env().revert(Error::AttestationInvalidSignature),
             },
         };
 
-        // Anti-replay: nonce debe ser estrictamente creciente por signer.
-        let last_nonce = self.attestation_nonce.get_or_default(&signer);
-        if nonce <= last_nonce {
-            self.env().revert(Error::AttestationInvalidNonce);
-        }
-
-        // Anti-replay: este nonce no debe haber sido usado ya.
+        // Anti-replay (fix #3): una atestación por comprador por lote.
         let replay_key = (lote_id, signer);
         if self.attestation_recorded.get_or_default(&replay_key) {
             self.env().revert(Error::AttestationNonceAlreadyUsed);
         }
 
         // Registrar.
-        self.attestation_nonce.set(&signer, nonce);
         self.attestation_recorded.set(&replay_key, true);
 
         self.env().emit_event(AttestationRecorded {
@@ -596,14 +602,14 @@ impl OhuVault {
 
     // ── Getters de atestación (S3) ──
 
-    /// Último nonce usado por `signer`.
-    pub fn attestation_nonce(&self, signer: Address) -> u64 {
-        self.attestation_nonce.get_or_default(&signer)
-    }
-
     /// ¿La atestación para `(lote_id, signer)` ya fue registrada?
     pub fn attestation_recorded(&self, lote_id: u64, signer: Address) -> bool {
         self.attestation_recorded.get_or_default(&(lote_id, signer))
+    }
+
+    /// `chain_id` fijado en init (domain separation, fix #4).
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id.get_or_revert_with(Error::NotInitialized)
     }
 
     // -----------------------------------------------------------------
@@ -714,13 +720,18 @@ mod tests {
         cap: U512,
         epoch_cap: U512,
         epoch_window_ms: u64,
+        chain_id: u64,
     }
 
     fn setup() -> Fixture {
-        setup_with(U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000)
+        setup_with_chain(U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1)
     }
 
     fn setup_with(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64) -> Fixture {
+        setup_with_chain(cap, required, epoch_cap, epoch_window_ms, 1)
+    }
+
+    fn setup_with_chain(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64, chain_id: u64) -> Fixture {
         let env = odra_test::env();
         let admin = env.get_account(0);
         let operator = env.get_account(1);
@@ -740,6 +751,7 @@ mod tests {
                 micropayment_cap: cap,
                 epoch_cap,
                 epoch_window_ms,
+                chain_id,
             },
         );
 
@@ -760,6 +772,7 @@ mod tests {
             cap,
             epoch_cap,
             epoch_window_ms,
+            chain_id,
         }
     }
 
@@ -1285,6 +1298,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1305,6 +1319,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1326,6 +1341,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::DuplicateApprover.into());
@@ -1344,6 +1360,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1362,6 +1379,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1380,6 +1398,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1398,6 +1417,7 @@ mod tests {
                 micropayment_cap: U512::zero(),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1418,6 +1438,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::zero(),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1436,6 +1457,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 0,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidEpochWindow.into());
@@ -1455,6 +1477,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::AdminIsApprover.into());
@@ -1476,6 +1499,7 @@ mod tests {
                 micropayment_cap: U512::from(ONE_CSPR),
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
+                chain_id: 1,
             },
         );
         assert_eq!(result.err().unwrap(), Error::ApproversTooMany.into());
@@ -1539,12 +1563,16 @@ mod tests {
         lote_id: u64,
         nonce: u64,
         received: bool,
+        verifying_contract: Address,
+        chain_id: u64,
     ) -> (SecretKey, [u8; 32], [u8; 64], Address) {
         let (secret_key, public_key) = crypto::generate_ed25519_keypair();
         let account_hash = public_key.to_account_hash();
         let signer = Address::Account(account_hash);
 
-        let message = crate::attestation::build_attestation_message(lote_id, nonce, received);
+        let message = crate::attestation::build_attestation_message(
+            lote_id, nonce, received, verifying_contract, chain_id,
+        );
         let signature = crypto::sign(&message, &secret_key, &public_key);
 
         let pk_bytes: [u8; 32] = Into::<Vec<u8>>::into(&public_key)
@@ -1557,24 +1585,47 @@ mod tests {
         (secret_key, pk_bytes, sig_bytes, signer)
     }
 
+    /// Firma una atestación con una clave existente.
+    fn sign_second(
+        sk: &SecretKey,
+        lote_id: u64,
+        nonce: u64,
+        received: bool,
+        verifying_contract: Address,
+        chain_id: u64,
+    ) -> [u8; 64] {
+        let pk = PublicKey::from(sk);
+        let msg = crate::attestation::build_attestation_message(
+            lote_id, nonce, received, verifying_contract, chain_id,
+        );
+        let sig = crypto::sign(&msg, sk, &pk);
+        Into::<Vec<u8>>::into(&sig).try_into().unwrap()
+    }
+
+    /// Devuelve el `(verifying_contract, chain_id)` de la fixture actual.
+    fn vault_domain(f: &Fixture) -> (Address, u64) {
+        (f.contract.contract_address(), f.chain_id)
+    }
+
+    // ── Positivos ────────────────────────────────────────────────────
+
     #[test]
     fn attestation_valid_signature_succeeds_and_records() {
         let mut f = setup();
         let lote_id = 1u64;
         let nonce = 5u64;
         let received = true;
+        let (vc_addr, chain_id) = vault_domain(&f);
 
         let (_sk, pk_bytes, sig_bytes, signer) =
-            sign_attestation(lote_id, nonce, received);
+            sign_attestation(lote_id, nonce, received, vc_addr, chain_id);
 
-        // Cualquier caller puede verificar (el agente paga el gas).
         f.env.set_caller(f.operator);
         let result = f
             .contract
             .verify_attestation(lote_id, nonce, received, pk_bytes, sig_bytes);
 
         assert!(result);
-        assert_eq!(f.contract.attestation_nonce(signer), nonce);
         assert!(f.contract.attestation_recorded(lote_id, signer));
         assert!(f.env.emitted_event(
             &f.contract,
@@ -1590,8 +1641,9 @@ mod tests {
     #[test]
     fn attestation_received_false_also_succeeds() {
         let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
         let (_sk, pk_bytes, sig_bytes, signer) =
-            sign_attestation(2, 1, false);
+            sign_attestation(2, 1, false, vc_addr, chain_id);
 
         f.env.set_caller(f.operator);
         let result = f.contract.verify_attestation(2, 1, false, pk_bytes, sig_bytes);
@@ -1604,9 +1656,12 @@ mod tests {
     fn attestation_multiple_signers_same_lote_succeeds() {
         let mut f = setup();
         let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
 
-        let (_sk1, pk1, sig1, signer1) = sign_attestation(lote_id, 1, true);
-        let (_sk2, pk2, sig2, signer2) = sign_attestation(lote_id, 1, true);
+        let (_sk1, pk1, sig1, signer1) =
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id);
+        let (_sk2, pk2, sig2, signer2) =
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id);
 
         f.env.set_caller(f.operator);
         assert!(f.contract.verify_attestation(lote_id, 1, true, pk1, sig1));
@@ -1616,15 +1671,67 @@ mod tests {
         assert!(f.contract.attestation_recorded(lote_id, signer2));
     }
 
+    /// Fix #3 mandatory: submit lote B before lote A → AMBOS pasan.
+    #[test]
+    fn attestation_submit_lote_b_before_lote_a_both_pass() {
+        let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let (sk, pk, _, signer) =
+            sign_attestation(1, 1, true, vc_addr, chain_id);
+
+        // Firma ambos lotes.
+        let sig_a = sign_second(&sk, 1, 1, true, vc_addr, chain_id);
+        let sig_b = sign_second(&sk, 2, 2, true, vc_addr, chain_id);
+
+        f.env.set_caller(f.operator);
+        // Submit lote B (nonce=2) primero.
+        assert!(f.contract.verify_attestation(2, 2, true, pk, sig_b));
+        // Luego lote A (nonce=1) — debe pasar porque el scope es (signer, lote_id).
+        assert!(f.contract.verify_attestation(1, 1, true, pk, sig_a));
+
+        assert!(f.contract.attestation_recorded(1, signer));
+        assert!(f.contract.attestation_recorded(2, signer));
+    }
+
+    /// Mismo signer, distinto lote, nonce arbitrario — OK (fix #3: no global monotonicity).
+    #[test]
+    fn attestation_same_signer_different_lote_succeeds() {
+        let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let (sk, pk, _, _signer) =
+            sign_attestation(1, 1, true, vc_addr, chain_id);
+
+        let sig1 = sign_second(&sk, 1, 1, true, vc_addr, chain_id);
+        let sig2 = sign_second(&sk, 2, 100, true, vc_addr, chain_id);
+
+        f.env.set_caller(f.operator);
+        assert!(f.contract.verify_attestation(1, 1, true, pk, sig1));
+        assert!(f.contract.verify_attestation(2, 100, true, pk, sig2));
+    }
+
+    #[test]
+    fn attestation_same_nonce_different_signer_succeeds() {
+        let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let (_sk1, pk1, sig1, _s1) =
+            sign_attestation(1, 3, true, vc_addr, chain_id);
+        let (_sk2, pk2, sig2, _s2) =
+            sign_attestation(1, 3, true, vc_addr, chain_id);
+
+        f.env.set_caller(f.operator);
+        assert!(f.contract.verify_attestation(1, 3, true, pk1, sig1));
+        assert!(f.contract.verify_attestation(1, 3, true, pk2, sig2));
+    }
+
     // ── Negativos ────────────────────────────────────────────────────
 
     #[test]
     fn attestation_manipulated_public_key_reverts() {
         let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true);
+            sign_attestation(1, 1, true, vc_addr, chain_id);
 
-        // Corrompe la clave pública.
         let mut bad_pk = pk_bytes;
         bad_pk[0] ^= 0xFF;
 
@@ -1633,7 +1740,6 @@ mod tests {
             .contract
             .try_verify_attestation(1, 1, true, bad_pk, sig_bytes);
 
-        // Debe revertir: la firma no corresponde a esta clave.
         assert!(result.is_err());
         assert!(!f.contract.attestation_recorded(1, signer));
     }
@@ -1641,10 +1747,10 @@ mod tests {
     #[test]
     fn attestation_manipulated_signature_reverts() {
         let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true);
+            sign_attestation(1, 1, true, vc_addr, chain_id);
 
-        // Corrompe la firma.
         let mut bad_sig = sig_bytes;
         bad_sig[10] ^= 0xFF;
 
@@ -1654,17 +1760,16 @@ mod tests {
             .try_verify_attestation(1, 1, true, pk_bytes, bad_sig);
 
         assert!(result.is_err());
-        // No se registró.
         assert!(!f.contract.attestation_recorded(1, signer));
     }
 
     #[test]
     fn attestation_manipulated_received_payload_reverts() {
         let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true);
+            sign_attestation(1, 1, true, vc_addr, chain_id);
 
-        // La firma fue sobre `received = true` pero se intenta `received = false`.
         f.env.set_caller(f.operator);
         let result = f
             .contract
@@ -1677,10 +1782,10 @@ mod tests {
     #[test]
     fn attestation_manipulated_nonce_reverts() {
         let mut f = setup();
+        let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 5, true);
+            sign_attestation(1, 5, true, vc_addr, chain_id);
 
-        // La firma fue sobre nonce=5 pero se intenta nonce=3.
         f.env.set_caller(f.operator);
         let result = f
             .contract
@@ -1690,122 +1795,73 @@ mod tests {
         assert!(!f.contract.attestation_recorded(1, signer));
     }
 
+    /// Replay: mismo (lote, signer) → revierte (fix #3: attestation_recorded guard).
     #[test]
-    fn attestation_replay_same_lote_nonce_reverts() {
+    fn attestation_replay_same_lote_same_signer_reverts() {
         let mut f = setup();
-        let (_, pk1, sig1, _signer1) = sign_attestation(1, 5, true);
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let (sk, pk, _, _signer) =
+            sign_attestation(1, 5, true, vc_addr, chain_id);
+        let sig = sign_second(&sk, 1, 5, true, vc_addr, chain_id);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 5, true, pk1, sig1));
+        assert!(f.contract.verify_attestation(1, 5, true, pk, sig));
 
-        // Replay con el mismo payload del mismo firmante: mismo nonce → nonce ya fue usado.
+        // Replay exacto del mismo payload → attestation_recorded ya es true.
         let result = f
             .contract
-            .try_verify_attestation(1, 5, true, pk1, sig1);
+            .try_verify_attestation(1, 5, true, pk, sig);
 
         assert_eq!(
             result.unwrap_err(),
-            Error::AttestationInvalidNonce.into()
+            Error::AttestationNonceAlreadyUsed.into()
         );
     }
 
+    /// Fix #4 mandatory: firma construida con OTRA dirección de contrato → revierte.
     #[test]
-    fn attestation_replay_different_lote_same_signer_same_nonce_reverts() {
+    fn attestation_different_verifying_contract_reverts() {
         let mut f = setup();
-        let (sk, pk, _, _signer) = sign_attestation(1, 5, true);
+        let (_, chain_id) = vault_domain(&f);
+        // Construye un Address de contrato distinto al real.
+        let fake_hash = [0xABu8; 32];
+        let fake_vc_addr = Address::Contract(
+            odra::casper_types::contracts::ContractPackageHash::new(fake_hash),
+        );
+        // Verifica que sea distinto del real.
+        assert_ne!(f.contract.contract_address(), fake_vc_addr);
+
+        // Firma con la dirección FALSA.
+        let (_, pk_bytes, sig_bytes, _signer) =
+            sign_attestation(1, 1, true, fake_vc_addr, chain_id);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 5, true, pk, sign_second(&sk, 1, 5, true)));
-
-        // Intenta usar el mismo nonce=5 en otro lote — debe revertir porque el nonce no aumentó.
-        let sig_lote2 = sign_second(&sk, 2, 5, true);
+        // El vault usa su dirección REAL en el mensaje, no `fake_vc_addr` → firma no coincide.
         let result = f
             .contract
-            .try_verify_attestation(2, 5, true, pk, sig_lote2);
+            .try_verify_attestation(1, 1, true, pk_bytes, sig_bytes);
 
-        assert_eq!(
-            result.unwrap_err(),
-            Error::AttestationInvalidNonce.into()
-        );
-        // No se registró el lote 2 con nonce 5.
-        assert!(!f.contract.attestation_recorded(2, Address::Account(PublicKey::from(&sk).to_account_hash())));
+        assert!(result.is_err());
     }
 
+    /// Fix #4 mandatory: firma construida con OTRO chain_id → revierte.
     #[test]
-    fn attestation_non_ascending_nonce_same_signer_reverts() {
-        let mut f = setup();
-        let (sk, pk, _, _signer) = sign_attestation(1, 10, true);
+    fn attestation_different_chain_id_reverts() {
+        let mut f = setup_with_chain(
+            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 999,
+        );
+        let (vc_addr, _) = vault_domain(&f);
+        // Firma con chain_id=1 (incorrecto).
+        let (_, pk_bytes, sig_bytes, signer) =
+            sign_attestation(1, 1, true, vc_addr, 1);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 10, true, pk, sign_second(&sk, 1, 10, true)));
-
-        // Firma para nonce=5 (< 10) con la MISMA clave.
-        let msg5 = crate::attestation::build_attestation_message(1, 5, true);
-        let public_key = PublicKey::from(&sk);
-        let sig5 = crypto::sign(&msg5, &sk, &public_key);
-        let sig5_bytes: [u8; 64] =
-            Into::<Vec<u8>>::into(&sig5).try_into().unwrap();
-
+        // El vault usa chain_id=999, pero la firma es sobre chain_id=1.
         let result = f
             .contract
-            .try_verify_attestation(1, 5, true, pk, sig5_bytes);
+            .try_verify_attestation(1, 1, true, pk_bytes, sig_bytes);
 
-        assert_eq!(
-            result.unwrap_err(),
-            Error::AttestationInvalidNonce.into()
-        );
-    }
-
-    #[test]
-    fn attestation_same_signer_different_lote_succeeds() {
-        let mut f = setup();
-        let (sk, pk, _, _signer) = sign_attestation(1, 1, true);
-
-        // Firma lote=1, nonce=1
-        let public_key_for_signing = PublicKey::from(&sk);
-        let msg1 = crate::attestation::build_attestation_message(1, 1, true);
-        let sig1 = crypto::sign(&msg1, &sk, &public_key_for_signing);
-        let sig1_bytes: [u8; 64] =
-            Into::<Vec<u8>>::into(&sig1).try_into().unwrap();
-
-        // Firma lote=2, nonce=2 (nonce creciente, lote distinto)
-        let msg2 = crate::attestation::build_attestation_message(2, 2, true);
-        let sig2 = crypto::sign(&msg2, &sk, &public_key_for_signing);
-        let sig2_bytes: [u8; 64] =
-            Into::<Vec<u8>>::into(&sig2).try_into().unwrap();
-
-        f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 1, true, pk, sig1_bytes));
-        assert!(f.contract.verify_attestation(2, 2, true, pk, sig2_bytes));
-        // El nonce track es global por signer, no por lote.
-        assert_eq!(f.contract.attestation_nonce(
-            Address::Account(PublicKey::from(&sk).to_account_hash())
-        ), 2);
-    }
-
-    #[test]
-    fn attestation_same_nonce_different_signer_succeeds() {
-        let mut f = setup();
-        let (_sk1, pk1, sig1, _s1) = sign_attestation(1, 3, true);
-        let (_sk2, pk2, sig2, _s2) = sign_attestation(1, 3, true);
-
-        f.env.set_caller(f.operator);
-        // Ambos usan nonce=3 pero son firmantes distintos → OK.
-        assert!(f.contract.verify_attestation(1, 3, true, pk1, sig1));
-        assert!(f.contract.verify_attestation(1, 3, true, pk2, sig2));
-    }
-
-    // ── Helper para firmar con una clave existente ──
-
-    fn sign_second(
-        sk: &SecretKey,
-        lote_id: u64,
-        nonce: u64,
-        received: bool,
-    ) -> [u8; 64] {
-        let pk = PublicKey::from(sk);
-        let msg = crate::attestation::build_attestation_message(lote_id, nonce, received);
-        let sig = crypto::sign(&msg, sk, &pk);
-        Into::<Vec<u8>>::into(&sig).try_into().unwrap()
+        assert!(result.is_err());
+        assert!(!f.contract.attestation_recorded(1, signer));
     }
 }
