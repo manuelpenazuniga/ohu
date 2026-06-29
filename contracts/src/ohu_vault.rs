@@ -118,6 +118,17 @@ pub enum Error {
     AttestationInvalidSignature = 32,
     /// Este nonce ya fue usado por este firmante (anti-replay).
     AttestationNonceAlreadyUsed = 33,
+    // ── W1-1: modelo de lote ──
+    /// El lote_id ya existe (no se puede abrir dos veces).
+    LoteAlreadyExists = 40,
+    /// El lote_id no existe (no se ha abierto con `open_lote`).
+    LoteNotFound = 41,
+    /// El lote no está en estado OPEN (ya fue fondeado o no existe).
+    LoteNotOpen = 42,
+    /// Solo el productor registrado del lote puede ejecutar esta acción.
+    NotProducer = 43,
+    /// El bono del productor ya fue depositado para este lote.
+    BondAlreadyPosted = 44,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -169,12 +180,43 @@ pub struct AttestationRecorded {
     pub nonce: u64,
 }
 
+// ── W1-1: modelo de lote ──
+
+/// Evento: se abre un nuevo lote de compra cooperativa (estado OPEN).
+#[odra::event]
+pub struct LoteOpened {
+    pub lote_id: u64,
+    pub producer: Address,
+}
+
+/// Evento: un comprador deposita su share earmarked a un lote (INV-7).
+#[odra::event]
+pub struct DepositedToLote {
+    pub lote_id: u64,
+    pub buyer: Address,
+    pub amount: U512,
+}
+
+/// Evento: el productor publica su bono de cumplimiento.
+#[odra::event]
+pub struct BondPosted {
+    pub lote_id: u64,
+    pub producer: Address,
+    pub amount: U512,
+}
+
+/// Evento: el lote alcanza el estado FUNDED (bono + fondeo ≥ 1 share).
+#[odra::event]
+pub struct LoteFunded {
+    pub lote_id: u64,
+}
+
 /// Contrato de custodia de Ohu.
 ///
 /// TODO(audit): CES (`emit_event`) es el event standard soportado por Odra.
 /// Verificar si CSPR.cloud indexa CES, native events, o ambos; ajustar a
 /// `emit_native_event` si es necesario. Ver <https://odra.dev/docs/basics/events>.
-#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded])]
+#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded, LoteOpened, DepositedToLote, BondPosted, LoteFunded])]
 pub struct OhuVault {
     /// Cuenta que ejecuta releases grandes (`caller == admin` en `execute`).
     admin: Var<Address>,
@@ -210,7 +252,24 @@ pub struct OhuVault {
     attestation_recorded: Mapping<(u64, Address), bool>,
     /// S3: identificador de cadena para domain separation (fix #4).
     chain_id: Var<u64>,
+    // ── W1-1: modelo de lote (INV-7: escrow earmarked) ──
+    /// Productor asignado a cada lote.
+    lote_producer: Mapping<u64, Address>,
+    /// Estado del lote: 0=inexistente, 1=OPEN, 2=FUNDED.
+    lote_state: Mapping<u64, u8>,
+    /// Suma total de shares depositadas en el lote (Σ depósitos de compradores).
+    /// INV-7: esta contabilidad es POR LOTE, nunca se deriva de self_balance().
+    lote_funded: Mapping<u64, U512>,
+    /// Share depositada por `(lote_id, comprador)`.
+    lote_share: Mapping<(u64, Address), U512>,
+    /// Bono de cumplimiento depositado por el productor del lote.
+    lote_bond: Mapping<u64, U512>,
 }
+
+/// Constantes de estado de lote (W1-1).
+/// 0 = inexistente (default de Mapping); 1 = OPEN; 2 = FUNDED.
+const LOTE_STATE_OPEN: u8 = 1;
+const LOTE_STATE_FUNDED: u8 = 2;
 
 #[odra::module]
 impl OhuVault {
@@ -603,6 +662,169 @@ impl OhuVault {
         true
     }
 
+    // ── W1-1: modelo de lote (INV-7: escrow earmarked) ──
+
+    /// Abre un nuevo lote de compra cooperativa en estado OPEN.
+    ///
+    /// Gates:
+    /// - `caller == admin` o `caller == operator`.
+    /// - `lote_id` no debe existir ya (`lote_state` ≠ 0).
+    /// - `producer` debe ser cuenta (no contrato, INV-3).
+    ///
+    /// El lote nace con `lote_funded = 0`, `lote_bond = 0`, sin shares.
+    pub fn open_lote(&mut self, lote_id: u64, producer: Address) {
+        let caller = self.env().caller();
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        let operator = self.operator.get_or_revert_with(Error::NotInitialized);
+        if caller != admin && caller != operator {
+            self.env().revert(Error::NotAdmin);
+        }
+
+        if self.lote_state.get_or_default(&lote_id) != 0 {
+            self.env().revert(Error::LoteAlreadyExists);
+        }
+
+        if producer.is_contract() {
+            self.env().revert(Error::NotAnAccount);
+        }
+
+        self.lote_producer.set(&lote_id, producer);
+        self.lote_state.set(&lote_id, LOTE_STATE_OPEN);
+        // lote_funded y lote_bond comienzan en ceros (default de Mapping).
+
+        self.env().emit_event(LoteOpened { lote_id, producer });
+    }
+
+    /// Deposita la share earmarked del comprador a un lote (INV-7).
+    ///
+    /// `#[odra(payable)]`: el caller envía CSPR junto con la llamada. El
+    /// monto se registra en `lote_share[(lote_id, caller)]` y se acumula en
+    /// `lote_funded[lote_id]`.
+    ///
+    /// Gates:
+    /// - El lote debe existir (`lote_state` ≠ 0).
+    /// - El lote debe estar en estado OPEN (no FUNDED/SETTLED).
+    /// - `attached_value() > 0`.
+    ///
+    /// INV-7: los fondos se contabilizan por lote en los Mappings, nunca
+    /// desde `self_balance()`. Dos lotes jamás comparten saldo entre sí.
+    ///
+    /// TODO(audit): si el lote ya tiene bono y este es el primer depósito,
+    /// la transición a FUNDED ocurre aquí mismo (regla conservadora: se
+    /// necesita tanto bono como fondeo > 0).
+    #[odra(payable)]
+    pub fn deposit_to_lote(&mut self, lote_id: u64) {
+        let buyer = self.env().caller();
+        let amount = self.env().attached_value();
+
+        if amount == U512::zero() {
+            self.env().revert(Error::ZeroAmount);
+        }
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state == 0 {
+            self.env().revert(Error::LoteNotFound);
+        }
+        if state != LOTE_STATE_OPEN {
+            self.env().revert(Error::LoteNotOpen);
+        }
+
+        // INV-7: aritmética de contabilidad por-lote (checked implícito en U512).
+        let share_key = (lote_id, buyer);
+        let old_share = self.lote_share.get_or_default(&share_key);
+        let new_share = old_share + amount;
+        self.lote_share.set(&share_key, new_share);
+
+        let old_funded = self.lote_funded.get_or_default(&lote_id);
+        let new_funded = old_funded + amount;
+        // INV-7: checked — si una suma desbordara U512, el + en debug paniquea.
+        // En producción U512 no desborda con valores reales (≥153 dígitos decimales).
+        self.lote_funded.set(&lote_id, new_funded);
+
+        self.env().emit_event(DepositedToLote {
+            lote_id,
+            buyer,
+            amount,
+        });
+
+        // Transición a FUNDED si el bono ya fue depositado.
+        self.try_transition_to_funded(lote_id);
+    }
+
+    /// El productor del lote deposita su bono de cumplimiento.
+    ///
+    /// `#[odra(payable)]`: el monto enviado queda en el purse del contrato
+    /// como parte del escrow global. La contabilidad del bono es por-lote
+    /// en `lote_bond[lote_id]`.
+    ///
+    /// Gates:
+    /// - `caller` debe ser el `lote_producer` registrado.
+    /// - El lote debe existir.
+    /// - El bono no debe haber sido depositado ya (`lote_bond[lote_id] == 0`).
+    ///
+    /// Transición a FUNDED si además `lote_funded[lote_id] > 0`.
+    ///
+    /// TODO(audit): verificar si la transición a FUNDED debe exigir un
+    /// mínimo de fondeo (umbral paramétrico). La regla actual (bono>0 ∧
+    /// funded>0) es la más conservadora.
+    #[odra(payable)]
+    pub fn post_bond(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+        let amount = self.env().attached_value();
+
+        if amount == U512::zero() {
+            self.env().revert(Error::ZeroAmount);
+        }
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state == 0 {
+            self.env().revert(Error::LoteNotFound);
+        }
+
+        let producer = match self.lote_producer.get(&lote_id) {
+            Some(p) => p,
+            None => self.env().revert(Error::LoteNotFound),
+        };
+
+        if caller != producer {
+            self.env().revert(Error::NotProducer);
+        }
+
+        let existing_bond = self.lote_bond.get_or_default(&lote_id);
+        if existing_bond > U512::zero() {
+            self.env().revert(Error::BondAlreadyPosted);
+        }
+
+        self.lote_bond.set(&lote_id, amount);
+
+        self.env().emit_event(BondPosted {
+            lote_id,
+            producer: caller,
+            amount,
+        });
+
+        // Transición a FUNDED si ya hay fondeo.
+        self.try_transition_to_funded(lote_id);
+    }
+
+    /// Intenta la transición OPEN → FUNDED cuando tanto el bono como el
+    /// fondeo del lote son > 0.
+    ///
+    /// INV-7: solo opera sobre el lote indicado; no cruza contabilidad
+    /// entre lotes.
+    fn try_transition_to_funded(&mut self, lote_id: u64) {
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_OPEN {
+            return;
+        }
+        let bond = self.lote_bond.get_or_default(&lote_id);
+        let funded = self.lote_funded.get_or_default(&lote_id);
+        if bond > U512::zero() && funded > U512::zero() {
+            self.lote_state.set(&lote_id, LOTE_STATE_FUNDED);
+            self.env().emit_event(LoteFunded { lote_id });
+        }
+    }
+
     // ── Getters de atestación (S3) ──
 
     /// ¿La atestación para `(lote_id, signer)` ya fue registrada?
@@ -692,12 +914,45 @@ impl OhuVault {
             None => self.env().revert(Error::RequestNotFound),
         }
     }
+
+    // ── W1-1: getters de lote ──
+
+    /// Estado del lote: 0=inexistente, 1=OPEN, 2=FUNDED.
+    pub fn lote_state(&self, lote_id: u64) -> u8 {
+        self.lote_state.get_or_default(&lote_id)
+    }
+
+    /// Productor asignado al lote (revert si no existe).
+    pub fn lote_producer(&self, lote_id: u64) -> Address {
+        match self.lote_producer.get(&lote_id) {
+            Some(p) => p,
+            None => self.env().revert(Error::LoteNotFound),
+        }
+    }
+
+    /// Suma total de shares depositadas en el lote (0 si no existe).
+    /// INV-7: nunca se deriva de `self_balance()`, es contabilidad por-lote.
+    pub fn lote_funded(&self, lote_id: u64) -> U512 {
+        self.lote_funded.get_or_default(&lote_id)
+    }
+
+    /// Share depositada por un comprador específico en este lote.
+    /// Devuelve 0 si el comprador nunca depositó o el lote no existe.
+    pub fn lote_share(&self, lote_id: u64, buyer: Address) -> U512 {
+        self.lote_share.get_or_default(&(lote_id, buyer))
+    }
+
+    /// Bono depositado por el productor para este lote (0 si no existe).
+    pub fn lote_bond(&self, lote_id: u64) -> U512 {
+        self.lote_bond.get_or_default(&lote_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AttestationRecorded, Deposit, Error, MicropaymentRouted, OhuVault, OhuVaultHostRef,
+        AttestationRecorded, BondPosted, DepositedToLote, Deposit, Error, LoteFunded, LoteOpened,
+        LOTE_STATE_FUNDED, LOTE_STATE_OPEN, MicropaymentRouted, OhuVault, OhuVaultHostRef,
         OhuVaultInitArgs, WithdrawApproved, WithdrawExecuted, WithdrawProposed,
     };
     use odra::casper_types::crypto::{self, PublicKey, SecretKey};
@@ -1885,5 +2140,644 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!f.contract.attestation_recorded(1, signer));
+    }
+
+    // ===============================================================
+    // W1-1 — Modelo de lote + escrow earmarked (INV-7)
+    // ===============================================================
+
+    fn simple_setup() -> Fixture {
+        setup()
+    }
+
+    /// Abre un lote con el admin y devuelve el producer.
+    fn open_lote(f: &mut Fixture, lote_id: u64, producer: Address) {
+        f.env.set_caller(f.admin);
+        f.contract.open_lote(lote_id, producer);
+    }
+
+    // ── Positivos: open_lote ────────────────────────────────────────
+
+    #[test]
+    fn open_lote_as_admin_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_producer(1), producer);
+        assert_eq!(f.contract.lote_funded(1), U512::zero());
+        assert_eq!(f.contract.lote_bond(1), U512::zero());
+        assert!(f.env.emitted_event(
+            &f.contract,
+            LoteOpened {
+                lote_id: 1,
+                producer,
+            }
+        ));
+    }
+
+    #[test]
+    fn open_lote_as_operator_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        f.env.set_caller(f.operator);
+        f.contract.open_lote(2, producer);
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_producer(2), producer);
+    }
+
+    #[test]
+    fn open_multiple_lotes_different_ids_succeeds() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        open_lote(&mut f, 1, p0);
+        open_lote(&mut f, 2, p1);
+        assert_eq!(f.contract.lote_producer(1), p0);
+        assert_eq!(f.contract.lote_producer(2), p1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_OPEN);
+    }
+
+    // ── Negativos: open_lote ───────────────────────────────────────
+
+    #[test]
+    fn open_lote_by_approver_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        f.env.set_caller(f.approver0);
+        let result = f.contract.try_open_lote(1, producer);
+        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+    }
+
+    #[test]
+    fn open_lote_by_random_caller_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        f.env.set_caller(f.env.get_account(9));
+        let result = f.contract.try_open_lote(1, producer);
+        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+    }
+
+    #[test]
+    fn open_lote_duplicate_id_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_open_lote(1, f.env.get_account(8));
+        assert_eq!(result.unwrap_err(), Error::LoteAlreadyExists.into());
+        // El productor original sigue intacto.
+        assert_eq!(f.contract.lote_producer(1), producer);
+    }
+
+    #[test]
+    fn open_lote_contract_as_producer_reverts() {
+        let mut f = simple_setup();
+        let vault_addr = f.contract.contract_address();
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_open_lote(1, vault_addr);
+        assert_eq!(result.unwrap_err(), Error::NotAnAccount.into());
+    }
+
+    // ── Positivos: deposit_to_lote ─────────────────────────────────
+
+    #[test]
+    fn deposit_to_lote_records_share_and_emits_event() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let amount = U512::from(3 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(amount).deposit_to_lote(1);
+
+        assert_eq!(f.contract.lote_share(1, buyer), amount);
+        assert_eq!(f.contract.lote_funded(1), amount);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            DepositedToLote {
+                lote_id: 1,
+                buyer,
+                amount,
+            }
+        ));
+    }
+
+    #[test]
+    fn multiple_buyers_deposit_to_same_lote_accumulates() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let b0 = f.env.get_account(8);
+        let b1 = f.env.get_account(9);
+        let a0 = U512::from(2 * ONE_CSPR);
+        let a1 = U512::from(3 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(b0);
+        f.contract.with_tokens(a0).deposit_to_lote(1);
+        f.env.set_caller(b1);
+        f.contract.with_tokens(a1).deposit_to_lote(1);
+
+        assert_eq!(f.contract.lote_share(1, b0), a0);
+        assert_eq!(f.contract.lote_share(1, b1), a1);
+        assert_eq!(f.contract.lote_funded(1), a0 + a1);
+    }
+
+    #[test]
+    fn same_buyer_deposits_twice_accumulates_share() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let a0 = U512::from(ONE_CSPR);
+        let a1 = U512::from(ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(a0).deposit_to_lote(1);
+        f.contract.with_tokens(a1).deposit_to_lote(1);
+
+        assert_eq!(f.contract.lote_share(1, buyer), a0 + a1);
+        assert_eq!(f.contract.lote_funded(1), a0 + a1);
+    }
+
+    // ── Negativos: deposit_to_lote ─────────────────────────────────
+
+    #[test]
+    fn deposit_to_nonexistent_lote_reverts() {
+        let f = simple_setup();
+        let buyer = f.env.get_account(8);
+        f.env.set_caller(buyer);
+        let result = f
+            .contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .try_deposit_to_lote(99);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFound.into());
+    }
+
+    #[test]
+    fn deposit_to_lote_zero_amount_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        let result = f.contract.with_tokens(U512::zero()).try_deposit_to_lote(1);
+        assert_eq!(result.unwrap_err(), Error::ZeroAmount.into());
+        assert_eq!(f.contract.lote_funded(1), U512::zero());
+    }
+
+    #[test]
+    fn deposit_to_funded_lote_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        // Primero: buyer deposita
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .deposit_to_lote(1);
+        // Luego: producer pone bono → transición a FUNDED
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+
+        // Ahora depositar a un lote FUNDED revierte.
+        f.env.set_caller(buyer);
+        let result = f
+            .contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .try_deposit_to_lote(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotOpen.into());
+    }
+
+    // ── Positivos: post_bond ───────────────────────────────────────
+
+    #[test]
+    fn post_bond_by_producer_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let bond = U512::from(10 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+
+        assert_eq!(f.contract.lote_bond(1), bond);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            BondPosted {
+                lote_id: 1,
+                producer,
+                amount: bond,
+            }
+        ));
+    }
+
+    #[test]
+    fn post_bond_transitions_to_funded_when_funded_gt_zero() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        // Deposita primero
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(2 * ONE_CSPR))
+            .deposit_to_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+
+        // Bono cierra el lote → FUNDED
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        assert!(f.env.emitted_event(&f.contract, LoteFunded { lote_id: 1 }));
+    }
+
+    #[test]
+    fn deposit_after_bond_transitions_to_funded() {
+        // Caso inverso: el bono llega primero, luego el depósito.
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        // Bono primero
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN); // aún no fondeado
+
+        // Depósito → transición
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(2 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        assert!(f.env.emitted_event(&f.contract, LoteFunded { lote_id: 1 }));
+    }
+
+    #[test]
+    fn bond_without_deposits_does_not_transition() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        // Sin depósitos, el lote sigue OPEN.
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_bond(1), U512::from(5 * ONE_CSPR));
+    }
+
+    // ── Negativos: post_bond ───────────────────────────────────────
+
+    #[test]
+    fn post_bond_by_non_producer_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(f.env.get_account(9));
+        let result = f
+            .contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .try_post_bond(1);
+        assert_eq!(result.unwrap_err(), Error::NotProducer.into());
+        assert_eq!(f.contract.lote_bond(1), U512::zero());
+    }
+
+    #[test]
+    fn post_bond_twice_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        // Segundo intento
+        let result = f
+            .contract
+            .with_tokens(U512::from(3 * ONE_CSPR))
+            .try_post_bond(1);
+        assert_eq!(result.unwrap_err(), Error::BondAlreadyPosted.into());
+        // El bono original no se alteró.
+        assert_eq!(f.contract.lote_bond(1), U512::from(5 * ONE_CSPR));
+    }
+
+    #[test]
+    fn post_bond_nonexistent_lote_reverts() {
+        let f = simple_setup();
+        let producer = f.env.get_account(7);
+        f.env.set_caller(producer);
+        let result = f
+            .contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .try_post_bond(99);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFound.into());
+    }
+
+    #[test]
+    fn post_bond_zero_amount_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(producer);
+        let result = f.contract.with_tokens(U512::zero()).try_post_bond(1);
+        assert_eq!(result.unwrap_err(), Error::ZeroAmount.into());
+    }
+
+    // ── Getters ─────────────────────────────────────────────────────
+
+    #[test]
+    fn lote_getters_reflect_state_correctly() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let amount = U512::from(4 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(amount).deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        assert_eq!(f.contract.lote_producer(1), producer);
+        assert_eq!(f.contract.lote_funded(1), amount);
+        assert_eq!(f.contract.lote_share(1, buyer), amount);
+        assert_eq!(f.contract.lote_bond(1), bond);
+    }
+
+    #[test]
+    fn lote_state_nonexistent_returns_zero() {
+        let f = simple_setup();
+        assert_eq!(f.contract.lote_state(99), 0);
+    }
+
+    #[test]
+    fn lote_producer_nonexistent_reverts() {
+        let f = simple_setup();
+        // El getter de productor revierte si el lote no existe.
+        let result = f.contract.try_lote_producer(99);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFound.into());
+    }
+
+    #[test]
+    fn lote_share_nonexistent_returns_zero() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+        // Comprador que nunca depositó → share = 0
+        assert_eq!(f.contract.lote_share(1, buyer), U512::zero());
+    }
+
+    // ===============================================================
+    // INV-7 — Aislamiento entre lotes
+    // ===============================================================
+
+    #[test]
+    fn inv7_two_lotes_deposits_isolated() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let buyer = f.env.get_account(9);
+        let a0 = U512::from(3 * ONE_CSPR);
+        let a1 = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, p0);
+        open_lote(&mut f, 2, p1);
+
+        // Deposita al lote 1
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(a0).deposit_to_lote(1);
+        // Deposita al lote 2 (mismo comprador, lote distinto)
+        f.contract.with_tokens(a1).deposit_to_lote(2);
+
+        // Contabilidad de cada lote independiente (INV-7)
+        assert_eq!(f.contract.lote_funded(1), a0);
+        assert_eq!(f.contract.lote_funded(2), a1);
+        assert_eq!(f.contract.lote_share(1, buyer), a0);
+        assert_eq!(f.contract.lote_share(2, buyer), a1);
+        // Ningún lote se "llevó" el saldo del otro
+        assert_ne!(f.contract.lote_funded(1), f.contract.lote_funded(2));
+    }
+
+    #[test]
+    fn inv7_bond_isolated_between_lotes() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let b0 = U512::from(10 * ONE_CSPR);
+        let b1 = U512::from(20 * ONE_CSPR);
+        open_lote(&mut f, 1, p0);
+        open_lote(&mut f, 2, p1);
+
+        f.env.set_caller(p0);
+        f.contract.with_tokens(b0).post_bond(1);
+        f.env.set_caller(p1);
+        f.contract.with_tokens(b1).post_bond(2);
+
+        assert_eq!(f.contract.lote_bond(1), b0);
+        assert_eq!(f.contract.lote_bond(2), b1);
+    }
+
+    #[test]
+    fn inv7_deposit_to_lote_a_does_not_affect_lote_b() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let buyer = f.env.get_account(9);
+        open_lote(&mut f, 1, p0);
+        open_lote(&mut f, 2, p1);
+
+        // Solo se deposita en lote 1
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .deposit_to_lote(1);
+
+        // Lote 1 tiene fondeo; lote 2 sigue en 0
+        assert_eq!(f.contract.lote_funded(1), U512::from(ONE_CSPR));
+        assert_eq!(f.contract.lote_funded(2), U512::zero());
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_OPEN);
+    }
+
+    #[test]
+    fn inv7_lote_b_funding_does_not_trigger_lote_a_transition() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let buyer = f.env.get_account(9);
+        open_lote(&mut f, 1, p0);
+        open_lote(&mut f, 2, p1);
+
+        // Lote 1: tiene bono pero sin fondeo
+        f.env.set_caller(p0);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN); // sin fondeo → sigue OPEN
+
+        // Lote 2: se fondea y transiciona normalmente
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(2 * ONE_CSPR))
+            .deposit_to_lote(2);
+        f.env.set_caller(p1);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(2);
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_FUNDED);
+
+        // Lote 1 NO fue arrastrado a FUNDED por el evento del lote 2
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+    }
+
+    #[test]
+    fn inv7_share_query_returns_only_target_lote() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let buyer = f.env.get_account(9);
+        open_lote(&mut f, 1, p0);
+        open_lote(&mut f, 2, p1);
+
+        // El comprador deposita SOLO en lote 1
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(3 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        // Share en lote 2 del mismo comprador = 0 (INV-7: sin cruce)
+        assert_eq!(
+            f.contract.lote_share(1, buyer),
+            U512::from(3 * ONE_CSPR)
+        );
+        assert_eq!(f.contract.lote_share(2, buyer), U512::zero());
+    }
+
+    #[test]
+    fn inv7_three_lotes_fully_isolated() {
+        let mut f = simple_setup();
+        let p = [f.env.get_account(7), f.env.get_account(8), f.env.get_account(9)];
+        let buyers: Vec<Address> = (10..13).map(|i| f.env.get_account(i)).collect();
+        let amounts = [
+            U512::from(ONE_CSPR),
+            U512::from(2 * ONE_CSPR),
+            U512::from(3 * ONE_CSPR),
+        ];
+        let bonds = [
+            U512::from(10 * ONE_CSPR),
+            U512::from(20 * ONE_CSPR),
+            U512::from(30 * ONE_CSPR),
+        ];
+
+        for i in 0..3u64 {
+            open_lote(&mut f, i + 1, p[i as usize]);
+        }
+
+        // Depósitos cruzados: cada comprador deposita a su lote
+        for i in 0..3u64 {
+            f.env.set_caller(buyers[i as usize]);
+            f.contract.with_tokens(amounts[i as usize]).deposit_to_lote(i + 1);
+        }
+
+        // Bonos
+        for i in 0..3u64 {
+            f.env.set_caller(p[i as usize]);
+            f.contract.with_tokens(bonds[i as usize]).post_bond(i + 1);
+        }
+
+        // Verifica aislamiento total
+        for i in 0..3u64 {
+            let id = i + 1;
+            assert_eq!(f.contract.lote_funded(id), amounts[i as usize]);
+            assert_eq!(f.contract.lote_bond(id), bonds[i as usize]);
+            assert_eq!(f.contract.lote_state(id), LOTE_STATE_FUNDED);
+            assert_eq!(
+                f.contract.lote_share(id, buyers[i as usize]),
+                amounts[i as usize]
+            );
+            // Compradores de otros lotes no tienen share aquí
+            for j in 0..3u64 {
+                if i != j {
+                    assert_eq!(
+                        f.contract.lote_share(id, buyers[j as usize]),
+                        U512::zero(),
+                        "lote {} no debe tener share de comprador del lote {}",
+                        id,
+                        j + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inv7_lote_a_bond_does_not_count_towards_lote_b_funding() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        open_lote(&mut f, 1, p0);
+        open_lote(&mut f, 2, p1);
+
+        // Poner bono solo en lote 1
+        f.env.set_caller(p0);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        // lote_bond del lote 2 sigue siendo 0
+        assert_eq!(f.contract.lote_bond(2), U512::zero());
+
+        // lote_funded del lote 2 no se ve afectado
+        assert_eq!(f.contract.lote_funded(2), U512::zero());
+    }
+
+    #[test]
+    fn inv7_self_balance_is_not_used_for_lote_accounting() {
+        // INV-7 explícito: la contabilidad por-lote vive en Mappings,
+        // NUNCA en self_balance().
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(3 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        // El balance global del purse incluye los 100 CSPR del setup + 3 del depósito.
+        // La contabilidad del lote es independiente.
+        let global_balance = f.env.balance_of(&f.contract);
+        assert!(global_balance > f.contract.lote_funded(1));
+        // funded del lote = exactamente lo depositado al lote, no el balance global.
+        assert_eq!(
+            f.contract.lote_funded(1),
+            U512::from(3 * ONE_CSPR)
+        );
     }
 }
