@@ -4,9 +4,9 @@
 > Ohu**, **qué está construido hoy**, **cómo trabajamos**, y **el roadmap**. Léelo primero; luego
 > profundiza en los documentos enlazados.
 >
-> **Última actualización:** 2026-06-29 · rama `main` @ `4c21e67` (**+4 sobre `origin/main`, sin
-> pushear**) · **Fase 0 CERRADA**; **Semana 1 EN CURSO: W1-0 + W1-1 mergeadas (89 tests verdes),
-> W1-2 siguiente**.
+> **Última actualización:** 2026-06-29 · rama `main` @ `fee21a7` (**+6 sobre `origin/main`, sin
+> pushear**) · **Fase 0 CERRADA**; **Semana 1 EN CURSO: W1-0 + W1-1 + W1-2 mergeadas (111 tests
+> verdes); W1-3 (deploy Testnet) siguiente** — requiere `casper-client`.
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
@@ -186,7 +186,10 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 - **W1-1** ✅ modelo de lote + escrow **earmarked** (`open_lote`/`deposit_to_lote`/`post_bond`) — INV-7.
   `3141cf3` + fix `4c21e67` — DeepSeek V4 Pro, **audit dual Claude + Gemini 3.1 Pro High** (fix-round:
   `checked_add`/`Error::Overflow`, `post_bond` state==OPEN, `NotAdminNorOperator`). **89 tests verdes.**
-- **W1-2** 🔜 `release_to_producer` happy-path (gate admin M-de-N interino). **Siguiente.**
+- **W1-2** ✅ `release_to_producer` happy-path (M-de-N **lote-aware** interino:
+  `propose_release`/`approve_release`/`release_to_producer`, estado `SETTLED_OK`, CEI estricto,
+  paga `funded+bond` al productor). `fee21a7` — DeepSeek V4 Pro, **audit dual Claude + Gemini
+  (PASA sin fixes)**. **111 tests verdes.**
 - **W1-3** 🔜 **deploy real a Testnet** + E2E feliz + **multisig nativo real** (cierra el TODO de S2).
   ⚠️ requiere instalar `casper-client` (no presente en macOS).
 
