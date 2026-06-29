@@ -4,8 +4,9 @@
 > Ohu**, **qué está construido hoy**, **cómo trabajamos**, y **el roadmap**. Léelo primero; luego
 > profundiza en los documentos enlazados.
 >
-> **Última actualización:** 2026-06-29 · rama de trabajo `fase-0` @ `a4ce714` · **Fase 0 CERRADA**,
-> **Semana 1 planeada (sin empezar)**.
+> **Última actualización:** 2026-06-29 · rama `main` @ `e1d73a3` (todo consolidado y pusheado) ·
+> **Fase 0 CERRADA**, **Semana 1 planeada (sin empezar)**.
+> **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
 
@@ -17,8 +18,9 @@
   y typecheck limpios.
 - **Próximo:** **Semana 1 — núcleo de liquidación** (modelo de lote + settlement happy-path en
   Testnet). Planeada en `docs/plan/semana-1.md`, aún sin implementar.
-- **Modo de trabajo:** **Claude planifica en detalle y audita**; **agentes opencode implementan**
-  (no Anthropic — GLM-5.2, DeepSeek V4 Pro, Qwen3.7 Max, Kimi, MiniMax, etc.). Ver §5.
+- **Modo de trabajo:** **Claude planifica en detalle y audita**; **opencode** implementa lo pesado
+  (DeepSeek V4 Pro, Kimi K2.7 Code, MiniMax M3) y **agy/Antigravity** (Gemini 3.1 Pro high + 3.5 Flash)
+  hace worker ligero + audit; **GPT-5.5** audita lo que toca fondos. Ver §5.
 
 ---
 
@@ -64,17 +66,31 @@ ohu/
 
 ## 3. Estado del repositorio
 
-- **Rama de trabajo:** `fase-0` (todo el trabajo vive aquí, **local, NO pusheado**).
-- **`main`:** solo el commit inicial (`21cc72e`, spec + due diligence + CLAUDE.md) — **eso es lo
-  único en GitHub** (`manuelpenazuniga/ohu`). ⚠️ Para reflejar el avance en el remoto hay que
-  **pushear `fase-0`** (o mergear a `main`).
-- **Verde verificado:** `cargo odra test` → **55/55**; `pnpm -r test` → agents **24/24**, web **1/1**;
-  clippy `-D warnings` limpio; typecheck limpio.
-- **Cuentas GitHub:** el push debe hacerse como **`manuelpenazuniga`** (no `fundacionrescatedemascotas`,
-  que es la otra cuenta activa). La identidad de commit del repo está fijada localmente a
-  `manuelpenazuniga` (noreply).
+- **Rama activa:** `main` @ `e1d73a3` — **toda la Fase 0 está consolidada en `main` y pusheada a
+  `origin/main`** (`github.com/manuelpenazuniga/ohu`). La rama `fase-0` ya no existe local; su
+  historia (S0→S3 + planes) quedó en `main`. ✅ El remoto ya refleja el avance.
+- **Cuentas GitHub:** identidad de commit fijada a **`manuelpenazuniga`**
+  (`manuelpenazuniga@gmail.com` / noreply), no `fundacionrescatedemascotas`.
 
-### 3.1 Qué existe en el contrato HOY (`OhuVault`)
+### 3.1 Entorno macOS (migración desde WSL2 — verificado 2026-06-29)
+Repo clonado desde GitHub; el origen era **WSL2 (Linux x86_64)** y ahora corre en **macOS Apple
+Silicon (arm64)**. Compatibilidad comprobada de punta a punta — **todo verde**:
+
+| Check | Resultado en macOS arm64 |
+|---|---|
+| `cargo odra test` | ✅ **55/55** |
+| `pnpm -r test` | ✅ agents **24/24**, web **1/1** |
+| `cargo clippy --all-targets -D warnings` | ✅ limpio |
+| Toolchain pinned (`contracts/rust-toolchain` = `nightly-2026-01-01`) | ✅ instalado como `-aarch64-apple-darwin` |
+| `cargo-odra` 0.1.7 · Node v22 · pnpm 11.8.0 | ✅ presentes |
+| `target/` recompilado (Mach-O arm64, **sin** restos ELF de WSL2) | ✅ paquetes regenerados |
+| Scripts `infra/scripts/*.sh` (UTF-8, sin CRLF) | ✅ sin artefactos de Windows |
+
+- **Único gap del toolchain:** **`casper-client` NO instalado** — sólo hace falta para el **deploy a
+  Testnet (W1-3)**; nada del trabajo actual lo requiere. Instalar antes de W1-3.
+- `contracts/wasm/` aún no generado (no se ha corrido `just build` del contrato todavía).
+
+### 3.2 Qué existe en el contrato HOY (`OhuVault`)
 Entrypoints (todos sin Addressable Entity; custodia en el `purse` del contrato):
 
 | Entrypoint | Quién | Qué hace | Estado de seguridad |
@@ -92,7 +108,7 @@ Entrypoints (todos sin Addressable Entity; custodia en el `purse` del contrato):
   como **roadmap** (`#[allow(dead_code)]`).
 - **Limpieza pendiente:** `contracts/src/placeholder.rs` (huérfano de S0, no expuesto en `lib.rs`).
 
-### 3.2 Qué existe en agents (riel B x402)
+### 3.3 Qué existe en agents (riel B x402)
 `agents/src/x402/` — oráculo de reputación pago-por-request: `reputation-server`, `facilitator`
 local (fallback), `FailoverFacilitatorClient`, cliente de pago. **INV-4 fail-closed** (no cobra
 contra el escrow) e **idempotencia de settle** (no reintenta `settle` en el fallback).
@@ -128,19 +144,25 @@ contra el escrow) e **idempotencia de settle** (no reintenta `settle` en el fall
    layout + regla anti-alucinación + "commitea en tu rama").
 
 ### 5.1 Routing de modelos (resumen — detalle en `docs/plan/model-routing.md`)
-La **cuota (peticiones/5h)** es el muro, no el $. Reservar T2 (GLM-5.2 880/5h, Qwen3.7 Max 950/5h)
-para lo más duro; **MiniMax M3** (promo x3) de caballo de batalla.
+**Dos pools, por escasez:** la **cuota de opencode (req/5h) es el recurso caro/escaso** → solo impl
+pesada (DeepSeek V4 Pro, Kimi K2.7 Code, MiniMax M3). El **plan de agy/Antigravity (Gemini) es
+generoso** → trabajo ligero + auditorías. **Fuera Qwen3.7 Max y GLM-5.2** (quemaron una cuenta en 1
+día). **GPT-5.5** = audit premium de lo que toca fondos.
 
 | Trabajo | Primario | Escalar | Auditar |
 |---|---|---|---|
-| **Contratos (fondos)** | **DeepSeek V4 Pro** *(validado)* | GLM-5.2 | dual **Qwen3.7 Max + GLM-5.2** + Claude |
-| Agentes TS / x402 | MiniMax M3 ⚡ | DeepSeek V4 Pro | — |
-| Tests | MiniMax M2.7 | — | — |
-| Infra / deploy / CI | MiniMax M3 | GLM-5.2 | Claude |
-| Web / frontend | Qwen3.7 Plus | GLM-5.2 | — |
+| **Contratos (fondos)** | **DeepSeek V4 Pro** / Kimi K2.7 Code *(opencode)* | **Gemini 3.1 Pro high** *(agy)* | **GPT-5.5 + Gemini 3.1 Pro high + Claude** |
+| Agentes TS / x402 | MiniMax M3 ⚡ | Gemini 3.1 Pro high | — |
+| Tests | Gemini 3.5 Flash (med) / MiniMax M2.7 | — | — |
+| Infra / deploy / CI | Gemini 3.5 Flash (med) / M3 | — | Claude |
+| Web / frontend | Gemini 3.5 Flash (high) | — | — |
 
-**Calibración real:** Kimi K2.7 Code → mejor contrato (S1) · GLM-5.2 → x402+fixes limpios ·
-DeepSeek V4 Pro → fix de S2 limpio → **primario de contratos** (~4× cuota vs GLM).
+**Herramientas:** **opencode** = impl pesada (cuota escasa) · **agy/Antigravity** = Gemini 3.1 Pro
+high (auditor primario/escalación) + Gemini 3.5 Flash med/high (worker **solo tareas simples** — no
+sofisticadas; plan generoso) · **GPT-5.5** = auditor premium · **Claude** = planifica + audita.
+
+**Calibración real:** Kimi K2.7 Code → mejor contrato (S1) · DeepSeek V4 Pro → fix de S2 limpio →
+**primario de contratos**. (Qwen3.7 Max/GLM-5.2 retirados por **costo**, no por calidad.)
 
 ---
 
@@ -210,7 +232,8 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 2. Estado: `git -C . log --oneline -5` en `fase-0`; `cd contracts && cargo odra test` para
    confirmar verde.
 3. Próxima acción concreta: **arrancar W1-1 (+W1-0)** — abrir un worktree aislado
-   (`git worktree add ../ohu-w1 -b spike/w1-lote fase-0`), darle a **DeepSeek V4 Pro** el
-   `_wrapper.md` + el brief de W1-1, y **auditar** el resultado (dual Qwen3.7 Max + GLM-5.2 + Claude)
-   contra los criterios de `semana-1.md` y los invariantes (en especial **INV-7**).
+   (`git worktree add ../ohu-w1 -b spike/w1-lote main`), darle a **DeepSeek V4 Pro** (o Kimi K2.7
+   Code) el `_wrapper.md` + el brief de W1-1, y **auditar** el resultado
+   (**GPT-5.5 + Gemini 3.1 Pro high + Claude**) contra los criterios de `semana-1.md` y los
+   invariantes (en especial **INV-7**).
 4. Tras cada tarea de contrato: **audit dual** → merge ff a `fase-0`.

@@ -5,8 +5,9 @@
 > end-to-end en Testnet**.
 >
 > **Rol/auditoría/invariantes:** `fase-0-derisk.md §1` + `model-routing.md`. Contratos =
-> **DeepSeek V4 Pro** primario → **GLM-5.2** escalación; **audit dual Qwen3.7 Max + GLM-5.2 +
-> Claude**. Tests → MiniMax M2.7. Infra/deploy → MiniMax M3 (⚡promo).
+> **DeepSeek V4 Pro / Kimi K2.7 Code** (opencode) → escalación **Gemini 3.1 Pro high** (agy);
+> **audit triple GPT-5.5 + Gemini 3.1 Pro high + Claude**. Tests → Gemini 3.5 Flash (med).
+> Infra/deploy → Gemini 3.5 Flash (med) o MiniMax M3.
 
 ## Objetivo
 Pasar del vault genérico de Fase 0 al **modelo de LOTE**: los compradores depositan su parte
@@ -38,7 +39,7 @@ autorización de atestaciones (S3 #1) y la liquidación paramétrica — ambas d
 - **Aceptación:** N compradores depositan al lote L → `funded(L) == Σ shares`; depositar a un lote
   inexistente/cerrado revierte; el bono queda registrado; **INV-7:** tests que prueban que los
   fondos de L no afectan a L'.
-- **Dependencias:** Fase 0. **Modelo:** DeepSeek V4 Pro → GLM-5.2. **Audita (dual):** Qwen3.7 Max + GLM-5.2 + Claude.
+- **Dependencias:** Fase 0. **Modelo:** DeepSeek V4 Pro / Kimi K2.7 Code → Gemini 3.1 Pro high. **Audita (triple):** GPT-5.5 + Gemini 3.1 Pro high + Claude.
 - **Auditoría:** contabilidad por-lote sin mezclar el purse global; overflow U512 en sumas; ¿un
   comprador puede inflar su share o retirar antes de tiempo?; control de acceso de `open_lote`.
 
@@ -52,7 +53,7 @@ autorización de atestaciones (S3 #1) y la liquidación paramétrica — ambas d
   recién entonces se le añade autorización (S3 #1) + valid_before (S3 #2).`
 - **Aceptación:** lote `FUNDED` + M-de-N → el productor recibe `funded(L)`, bono devuelto, estado
   `SETTLED_OK`; sin M-de-N revierte; no se liquida dos veces; no se liquida un lote no-`FUNDED`.
-- **Dependencias:** W1-1. **Modelo:** DeepSeek V4 Pro → GLM-5.2. **Audita (dual):** Qwen3.7 Max + GLM-5.2 + Claude.
+- **Dependencias:** W1-1. **Modelo:** DeepSeek V4 Pro / Kimi K2.7 Code → Gemini 3.1 Pro high. **Audita (triple):** GPT-5.5 + Gemini 3.1 Pro high + Claude.
 - **Auditoría:** CEI/reentrancy; ¿se puede pagar a otro productor?; doble settlement; bono devuelto
   al productor correcto; **INV-7** (no cruzar lotes).
 
@@ -66,8 +67,8 @@ autorización de atestaciones (S3 #1) y la liquidación paramétrica — ambas d
   el productor recibe, **visible en CSPR.cloud**.
 - **Aceptación:** en Testnet un lote feliz liquida E2E; el deploy de `release` exige **co-firma
   nativa real** (no una sola clave) → cierra el criterio de S2 "el threshold real fuerza co-firma".
-- **Dependencias:** W1-2. **Modelo:** infra/backend → **MiniMax M3** ⚡; código de contrato →
-  DeepSeek V4 Pro. **Audita:** Claude (scripts + verificación on-chain) + GLM-5.2.
+- **Dependencias:** W1-2. **Modelo:** infra/backend → **Gemini 3.5 Flash (med)** o **MiniMax M3** ⚡;
+  código de contrato → DeepSeek V4 Pro. **Audita:** Claude (scripts + verificación on-chain) + Gemini 3.1 Pro high.
 - **Auditoría:** secrets fuera de git; el E2E prueba co-firma **real**; se ve on-chain en
   CSPR.cloud; fallback documentado si el keys-manager WASM no existe.
 

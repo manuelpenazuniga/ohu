@@ -1,5 +1,10 @@
 # Asignación multiagente de modelos — OpenCode (jun 2026)
 
+> ⚠️ **SUPERSEDIDO en routing (2026-06-29):** este doc es la **evidencia cruda del bench**, no el
+> routing vigente. **Qwen3.7 Max y GLM-5.2 fueron RETIRADOS por costo** (quemaron una cuenta en 1
+> día) — donde abajo se recomienden, léelos como histórico. Routing actual = `docs/plan/model-routing.md`
+> (opencode = impl pesada · agy/Gemini = ligero + audit · GPT-5.5 = audit premium).
+>
 > Análisis costo-beneficio para enrutar 13 modelos a tareas de dev según tu perfil
 > (Rust / Web3 / web-LMS / Node / planificación). Benchmarks recopilados jun 2026.
 
