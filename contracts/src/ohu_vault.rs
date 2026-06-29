@@ -133,6 +133,12 @@ pub enum Error {
     Overflow = 45,
     /// El caller no es admin ni operator (gate de open_lote).
     NotAdminNorOperator = 46,
+    /// El lote no está en estado FUNDED (release/propose/approve).
+    LoteNotFunded = 47,
+    /// Ya hay propuesta de release abierta para este lote.
+    ReleaseAlreadyProposed = 48,
+    /// No hay propuesta de release abierta para este lote.
+    ReleaseNotProposed = 49,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -215,12 +221,38 @@ pub struct LoteFunded {
     pub lote_id: u64,
 }
 
+// ── W1-2: settlement happy-path ──
+
+/// Evento: se propone la liberación del escrow de un lote al productor.
+#[odra::event]
+pub struct ReleaseProposed {
+    pub lote_id: u64,
+    pub proposer: Address,
+}
+
+/// Evento: un approver vota la liberación del escrow de un lote.
+#[odra::event]
+pub struct ReleaseApproved {
+    pub lote_id: u64,
+    pub approver: Address,
+    pub count: u8,
+}
+
+/// Evento: el escrow del lote se libera al productor (SETTLED_OK).
+#[odra::event]
+pub struct ReleasedToProducer {
+    pub lote_id: u64,
+    pub producer: Address,
+    pub funded: U512,
+    pub bond: U512,
+}
+
 /// Contrato de custodia de Ohu.
 ///
 /// TODO(audit): CES (`emit_event`) es el event standard soportado por Odra.
 /// Verificar si CSPR.cloud indexa CES, native events, o ambos; ajustar a
 /// `emit_native_event` si es necesario. Ver <https://odra.dev/docs/basics/events>.
-#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded, LoteOpened, DepositedToLote, BondPosted, LoteFunded])]
+#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded, LoteOpened, DepositedToLote, BondPosted, LoteFunded, ReleaseProposed, ReleaseApproved, ReleasedToProducer])]
 pub struct OhuVault {
     /// Cuenta que ejecuta releases grandes (`caller == admin` en `execute`).
     admin: Var<Address>,
@@ -268,12 +300,20 @@ pub struct OhuVault {
     lote_share: Mapping<(u64, Address), U512>,
     /// Bono de cumplimiento depositado por el productor del lote.
     lote_bond: Mapping<u64, U512>,
+    // ── W1-2: settlement M-de-N lote-aware ──
+    /// `true` si ya hay una propuesta de release abierta para este lote.
+    lote_release_proposed: Mapping<u64, bool>,
+    /// Aprobaciones distintas acumuladas para el release de este lote.
+    lote_release_approvals: Mapping<u64, u8>,
+    /// `(lote_id, approver) -> true`: anti doble-aprobación.
+    lote_release_has_approved: Mapping<(u64, Address), bool>,
 }
 
 /// Constantes de estado de lote (W1-1).
 /// 0 = inexistente (default de Mapping); 1 = OPEN; 2 = FUNDED.
 const LOTE_STATE_OPEN: u8 = 1;
 const LOTE_STATE_FUNDED: u8 = 2;
+const LOTE_STATE_SETTLED_OK: u8 = 3;
 
 #[odra::module]
 impl OhuVault {
@@ -835,6 +875,130 @@ impl OhuVault {
         }
     }
 
+    // ── W1-2: settlement M-de-N lote-aware ──
+
+    /// Propone la liberación del escrow de un lote al productor.
+    ///
+    /// Gate: `caller == admin` o `caller` es approver. El operator NO.
+    /// El lote debe estar en estado FUNDED.
+    /// Idempotente: si ya hay propuesta abierta → `ReleaseAlreadyProposed`.
+    pub fn propose_release(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        let caller_is_approver = self.is_approver.get_or_default(&caller);
+        if caller != admin && !caller_is_approver {
+            self.env().revert(Error::NotApprover);
+        }
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_FUNDED {
+            self.env().revert(Error::LoteNotFunded);
+        }
+
+        if self.lote_release_proposed.get_or_default(&lote_id) {
+            self.env().revert(Error::ReleaseAlreadyProposed);
+        }
+
+        self.lote_release_proposed.set(&lote_id, true);
+
+        self.env().emit_event(ReleaseProposed {
+            lote_id,
+            proposer: caller,
+        });
+    }
+
+    /// Aprueba el release de un lote. Solo `approvers`; un mismo approver
+    /// no puede aprobar dos veces el release del mismo lote.
+    pub fn approve_release(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+        if !self.is_approver.get_or_default(&caller) {
+            self.env().revert(Error::NotApprover);
+        }
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_FUNDED {
+            self.env().revert(Error::LoteNotFunded);
+        }
+
+        if !self.lote_release_proposed.get_or_default(&lote_id) {
+            self.env().revert(Error::ReleaseNotProposed);
+        }
+
+        let key = (lote_id, caller);
+        if self.lote_release_has_approved.get_or_default(&key) {
+            self.env().revert(Error::AlreadyApproved);
+        }
+        self.lote_release_has_approved.set(&key, true);
+
+        let count = self.lote_release_approvals.get_or_default(&lote_id) + 1;
+        self.lote_release_approvals.set(&lote_id, count);
+
+        self.env().emit_event(ReleaseApproved {
+            lote_id,
+            approver: caller,
+            count,
+        });
+    }
+
+    /// Ejecuta el settlement de un lote: libera el escrow (`funded`)
+    /// al productor y le devuelve su bono. Estado → SETTLED_OK.
+    ///
+    /// Doble gate (INV-1):
+    /// - `caller == admin`.
+    /// - `lote_release_approvals[lote_id] >= required_approvals` (M-de-N on-chain).
+    ///
+    /// CEI estricto: marca SETTLED_OK antes de `transfer_tokens`.
+    pub fn release_to_producer(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        if caller != admin {
+            self.env().revert(Error::NotAdmin);
+        }
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_FUNDED {
+            self.env().revert(Error::LoteNotFunded);
+        }
+
+        // TODO(Sem2): reemplazar el gate admin + M-de-N por el disparador PARAMETRICO
+        // (tally de atestaciones ponderadas >= umbral, INV-2). Aquí se conectara verify_attestation;
+        // recien entonces se le anade autorizacion del firmante (S3 #1) + valid_before (S3 #2).
+        let count = self.lote_release_approvals.get_or_default(&lote_id);
+        let required = self
+            .required_approvals
+            .get_or_revert_with(Error::NotInitialized);
+        if count < required {
+            self.env().revert(Error::InsufficientApprovals);
+        }
+
+        let payout = self.lote_funded.get_or_default(&lote_id);
+        let bond = self.lote_bond.get_or_default(&lote_id);
+
+        let total = payout
+            .checked_add(bond)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        let balance = self.env().self_balance();
+        if total > balance {
+            self.env().revert(Error::InsufficientBalance);
+        }
+
+        let producer = match self.lote_producer.get(&lote_id) {
+            Some(p) => p,
+            None => self.env().revert(Error::LoteNotFound),
+        };
+
+        // CEI: effects antes que interactions (defensa en profundidad).
+        self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_OK);
+        self.env().transfer_tokens(&producer, &total);
+        self.env().emit_event(ReleasedToProducer {
+            lote_id,
+            producer,
+            funded: payout,
+            bond,
+        });
+    }
+
     // ── Getters de atestación (S3) ──
 
     /// ¿La atestación para `(lote_id, signer)` ya fue registrada?
@@ -956,14 +1120,23 @@ impl OhuVault {
     pub fn lote_bond(&self, lote_id: u64) -> U512 {
         self.lote_bond.get_or_default(&lote_id)
     }
+
+    // ── W1-2: getters de settlement ──
+
+    /// Aprobaciones distintas acumuladas para el release del lote.
+    pub fn lote_release_approvals(&self, lote_id: u64) -> u8 {
+        self.lote_release_approvals.get_or_default(&lote_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AttestationRecorded, BondPosted, DepositedToLote, Deposit, Error, LoteFunded, LoteOpened,
-        LOTE_STATE_FUNDED, LOTE_STATE_OPEN, MicropaymentRouted, OhuVault, OhuVaultHostRef,
-        OhuVaultInitArgs, WithdrawApproved, WithdrawExecuted, WithdrawProposed,
+        LOTE_STATE_FUNDED, LOTE_STATE_OPEN, LOTE_STATE_SETTLED_OK,
+        MicropaymentRouted, OhuVault, OhuVaultHostRef, OhuVaultInitArgs,
+        ReleaseApproved, ReleasedToProducer, ReleaseProposed,
+        WithdrawApproved, WithdrawExecuted, WithdrawProposed,
     };
     use odra::casper_types::crypto::{self, PublicKey, SecretKey};
     use odra::casper_types::U512;
@@ -2789,5 +2962,501 @@ mod tests {
             f.contract.lote_funded(1),
             U512::from(3 * ONE_CSPR)
         );
+    }
+
+    // ===============================================================
+    // W1-2 — Settlement happy-path (release_to_producer)
+    // ===============================================================
+
+    /// Fundea un lote completo con comprador + bono y lo retorna en estado FUNDED.
+    /// Usa el admin para abrir, un comprador (acct 8) para depositar, el producer para el bono.
+    fn fund_lote(f: &mut Fixture, lote_id: u64, producer: Address, funded_amount: U512, bond_amount: U512) {
+        open_lote(f, lote_id, producer);
+        let buyer = f.env.get_account(8);
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(funded_amount).deposit_to_lote(lote_id);
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond_amount).post_bond(lote_id);
+        assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_FUNDED);
+    }
+
+    // ── Positivos: happy-path ──────────────────────────────────────
+
+    #[test]
+    fn release_to_producer_with_m_approvals_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+        let vault_before = f.env.balance_of(&f.contract);
+
+        // Proponer release
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+
+        // M=2 aprobaciones
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+
+        let producer_before = f.env.balance_of(&producer);
+
+        // Ejecutar
+        f.env.set_caller(f.admin);
+        f.contract.release_to_producer(1);
+
+        // Estado → SETTLED_OK
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+        // Productor recibe funded + bond
+        assert_eq!(f.env.balance_of(&producer), producer_before + funded + bond);
+        assert_eq!(f.env.balance_of(&f.contract), vault_before - (funded + bond));
+        // Evento
+        assert!(f.env.emitted_event(
+            &f.contract,
+            ReleasedToProducer {
+                lote_id: 1,
+                producer,
+                funded,
+                bond,
+            }
+        ));
+    }
+
+    #[test]
+    fn release_events_proposed_and_approved_emitted() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(2 * ONE_CSPR);
+        let bond = U512::from(3 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        // Proponer
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            ReleaseProposed { lote_id: 1, proposer: f.admin }
+        ));
+
+        // Aprobar
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            ReleaseApproved { lote_id: 1, approver: f.approver0, count: 1 }
+        ));
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            ReleaseApproved { lote_id: 1, approver: f.approver1, count: 2 }
+        ));
+    }
+
+    #[test]
+    fn release_with_three_distinct_approvals_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        // Proponer como approver
+        f.env.set_caller(f.approver2);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver2);
+        f.contract.approve_release(1);
+        assert_eq!(f.contract.lote_release_approvals(1), 3);
+
+        f.env.set_caller(f.admin);
+        f.contract.release_to_producer(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+    }
+
+    #[test]
+    fn propose_release_as_approver_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        // Un approver propone el release
+        f.env.set_caller(f.approver0);
+        f.contract.propose_release(1);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            ReleaseProposed { lote_id: 1, proposer: f.approver0 }
+        ));
+    }
+
+    // ── Negativos: sin M-de-N suficiente ───────────────────────────
+
+    #[test]
+    fn release_without_approvals_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+
+        // Sin aprobaciones → InsufficientApprovals
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::InsufficientApprovals.into());
+        // No se movió capital, estado sigue FUNDED
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+    }
+
+    #[test]
+    fn release_with_insufficient_approvals_reverts() {
+        let mut f = simple_setup(); // required = 2
+        let producer = f.env.get_account(7);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1); // solo 1 de 2
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::InsufficientApprovals.into());
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        assert_eq!(f.contract.lote_release_approvals(1), 1);
+    }
+
+    // ── Negativos: doble settlement ────────────────────────────────
+
+    #[test]
+    fn release_twice_reverts_lote_not_funded() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+
+        f.env.set_caller(f.admin);
+        f.contract.release_to_producer(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+
+        // Segundo intento → LoteNotFunded (ya no es FUNDED)
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    // ── Negativos: liquidar lote no-FUNDED ─────────────────────────
+
+    #[test]
+    fn release_to_open_lote_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    #[test]
+    fn propose_release_on_open_lote_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_propose_release(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    #[test]
+    fn approve_release_on_open_lote_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(f.approver0);
+        let result = f.contract.try_approve_release(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    #[test]
+    fn propose_release_on_nonexistent_lote_reverts() {
+        let mut f = simple_setup();
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_propose_release(99);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    #[test]
+    fn release_to_nonexistent_lote_reverts() {
+        let mut f = simple_setup();
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_release_to_producer(99);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    // ── Negativos: operator no puede mover capital ──────────────────
+
+    #[test]
+    fn operator_cannot_propose_release_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.operator);
+        let result = f.contract.try_propose_release(1);
+        assert_eq!(result.unwrap_err(), Error::NotApprover.into());
+    }
+
+    #[test]
+    fn operator_cannot_approve_release_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+
+        f.env.set_caller(f.operator);
+        let result = f.contract.try_approve_release(1);
+        assert_eq!(result.unwrap_err(), Error::NotApprover.into());
+        assert_eq!(f.contract.lote_release_approvals(1), 0);
+    }
+
+    #[test]
+    fn operator_cannot_execute_release_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+
+        f.env.set_caller(f.operator);
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+        // Estado sigue FUNDED, capital no se movió
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+    }
+
+    #[test]
+    fn random_caller_cannot_release_to_producer_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+
+        let random = f.env.get_account(9);
+        f.env.set_caller(random);
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+    }
+
+    // ── INV-7: dos lotes FUNDED, liquidar L1 no altera L2 ──────────
+
+    #[test]
+    fn inv7_release_l1_pays_only_producer_l1_and_does_not_alter_l2() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let _buyer = f.env.get_account(9);
+        let funded0 = U512::from(3 * ONE_CSPR);
+        let bond0 = U512::from(5 * ONE_CSPR);
+        let funded1 = U512::from(4 * ONE_CSPR);
+        let bond1 = U512::from(6 * ONE_CSPR);
+
+        // Fundea ambos lotes
+        fund_lote(&mut f, 1, p0, funded0, bond0);
+        fund_lote(&mut f, 2, p1, funded1, bond1);
+
+        let vault_before = f.env.balance_of(&f.contract);
+        let p0_before = f.env.balance_of(&p0);
+        let p1_before = f.env.balance_of(&p1);
+
+        // Propone y aprueba SOLO lote 1
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+
+        // Ejecuta release de lote 1
+        f.env.set_caller(f.admin);
+        f.contract.release_to_producer(1);
+
+        // Lote 1: SETTLED_OK, productor 0 recibe funded0 + bond0
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+        assert_eq!(f.env.balance_of(&p0), p0_before + funded0 + bond0);
+
+        // Lote 2: NO se altera
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_FUNDED);
+        assert_eq!(f.contract.lote_funded(2), funded1);
+        assert_eq!(f.contract.lote_bond(2), bond1);
+        assert_eq!(f.contract.lote_producer(2), p1);
+        // Productor 1 NO recibe nada
+        assert_eq!(f.env.balance_of(&p1), p1_before);
+        // El vault solo perdió lo de L1
+        assert_eq!(
+            f.env.balance_of(&f.contract),
+            vault_before - (funded0 + bond0)
+        );
+    }
+
+    #[test]
+    fn inv7_after_release_l1_l2_can_still_be_released_independently() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let funded0 = U512::from(3 * ONE_CSPR);
+        let bond0 = U512::from(ONE_CSPR);
+        let funded1 = U512::from(2 * ONE_CSPR);
+        let bond1 = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, p0, funded0, bond0);
+        fund_lote(&mut f, 2, p1, funded1, bond1);
+
+        let p1_before = f.env.balance_of(&p1);
+
+        // Release L1
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.admin);
+        f.contract.release_to_producer(1);
+
+        // Release L2
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(2);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(2);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(2);
+        f.env.set_caller(f.admin);
+        f.contract.release_to_producer(2);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_SETTLED_OK);
+        assert_eq!(f.env.balance_of(&p1), p1_before + funded1 + bond1);
+    }
+
+    // ── Negativos: doble aprobación ────────────────────────────────
+
+    #[test]
+    fn approver_cannot_approve_release_twice_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+
+        // Mismo approver, 2da vez
+        let result = f.contract.try_approve_release(1);
+        assert_eq!(result.unwrap_err(), Error::AlreadyApproved.into());
+        assert_eq!(f.contract.lote_release_approvals(1), 1);
+    }
+
+    // ── Negativos: idempotencia de proposal ────────────────────────
+
+    #[test]
+    fn propose_release_twice_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+
+        let result = f.contract.try_propose_release(1);
+        assert_eq!(result.unwrap_err(), Error::ReleaseAlreadyProposed.into());
+    }
+
+    #[test]
+    fn approve_release_without_proposal_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        // Aprobar sin propuesta previa
+        f.env.set_caller(f.approver0);
+        let result = f.contract.try_approve_release(1);
+        assert_eq!(result.unwrap_err(), Error::ReleaseNotProposed.into());
+    }
+
+    // ── Getter ─────────────────────────────────────────────────────
+
+    #[test]
+    fn lote_release_approvals_getter() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(ONE_CSPR);
+        let bond = U512::from(ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        assert_eq!(f.contract.lote_release_approvals(1), 0);
+
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        assert_eq!(f.contract.lote_release_approvals(1), 1);
+
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+        assert_eq!(f.contract.lote_release_approvals(1), 2);
+
+        // Lote no existente → 0
+        assert_eq!(f.contract.lote_release_approvals(99), 0);
     }
 }
