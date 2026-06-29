@@ -4,8 +4,9 @@
 > Ohu**, **qué está construido hoy**, **cómo trabajamos**, y **el roadmap**. Léelo primero; luego
 > profundiza en los documentos enlazados.
 >
-> **Última actualización:** 2026-06-29 · rama `main` @ `e1d73a3` (todo consolidado y pusheado) ·
-> **Fase 0 CERRADA**, **Semana 1 planeada (sin empezar)**.
+> **Última actualización:** 2026-06-29 · rama `main` @ `4c21e67` (**+4 sobre `origin/main`, sin
+> pushear**) · **Fase 0 CERRADA**; **Semana 1 EN CURSO: W1-0 + W1-1 mergeadas (89 tests verdes),
+> W1-2 siguiente**.
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
@@ -179,12 +180,15 @@ Mató los 4 riesgos técnicos con spikes verdes en VM Odra:
 | **S4** riel B x402 (oráculo reputación) + fail-closed + idempotencia | ✅ (+ fixes S4a/S4b) | GLM-5.2 |
 | **S3** atestación gasless Ed25519 on-chain + anti-replay por lote + domain sep. | ✅ (audit dual + fix #3/#4) | DeepSeek V4 Pro |
 
-### 🔜 Semana 1 — Núcleo de liquidación (PLANEADA — `docs/plan/semana-1.md`)
+### 🔄 Semana 1 — Núcleo de liquidación (EN CURSO — `docs/plan/semana-1.md`)
 Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en Testnet**.
-- **W1-0** micro-fix `chain_id==0` (cierra audit de S3).
-- **W1-1** modelo de lote + escrow **earmarked** (`open_lote`/`deposit_to_lote`/`post_bond`) — INV-7.
-- **W1-2** `release_to_producer` happy-path (gate admin M-de-N interino).
-- **W1-3** **deploy real a Testnet** + E2E feliz + **multisig nativo real** (cierra el TODO de S2).
+- **W1-0** ✅ micro-fix `chain_id==0` (cierra audit de S3). `30e51c1` — DeepSeek V4 Pro, audit Claude.
+- **W1-1** ✅ modelo de lote + escrow **earmarked** (`open_lote`/`deposit_to_lote`/`post_bond`) — INV-7.
+  `3141cf3` + fix `4c21e67` — DeepSeek V4 Pro, **audit dual Claude + Gemini 3.1 Pro High** (fix-round:
+  `checked_add`/`Error::Overflow`, `post_bond` state==OPEN, `NotAdminNorOperator`). **89 tests verdes.**
+- **W1-2** 🔜 `release_to_producer` happy-path (gate admin M-de-N interino). **Siguiente.**
+- **W1-3** 🔜 **deploy real a Testnet** + E2E feliz + **multisig nativo real** (cierra el TODO de S2).
+  ⚠️ requiere instalar `casper-client` (no presente en macOS).
 
 ### 🗓️ Semanas 2-4 (de `ohu.md §11`)
 - **Sem 2 — Atestación + mutual:** disparador **paramétrico** (reemplaza el gate M-de-N por
@@ -203,11 +207,13 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 | **S3 #1** — `verify_attestation` NO valida `signer ∈ compradores(lote)` (ponderado por share) | 🔴 crítico-en-diseño, **inerte hoy** (nada consume atestaciones) | **Sem 2** (ya con registro lote→compradores de W1-1) |
 | **S3 #2** — atestación sin `valid_before` (expiry) | 🟠 alto | **Sem 2** |
 | Disparador paramétrico (tally) reemplaza gate M-de-N de `release` | — | **Sem 2** |
-| `chain_id==0` no validado en `init` (docstring miente) | 🟡 bajo | **W1-0** |
-| Multisig **nativo** (associated keys) — capa 2, falta `KEYS_MANAGER_WASM` | 🟠 (la capa on-chain ya protege) | **W1-3** |
+| ~~`chain_id==0` no validado en `init`~~ | ✅ **CERRADO** | **W1-0** (`30e51c1`) |
+| **W1-1** — transición a FUNDED **demasiado ansiosa** (`bond>0 ∧ funded>0` ⇒ 1 depósito cierra el lote y bloquea más compradores) | 🔵 diseño, **inerte hoy** | **Sem 2** (umbral paramétrico) |
+| **W1-1** — audit de cierre con **GPT-5.5** pendiente (sin cupo OpenAI hoy) | 🟢 confianza | **gran audit de fin de día** |
+| Multisig **nativo** (associated keys) — capa 2, falta `KEYS_MANAGER_WASM` | 🟠 (la capa on-chain ya protege) | **W1-3** (requiere `casper-client`) |
 | `placeholder.rs` huérfano | 🟢 limpieza | cualquier toque de contracts |
 | Migración EIP-712 completa (hoy ruta activa = Ed25519, permitida por spec) | 🟢 roadmap | Sem 2+ |
-| Pushear `fase-0` al remoto / dominio + marca de "Ohu" | — | go-to-market |
+| **Pushear `main` al remoto** (+4 commits sin pushear) / dominio + marca de "Ohu" | — | cuando decidas |
 
 ---
 
