@@ -265,6 +265,9 @@ impl OhuVault {
         if epoch_window_ms == 0 {
             self.env().revert(Error::InvalidEpochWindow);
         }
+        if chain_id == 0 {
+            self.env().revert(Error::InvalidSetup);
+        }
 
         for i in 0..approvers.len() {
             let a = approvers[i];
@@ -1461,6 +1464,25 @@ mod tests {
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidEpochWindow.into());
+    }
+
+    #[test]
+    fn init_reverts_when_zero_chain_id() {
+        let env = odra_test::env();
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin: env.get_account(0),
+                operator: env.get_account(1),
+                approvers: vec![env.get_account(2), env.get_account(3)],
+                required_approvals: 1,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+                chain_id: 0,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
     }
 
     #[test]
