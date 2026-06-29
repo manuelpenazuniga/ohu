@@ -129,6 +129,10 @@ pub enum Error {
     NotProducer = 43,
     /// El bono del productor ya fue depositado para este lote.
     BondAlreadyPosted = 44,
+    /// Overflow aritmético en la contabilidad por-lote (suma U512).
+    Overflow = 45,
+    /// El caller no es admin ni operator (gate de open_lote).
+    NotAdminNorOperator = 46,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -677,7 +681,7 @@ impl OhuVault {
         let admin = self.admin.get_or_revert_with(Error::NotInitialized);
         let operator = self.operator.get_or_revert_with(Error::NotInitialized);
         if caller != admin && caller != operator {
-            self.env().revert(Error::NotAdmin);
+            self.env().revert(Error::NotAdminNorOperator);
         }
 
         if self.lote_state.get_or_default(&lote_id) != 0 {
@@ -729,16 +733,19 @@ impl OhuVault {
             self.env().revert(Error::LoteNotOpen);
         }
 
-        // INV-7: aritmética de contabilidad por-lote (checked implícito en U512).
+        // INV-7: checked_add — overflow U512 revierte con Error::Overflow (el `+` plano
+        // envolvería en silencio en release de WASM).
         let share_key = (lote_id, buyer);
         let old_share = self.lote_share.get_or_default(&share_key);
-        let new_share = old_share + amount;
+        let new_share = old_share
+            .checked_add(amount)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
         self.lote_share.set(&share_key, new_share);
 
         let old_funded = self.lote_funded.get_or_default(&lote_id);
-        let new_funded = old_funded + amount;
-        // INV-7: checked — si una suma desbordara U512, el + en debug paniquea.
-        // En producción U512 no desborda con valores reales (≥153 dígitos decimales).
+        let new_funded = old_funded
+            .checked_add(amount)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
         self.lote_funded.set(&lote_id, new_funded);
 
         self.env().emit_event(DepositedToLote {
@@ -779,6 +786,9 @@ impl OhuVault {
         let state = self.lote_state.get_or_default(&lote_id);
         if state == 0 {
             self.env().revert(Error::LoteNotFound);
+        }
+        if state != LOTE_STATE_OPEN {
+            self.env().revert(Error::LoteNotOpen);
         }
 
         let producer = match self.lote_producer.get(&lote_id) {
@@ -2207,7 +2217,7 @@ mod tests {
         let producer = f.env.get_account(7);
         f.env.set_caller(f.approver0);
         let result = f.contract.try_open_lote(1, producer);
-        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+        assert_eq!(result.unwrap_err(), Error::NotAdminNorOperator.into());
     }
 
     #[test]
@@ -2216,7 +2226,7 @@ mod tests {
         let producer = f.env.get_account(7);
         f.env.set_caller(f.env.get_account(9));
         let result = f.contract.try_open_lote(1, producer);
-        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+        assert_eq!(result.unwrap_err(), Error::NotAdminNorOperator.into());
     }
 
     #[test]
