@@ -74,7 +74,9 @@ premium del mes.
 - **Auditor por-tarea = `agy` (Antigravity) con Gemini 3.1 Pro (High).** Invocación:
   `agy -p "<prompt>" --model "Gemini 3.1 Pro (High)" --add-dir <worktree>` (modo `--print`, solo
   lectura; no necesita bypass de permisos).
-- **GPT-5.5 = DIFERIDO.** Cuenta OpenAI (Codex) sin cupo por ahora → en lugar de auditar por-tarea,
-  se hace **UNA auditoría grande de fin de día** con GPT-5.5 cuando haya cupo. Operarla vía CLI:
-  más adelante. **Mientras tanto, el gate por-tarea = Claude + Gemini 3.1 Pro High**; el tercer set
-  (GPT-5.5) se diffea en la pasada de cierre del día.
+- **GPT-5.5 = `codex` CLI (operable, validado 2026-06-29).** Cuenta ChatGPT/Codex con cupo.
+  Invocación: `codex exec -s read-only -m gpt-5.5 -c mcp_servers="{}" "<prompt>"` (no-interactivo,
+  sandbox **read-only** = no edita; pasar prompt inline). ⚠️ `gpt-5.5-codex` **no** está soportado en
+  cuenta ChatGPT → usar **`gpt-5.5`** a secas. Uso: **auditoría holística de cierre** (por-fase/día)
+  sobre `main`; opcionalmente como tercer set por-tarea. **El gate por-tarea sigue = Claude + Gemini
+  3.1 Pro High**; GPT-5.5 cierra cada fase.
