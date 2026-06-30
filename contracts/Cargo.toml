@@ -43,3 +43,9 @@ name = "ohu_livenet_deploy"
 path = "bin/livenet_deploy.rs"
 required-features = ["livenet"]
 test = false
+
+[[bin]]
+name = "ohu_livenet_e2e"
+path = "bin/livenet_e2e.rs"
+required-features = ["livenet"]
+test = false

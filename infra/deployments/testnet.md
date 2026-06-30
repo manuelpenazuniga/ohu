@@ -32,7 +32,24 @@ hashes, tx). Las claves privadas viven fuera del repo (`~/.casper-keys/`).
 
 **Reproducir:** `bash infra/scripts/deploy_testnet.sh` (requiere binaryen + .env + deployer fondeado).
 
-### Pendiente (Fase 2)
-Lote feliz E2E: repartir gas a las 5 cuentas → `open_lote` → `deposit_to_lote` →
-`post_bond` (FUNDED) → `propose_release` → `approve_release` ×2 (M-de-N) →
-`release_to_producer` (SETTLED_OK), visible on-chain.
+### Fase 2 — Lote feliz E2E (2026-06-30) ✅ COMPLETO ON-CHAIN
+
+Ciclo completo de un lote, cada paso firmado por la cuenta nativa del rol
+(`bin/livenet_e2e.rs`, multi-key via `set_caller`/`ODRA_CASPER_LIVENET_KEY_*`).
+Producer fresco: `account-hash-33518b62a4434cb640d6239c86e86f1ed1c132df9ddc2d1cf6f629913ad1f1ba`.
+
+| # | Paso | Firmante | Tx |
+|---|---|---|---|
+| 1 | `open_lote(1, producer)` | admin | `6114c4bf28a1aaf01d4fbe58c9c9804aabe4238d9fe3c30f041dfa332eb9aba4` |
+| 2 | `deposit_to_lote(1)` +10 CSPR | buyer (deployer) | `3c4daa6ed760865ed9fdcee3775240e70b05f3b0c7bd0b4041f5776559fc1d31` |
+| 3 | `post_bond(1)` +5 CSPR → FUNDED | producer | `bfd8a06c768ee23ebf3c0bb86650cae85a36ad3779e5627877a2f7aa68594880` |
+| 4 | `propose_release(1)` | approver0 | `0a5ddb8d2fa44ec8a469a48dc45309bb738542bd93f773a1efad9474174d62a7` |
+| 5a | `approve_release(1)` | approver0 | `80f617bb4bfd4c84aa91f2037b556392fde4e915797d4b822db4afcf12d4f767` |
+| 5b | `approve_release(1)` | approver1 | `40553b0dfada526231ba58c08190026f5c35ce180c6535d8971611f4e8804cdf` |
+| 6 | `release_to_producer(1)` → SETTLED_OK | admin | `70037193177fb33fce4e5f0034fb0d0c12ddd73ab530d0fab1811d0ad1882575` |
+
+Escrow liberado al producer = `funded + bond` = 15 CSPR, solo tras `caller==admin ∧
+approvals≥required(2)`. Multisig M-de-N nativo validado contra el nodo real.
+
+**Reproducir E2E:** fondear gas a las cuentas (admin/approvers/producer) y
+`cargo run --bin ohu_livenet_e2e --features livenet` (con `.env` sourceado).
