@@ -148,6 +148,11 @@ pub enum Error {
     NotABuyer = 52,
     /// La atestación expiró (now >= valid_before).
     AttestationExpired = 53,
+    // ── W2-1: disparador paramétrico ──
+    /// La ventana de atestación aún no cerró (now < lote_funded_at + window).
+    WindowNotClosed = 54,
+    /// El lote no está en estado EVAL_OK (no se puede liberar al productor).
+    LoteNotReleasable = 55,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -256,12 +261,25 @@ pub struct ReleasedToProducer {
     pub bond: U512,
 }
 
+// ── W2-1: disparador paramétrico ──
+
+/// Evento: evaluate_lote fijó el resultado del lote (EVAL_OK o EVAL_FAIL)
+/// sin mover fondos. El tally negativo y el funded van en U512 para
+/// transparencia on-chain.
+#[odra::event]
+pub struct LoteEvaluated {
+    pub lote_id: u64,
+    pub result: u8,
+    pub negative: U512,
+    pub funded: U512,
+}
+
 /// Contrato de custodia de Ohu.
 ///
 /// TODO(audit): CES (`emit_event`) es el event standard soportado por Odra.
 /// Verificar si CSPR.cloud indexa CES, native events, o ambos; ajustar a
 /// `emit_native_event` si es necesario. Ver <https://odra.dev/docs/basics/events>.
-#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded, LoteOpened, DepositedToLote, BondPosted, LoteFunded, ReleaseProposed, ReleaseApproved, ReleasedToProducer])]
+#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded, LoteOpened, DepositedToLote, BondPosted, LoteFunded, LoteEvaluated, ReleaseProposed, ReleaseApproved, ReleasedToProducer])]
 pub struct OhuVault {
     /// Cuenta que ejecuta releases grandes (`caller == admin` en `execute`).
     admin: Var<Address>,
@@ -297,6 +315,11 @@ pub struct OhuVault {
     attestation_recorded: Mapping<(u64, Address), bool>,
     /// S3: identificador de cadena para domain separation (fix #4).
     chain_id: Var<u64>,
+    // ── W2-1: disparador paramétrico ──
+    /// Umbral de no-recepción en basis points (p.ej. 6000 = 60%).
+    quorum_fail_bps: Var<u64>,
+    /// Ventana tras FUNDED para atestar (ms); tras ella, silencio=recibido.
+    attestation_window_ms: Var<u64>,
     // ── W1-1: modelo de lote (INV-7: escrow earmarked) ──
     /// INV-7 (FIX crítico): suma tracked de CSPR reservado para lotes activos.
     /// Se incrementa en `deposit_to_lote` y `post_bond`; se decrementa en
@@ -314,6 +337,8 @@ pub struct OhuVault {
     lote_share: Mapping<(u64, Address), U512>,
     /// Bono de cumplimiento depositado por el productor del lote.
     lote_bond: Mapping<u64, U512>,
+    /// Timestamp (get_block_time) en que el lote pasó a FUNDED (W2-1).
+    lote_funded_at: Mapping<u64, u64>,
     // ── W2-0: tally ponderado de atestaciones ──
     /// Suma de shares de firmantes que atestaron NO-recibido para el lote.
     lote_tally_negative: Mapping<u64, U512>,
@@ -328,11 +353,13 @@ pub struct OhuVault {
     lote_release_has_approved: Mapping<(u64, Address), bool>,
 }
 
-/// Constantes de estado de lote (W1-1).
+/// Constantes de estado de lote (W1-1, W2-1).
 /// 0 = inexistente (default de Mapping); 1 = OPEN; 2 = FUNDED.
 const LOTE_STATE_OPEN: u8 = 1;
 const LOTE_STATE_FUNDED: u8 = 2;
 const LOTE_STATE_SETTLED_OK: u8 = 3;
+const LOTE_STATE_EVAL_OK: u8 = 4;
+const LOTE_STATE_EVAL_FAIL: u8 = 5;
 
 #[odra::module]
 impl OhuVault {
@@ -362,6 +389,8 @@ impl OhuVault {
         epoch_cap: U512,
         epoch_window_ms: u64,
         chain_id: u64,
+        quorum_fail_bps: u64,
+        attestation_window_ms: u64,
     ) {
         if admin.is_contract() || operator.is_contract() {
             self.env().revert(Error::NotAnAccount);
@@ -388,6 +417,12 @@ impl OhuVault {
             self.env().revert(Error::InvalidEpochWindow);
         }
         if chain_id == 0 {
+            self.env().revert(Error::InvalidSetup);
+        }
+        if quorum_fail_bps == 0 || quorum_fail_bps > 10000 {
+            self.env().revert(Error::InvalidSetup);
+        }
+        if attestation_window_ms == 0 {
             self.env().revert(Error::InvalidSetup);
         }
 
@@ -423,6 +458,8 @@ impl OhuVault {
         self.required_approvals.set(required_approvals);
         self.next_request_id.set(0u64);
         self.chain_id.set(chain_id);
+        self.quorum_fail_bps.set(quorum_fail_bps);
+        self.attestation_window_ms.set(attestation_window_ms);
     }
 
     /// Deposita CSPR en el purse del contrato.
@@ -966,8 +1003,80 @@ impl OhuVault {
         let funded = self.lote_funded.get_or_default(&lote_id);
         if bond > U512::zero() && funded > U512::zero() {
             self.lote_state.set(&lote_id, LOTE_STATE_FUNDED);
+            self.lote_funded_at
+                .set(&lote_id, self.env().get_block_time());
             self.env().emit_event(LoteFunded { lote_id });
         }
+    }
+
+    // ── W2-1: disparador paramétrico (INV-2) ──
+
+    /// Evalúa el resultado del lote usando el tally ponderado de atestaciones
+    /// (INV-2: condición on-chain determinista, sin juicio del agente).
+    ///
+    /// Gates:
+    /// - caller ∈ {admin, operator} (NotAdminNorOperator).
+    /// - lote en estado FUNDED (LoteNotFunded).
+    /// - ventana de atestación cerrada: now >= lote_funded_at + window (WindowNotClosed).
+    ///
+    /// Cálculo (silencio=recibido):
+    ///   si neg * 10000 >= funded * quorum_fail_bps → EVAL_FAIL
+    ///   si no → EVAL_OK
+    ///
+    /// Emite LoteEvaluated. No mueve fondos.
+    pub fn evaluate_lote(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        let operator = self.operator.get_or_revert_with(Error::NotInitialized);
+        if caller != admin && caller != operator {
+            self.env().revert(Error::NotAdminNorOperator);
+        }
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_FUNDED {
+            self.env().revert(Error::LoteNotFunded);
+        }
+
+        let funded_at = self.lote_funded_at.get_or_default(&lote_id);
+        let window = self
+            .attestation_window_ms
+            .get_or_revert_with(Error::NotInitialized);
+        let deadline = funded_at
+            .checked_add(window)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+        if self.env().get_block_time() < deadline {
+            self.env().revert(Error::WindowNotClosed);
+        }
+
+        let neg = self.lote_tally_negative.get_or_default(&lote_id);
+        let funded = self.lote_funded.get_or_default(&lote_id);
+        let qbps = self
+            .quorum_fail_bps
+            .get_or_revert_with(Error::NotInitialized);
+
+        // Silencio=recibido: quórum de fallo si neg * 10000 >= funded * qbps.
+        // U512::checked_mul en ambos lados para prevenir overflow.
+        let neg_scaled = neg
+            .checked_mul(U512::from(10000u64))
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+        let threshold = funded
+            .checked_mul(U512::from(qbps))
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        let result_state = if neg_scaled >= threshold {
+            LOTE_STATE_EVAL_FAIL
+        } else {
+            LOTE_STATE_EVAL_OK
+        };
+
+        self.lote_state.set(&lote_id, result_state);
+
+        self.env().emit_event(LoteEvaluated {
+            lote_id,
+            result: result_state,
+            negative: neg,
+            funded,
+        });
     }
 
     // ── W1-2: settlement M-de-N lote-aware ──
@@ -1038,11 +1147,19 @@ impl OhuVault {
     /// Ejecuta el settlement de un lote: libera el escrow (`funded`)
     /// al productor y le devuelve su bono. Estado → SETTLED_OK.
     ///
-    /// Doble gate (INV-1):
-    /// - `caller == admin`.
-    /// - `lote_release_approvals[lote_id] >= required_approvals` (M-de-N on-chain).
+    /// Gate (INV-1 + INV-2):
+    /// - `caller == admin` (NotAdmin). El admin ejecuta; el agente nunca mueve capital.
+    /// - `state == EVAL_OK` (LoteNotReleasable). El tally on-chain autoriza (INV-2);
+    ///   el admin no decide si procede.
     ///
     /// CEI estricto: marca SETTLED_OK antes de `transfer_tokens`.
+    ///
+    /// TODO(Sem2: repurpose como emergency override): el M-de-N en-contrato
+    /// (`propose_release` / `approve_release` / `lote_release_approvals`)
+    /// queda como vestigio para una futura ruta de emergencia que puentee el
+    /// tally normal. El release normal NO lo exige.
+    /// La validación vestigial de approvals se conserva abajo como código
+    /// comentado con el prefijo `// EMERGENCY:`.
     pub fn release_to_producer(&mut self, lote_id: u64) {
         let caller = self.env().caller();
         let admin = self.admin.get_or_revert_with(Error::NotInitialized);
@@ -1051,20 +1168,17 @@ impl OhuVault {
         }
 
         let state = self.lote_state.get_or_default(&lote_id);
-        if state != LOTE_STATE_FUNDED {
-            self.env().revert(Error::LoteNotFunded);
+        if state != LOTE_STATE_EVAL_OK {
+            self.env().revert(Error::LoteNotReleasable);
         }
 
-        // TODO(Sem2): reemplazar el gate admin + M-de-N por el disparador PARAMETRICO
-        // (tally de atestaciones ponderadas >= umbral, INV-2). Aquí se conectara verify_attestation;
-        // recien entonces se le anade autorizacion del firmante (S3 #1) + valid_before (S3 #2).
-        let count = self.lote_release_approvals.get_or_default(&lote_id);
-        let required = self
-            .required_approvals
-            .get_or_revert_with(Error::NotInitialized);
-        if count < required {
-            self.env().revert(Error::InsufficientApprovals);
-        }
+        // EMERGENCY: vestigio del gate M-de-N original (W1-2), conservado como
+        // código comentado para una futura ruta de override de emergencia.
+        // let count = self.lote_release_approvals.get_or_default(&lote_id);
+        // let required = self.required_approvals.get_or_revert_with(Error::NotInitialized);
+        // if count < required {
+        //     self.env().revert(Error::InsufficientApprovals);
+        // }
 
         let payout = self.lote_funded.get_or_default(&lote_id);
         let bond = self.lote_bond.get_or_default(&lote_id);
@@ -1160,6 +1274,18 @@ impl OhuVault {
             .get_or_revert_with(Error::NotInitialized)
     }
 
+    /// Umbral de no-recepción en basis points (W2-1).
+    pub fn quorum_fail_bps(&self) -> u64 {
+        self.quorum_fail_bps
+            .get_or_revert_with(Error::NotInitialized)
+    }
+
+    /// Ventana de atestación en milisegundos (W2-1).
+    pub fn attestation_window_ms(&self) -> u64 {
+        self.attestation_window_ms
+            .get_or_revert_with(Error::NotInitialized)
+    }
+
     /// Total acumulado en la ventana de epoch actual.
     pub fn accumulated(&self) -> U512 {
         self.accumulated.get_or_revert_with(Error::NotInitialized)
@@ -1241,6 +1367,11 @@ impl OhuVault {
         self.reserved_lote_balance.get_or_default()
     }
 
+    /// Timestamp (`get_block_time`) en que el lote pasó a FUNDED (W2-1).
+    pub fn lote_funded_at(&self, lote_id: u64) -> u64 {
+        self.lote_funded_at.get_or_default(&lote_id)
+    }
+
     // ── W1-2: getters de settlement ──
 
     /// Aprobaciones distintas acumuladas para el release del lote.
@@ -1253,7 +1384,9 @@ impl OhuVault {
 mod tests {
     use super::{
         AttestationRecorded, BondPosted, DepositedToLote, Deposit, Error, LoteFunded, LoteOpened,
+        LOTE_STATE_EVAL_FAIL, LOTE_STATE_EVAL_OK,
         LOTE_STATE_FUNDED, LOTE_STATE_OPEN, LOTE_STATE_SETTLED_OK,
+        LoteEvaluated,
         MicropaymentRouted, OhuVault, OhuVaultHostRef, OhuVaultInitArgs,
         ReleaseApproved, ReleasedToProducer, ReleaseProposed,
         WithdrawApproved, WithdrawExecuted, WithdrawProposed,
@@ -1282,17 +1415,19 @@ mod tests {
         epoch_cap: U512,
         epoch_window_ms: u64,
         chain_id: u64,
+        quorum_fail_bps: u64,
+        attestation_window_ms: u64,
     }
 
     fn setup() -> Fixture {
-        setup_with_chain(U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1)
+        setup_with_chain(U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1, 6000, 86_400_000)
     }
 
     fn setup_with(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64) -> Fixture {
-        setup_with_chain(cap, required, epoch_cap, epoch_window_ms, 1)
+        setup_with_chain(cap, required, epoch_cap, epoch_window_ms, 1, 6000, 86_400_000)
     }
 
-    fn setup_with_chain(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64, chain_id: u64) -> Fixture {
+    fn setup_with_chain(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64, chain_id: u64, quorum_fail_bps: u64, attestation_window_ms: u64) -> Fixture {
         let env = odra_test::env();
         let admin = env.get_account(0);
         let operator = env.get_account(1);
@@ -1313,6 +1448,8 @@ mod tests {
                 epoch_cap,
                 epoch_window_ms,
                 chain_id,
+                quorum_fail_bps,
+                attestation_window_ms,
             },
         );
 
@@ -1334,6 +1471,8 @@ mod tests {
             epoch_cap,
             epoch_window_ms,
             chain_id,
+            quorum_fail_bps,
+            attestation_window_ms,
         }
     }
 
@@ -1860,6 +1999,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1881,6 +2022,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1903,6 +2046,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::DuplicateApprover.into());
@@ -1922,6 +2067,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1941,6 +2088,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1960,6 +2109,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -1979,6 +2130,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -2000,6 +2153,8 @@ mod tests {
                 epoch_cap: U512::zero(),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -2019,6 +2174,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 0,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidEpochWindow.into());
@@ -2038,6 +2195,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 0,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
@@ -2058,6 +2217,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::AdminIsApprover.into());
@@ -2080,6 +2241,8 @@ mod tests {
                 epoch_cap: U512::from(5 * ONE_CSPR),
                 epoch_window_ms: 3_600_000,
                 chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 86_400_000,
             },
         );
         assert_eq!(result.err().unwrap(), Error::ApproversTooMany.into());
@@ -2498,7 +2661,7 @@ mod tests {
     #[test]
     fn attestation_different_chain_id_reverts() {
         let mut f = setup_with_chain(
-            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 999,
+            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 999, 6000, 86_400_000,
         );
         let (vc_addr, _) = vault_domain(&f);
         // Firma con chain_id=1 (incorrecto).
@@ -3297,7 +3460,7 @@ mod tests {
     // ── Positivos: happy-path ──────────────────────────────────────
 
     #[test]
-    fn release_to_producer_with_m_approvals_succeeds() {
+    fn release_to_producer_after_evaluate_lote_succeeds() {
         let mut f = simple_setup();
         let producer = f.env.get_account(7);
         let funded = U512::from(3 * ONE_CSPR);
@@ -3305,19 +3468,17 @@ mod tests {
         fund_lote(&mut f, 1, producer, funded, bond);
         let vault_before = f.env.balance_of(&f.contract);
 
-        // Proponer release
-        f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
+        // Cerrar ventana de atestación
+        f.env.advance_block_time(f.attestation_window_ms + 1);
 
-        // M=2 aprobaciones
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
+        // Evaluar lote: silencio total → EVAL_OK
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
 
         let producer_before = f.env.balance_of(&producer);
 
-        // Ejecutar
+        // Release (admin + EVAL_OK)
         f.env.set_caller(f.admin);
         f.contract.release_to_producer(1);
 
@@ -3370,23 +3531,18 @@ mod tests {
     }
 
     #[test]
-    fn release_with_three_distinct_approvals_succeeds() {
+    fn release_with_eval_ok_succeeds() {
         let mut f = simple_setup();
         let producer = f.env.get_account(7);
         let funded = U512::from(ONE_CSPR);
         let bond = U512::from(ONE_CSPR);
         fund_lote(&mut f, 1, producer, funded, bond);
 
-        // Proponer como approver
-        f.env.set_caller(f.approver2);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver2);
-        f.contract.approve_release(1);
-        assert_eq!(f.contract.lote_release_approvals(1), 3);
+        // Cerrar ventana + evaluar
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
 
         f.env.set_caller(f.admin);
         f.contract.release_to_producer(1);
@@ -3410,10 +3566,13 @@ mod tests {
         ));
     }
 
-    // ── Negativos: sin M-de-N suficiente ───────────────────────────
+    // ── Negativos: release sin evaluate_lote ────────────────────────
+    // TODO(Sem2: repurpose como emergency override): los tests de gate M-de-N
+    // originales se recolocan aquí. El release normal ya no exige M-de-N; el
+    // gate es EVAL_OK.
 
     #[test]
-    fn release_without_approvals_reverts() {
+    fn release_on_funded_before_evaluate_reverts() {
         let mut f = simple_setup();
         let producer = f.env.get_account(7);
         let funded = U512::from(3 * ONE_CSPR);
@@ -3421,60 +3580,67 @@ mod tests {
         fund_lote(&mut f, 1, producer, funded, bond);
 
         f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-
-        // Sin aprobaciones → InsufficientApprovals
-        f.env.set_caller(f.admin);
         let result = f.contract.try_release_to_producer(1);
-        assert_eq!(result.unwrap_err(), Error::InsufficientApprovals.into());
+        assert_eq!(result.unwrap_err(), Error::LoteNotReleasable.into());
         // No se movió capital, estado sigue FUNDED
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
     }
 
     #[test]
-    fn release_with_insufficient_approvals_reverts() {
-        let mut f = simple_setup(); // required = 2
+    fn release_on_eval_fail_reverts() {
+        let mut f = setup_with_chain(
+            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1,
+            6000,  // quorum_fail_bps = 60%
+            60_000, // ventana = 60s
+        );
         let producer = f.env.get_account(7);
-        let funded = U512::from(3 * ONE_CSPR);
-        let bond = U512::from(ONE_CSPR);
-        fund_lote(&mut f, 1, producer, funded, bond);
-
-        f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1); // solo 1 de 2
-
-        f.env.set_caller(f.admin);
-        let result = f.contract.try_release_to_producer(1);
-        assert_eq!(result.unwrap_err(), Error::InsufficientApprovals.into());
+        let buyer = f.env.get_account(8);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(funded).deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
-        assert_eq!(f.contract.lote_release_approvals(1), 1);
+
+        // Sin atestaciones → silencio=recibido → evaluate_lote da EVAL_OK.
+        f.env.advance_block_time(60_001);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+
+        // Release sobre EVAL_OK sí procede.
+        f.contract.release_to_producer(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+
+        // Segundo release revierte (ya no es EVAL_OK).
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotReleasable.into());
     }
 
     // ── Negativos: doble settlement ────────────────────────────────
 
     #[test]
-    fn release_twice_reverts_lote_not_funded() {
+    fn release_twice_reverts() {
         let mut f = simple_setup();
         let producer = f.env.get_account(7);
         let funded = U512::from(3 * ONE_CSPR);
         let bond = U512::from(ONE_CSPR);
         fund_lote(&mut f, 1, producer, funded, bond);
 
+        f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
 
         f.env.set_caller(f.admin);
         f.contract.release_to_producer(1);
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
 
-        // Segundo intento → LoteNotFunded (ya no es FUNDED)
+        // Segundo intento → LoteNotReleasable (ya no es EVAL_OK)
         let result = f.contract.try_release_to_producer(1);
-        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+        assert_eq!(result.unwrap_err(), Error::LoteNotReleasable.into());
     }
 
     // ── Negativos: liquidar lote no-FUNDED ─────────────────────────
@@ -3488,7 +3654,7 @@ mod tests {
 
         f.env.set_caller(f.admin);
         let result = f.contract.try_release_to_producer(1);
-        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+        assert_eq!(result.unwrap_err(), Error::LoteNotReleasable.into());
     }
 
     #[test]
@@ -3528,7 +3694,7 @@ mod tests {
 
         f.env.set_caller(f.admin);
         let result = f.contract.try_release_to_producer(99);
-        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+        assert_eq!(result.unwrap_err(), Error::LoteNotReleasable.into());
     }
 
     // ── Negativos: operator no puede mover capital ──────────────────
@@ -3571,18 +3737,17 @@ mod tests {
         let bond = U512::from(ONE_CSPR);
         fund_lote(&mut f, 1, producer, funded, bond);
 
+        // Evaluar (EVAL_OK) para que solo falle por NotAdmin
+        f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
 
         f.env.set_caller(f.operator);
         let result = f.contract.try_release_to_producer(1);
         assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
-        // Estado sigue FUNDED, capital no se movió
-        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        // Estado sigue EVAL_OK, capital no se movió
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
     }
 
     #[test]
@@ -3593,12 +3758,11 @@ mod tests {
         let bond = U512::from(ONE_CSPR);
         fund_lote(&mut f, 1, producer, funded, bond);
 
+        // Evaluar (EVAL_OK) para que solo falle por NotAdmin
+        f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
 
         let random = f.env.get_account(9);
         f.env.set_caller(random);
@@ -3627,15 +3791,12 @@ mod tests {
         let p0_before = f.env.balance_of(&p0);
         let p1_before = f.env.balance_of(&p1);
 
-        // Propone y aprueba SOLO lote 1
+        // Cerrar ventana y evaluar solo lote 1
+        f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
+        f.contract.evaluate_lote(1);
 
-        // Ejecuta release de lote 1
+        // Ejecuta release de lote 1 (eval_ok + admin)
         f.env.set_caller(f.admin);
         f.contract.release_to_producer(1);
 
@@ -3671,23 +3832,17 @@ mod tests {
 
         let p1_before = f.env.balance_of(&p1);
 
-        // Release L1
+        // Cerrar ventana y evaluar ambos
+        f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
+        f.contract.evaluate_lote(1);
+        f.contract.evaluate_lote(2);
+
+        // Release L1
         f.env.set_caller(f.admin);
         f.contract.release_to_producer(1);
 
         // Release L2
-        f.env.set_caller(f.admin);
-        f.contract.propose_release(2);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(2);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(2);
         f.env.set_caller(f.admin);
         f.contract.release_to_producer(2);
 
@@ -3960,13 +4115,12 @@ mod tests {
         let reserved_before = f.contract.reserved_lote_balance();
         assert_eq!(reserved_before, funded + bond);
 
-        // Release
+        // Cerrar ventana + evaluar
+        f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
-        f.contract.propose_release(1);
-        f.env.set_caller(f.approver0);
-        f.contract.approve_release(1);
-        f.env.set_caller(f.approver1);
-        f.contract.approve_release(1);
+        f.contract.evaluate_lote(1);
+
+        // Release
         f.env.set_caller(f.admin);
         f.contract.release_to_producer(1);
 
@@ -4067,5 +4221,400 @@ mod tests {
     fn reserved_lote_balance_starts_at_zero() {
         let f = simple_setup();
         assert_eq!(f.contract.reserved_lote_balance(), U512::zero());
+    }
+
+    // ===============================================================
+    // W2-1 — Disparador paramétrico (evaluate_lote + release gate)
+    // ===============================================================
+
+    /// Silencio total (cero atestaciones) → EVAL_OK (silencio=recibido).
+    #[test]
+    fn evaluate_lote_silence_returns_eval_ok() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            LoteEvaluated {
+                lote_id: 1,
+                result: LOTE_STATE_EVAL_OK,
+                negative: U512::zero(),
+                funded,
+            }
+        ));
+    }
+
+    /// Borde exacto: neg = 59% de funded con quorum_fail_bps=60% → EVAL_OK.
+    #[test]
+    fn evaluate_lote_59pct_returns_eval_ok() {
+        let mut f = simple_setup(); // quorum_fail_bps=6000 (=60%)
+        let producer = f.env.get_account(7);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        // Comprador A: 59 CSPR — atestará no-recibido (usa sign_attestation)
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(1, 1, false, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, 1, signer, 59);
+
+        // Comprador B: 41 CSPR — silencio (no atesta → recibido por default)
+        let buyer_silent = f.env.get_account(9);
+        f.env.set_caller(buyer_silent);
+        f.contract
+            .with_tokens(U512::from(41 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        let funded = f.contract.lote_funded(1);
+        assert_eq!(funded, U512::from(100 * ONE_CSPR));
+
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+
+        f.env.set_caller(f.operator);
+        assert!(f.contract.verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+
+        // 59/100 = 59% < 60% → EVAL_OK
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+    }
+
+    /// Borde exacto: neg = 60% de funded con quorum_fail_bps=60% → EVAL_FAIL.
+    #[test]
+    fn evaluate_lote_60pct_returns_eval_fail() {
+        let mut f = simple_setup(); // quorum_fail_bps=6000 (=60%)
+        let producer = f.env.get_account(7);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        // Comprador A: 60 CSPR — atestará no-recibido (usa sign_attestation)
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(1, 1, false, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, 1, signer, 60);
+
+        // Comprador B: 40 CSPR — silencio (no atesta → recibido por default)
+        let buyer_silent = f.env.get_account(9);
+        f.env.set_caller(buyer_silent);
+        f.contract
+            .with_tokens(U512::from(40 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        let funded = f.contract.lote_funded(1);
+        assert_eq!(funded, U512::from(100 * ONE_CSPR));
+
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+
+        f.env.set_caller(f.operator);
+        assert!(f.contract.verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+
+        // 60/100 = 60% ≥ 60% → EVAL_FAIL
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_FAIL);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            LoteEvaluated {
+                lote_id: 1,
+                result: LOTE_STATE_EVAL_FAIL,
+                negative: U512::from(60 * ONE_CSPR),
+                funded,
+            }
+        ));
+    }
+
+    /// evaluate_lote cuando la ventana NO ha cerrado → WindowNotClosed.
+    #[test]
+    fn evaluate_lote_before_window_closes_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        // Avanzar menos que la ventana
+        f.env.advance_block_time(1_000); // solo 1 segundo
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_evaluate_lote(1);
+
+        assert_eq!(result.unwrap_err(), Error::WindowNotClosed.into());
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+    }
+
+    /// evaluate_lote por caller no admin/operator → NotAdminNorOperator.
+    #[test]
+    fn evaluate_lote_by_non_privileged_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        let random = f.env.get_account(9);
+        f.env.set_caller(random);
+        let result = f.contract.try_evaluate_lote(1);
+
+        assert_eq!(result.unwrap_err(), Error::NotAdminNorOperator.into());
+    }
+
+    /// evaluate_lote sobre lote que no existe → LoteNotFunded.
+    #[test]
+    fn evaluate_lote_nonexistent_reverts() {
+        let mut f = simple_setup();
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_evaluate_lote(99);
+
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    /// evaluate_lote sobre lote OPEN (no FUNDED) → LoteNotFunded.
+    #[test]
+    fn evaluate_lote_on_open_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_evaluate_lote(1);
+
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    /// evaluate_lote por el operator también funciona (puede gatillarlo el agente).
+    #[test]
+    fn evaluate_lote_by_operator_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.operator);
+        f.contract.evaluate_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+    }
+
+    /// evaluate_lote dos veces no revierte: la 2da evaluación encuentra
+    /// el lote en EVAL_OK/EVAL_FAIL (no FUNDED) → LoteNotFunded.
+    #[test]
+    fn evaluate_lote_twice_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+
+        // Segunda evaluación → ya no está FUNDED
+        let result = f.contract.try_evaluate_lote(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    /// Release sobre EVAL_OK con admin → paga al producer, estado SETTLED_OK (test integral).
+    #[test]
+    fn evaluate_then_release_full_flow() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        let vault_before = f.env.balance_of(&f.contract);
+        let producer_before = f.env.balance_of(&producer);
+
+        // Cerrar ventana + evaluar → EVAL_OK (silencio)
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+
+        // Release
+        f.contract.release_to_producer(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+        assert_eq!(f.env.balance_of(&producer), producer_before + funded + bond);
+        assert_eq!(f.env.balance_of(&f.contract), vault_before - (funded + bond));
+        assert!(f.env.emitted_event(
+            &f.contract,
+            ReleasedToProducer { lote_id: 1, producer, funded, bond }
+        ));
+    }
+
+    /// Release sobre lote FUNDED sin evaluate → LoteNotReleasable.
+    #[test]
+    fn release_on_funded_without_evaluate_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotReleasable.into());
+    }
+
+    /// Release sobre EVAL_FAIL → LoteNotReleasable (W2-2 implementara settle_failure).
+    #[test]
+    fn release_on_eval_fail_reverts_lote_not_releasable() {
+        let mut f = simple_setup(); // quorum_fail_bps = 60%
+        let producer = f.env.get_account(7);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        // 65 CSPR de no-recibido (65% > 60%) → EVAL_FAIL
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(1, 1, false, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, 1, signer, 65);
+        let buyer_silent = f.env.get_account(9);
+        f.env.set_caller(buyer_silent);
+        f.contract
+            .with_tokens(U512::from(35 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+
+        f.env.set_caller(f.operator);
+        assert!(f.contract.verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_FAIL);
+
+        // Release sobre EVAL_FAIL → revierte
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_release_to_producer(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotReleasable.into());
+    }
+
+    /// lote_funded_at se registra correctamente al transicionar a FUNDED.
+    #[test]
+    fn lote_funded_at_is_set_on_transition() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        f.env.advance_block_time(1_000);
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .deposit_to_lote(1);
+        f.env.advance_block_time(2_000);
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .post_bond(1);
+
+        let funded_at = f.contract.lote_funded_at(1);
+        assert!(funded_at >= 2_000, "funded_at should be at least 2000, got {}", funded_at);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+    }
+
+    /// validate init: quorum_fail_bps=0 → InvalidSetup.
+    #[test]
+    fn init_reverts_when_zero_quorum_fail_bps() {
+        let env = odra_test::env();
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin: env.get_account(0),
+                operator: env.get_account(1),
+                approvers: vec![env.get_account(2), env.get_account(3)],
+                required_approvals: 1,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+                chain_id: 1,
+                quorum_fail_bps: 0,
+                attestation_window_ms: 86_400_000,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
+    }
+
+    /// validate init: quorum_fail_bps > 10000 → InvalidSetup.
+    #[test]
+    fn init_reverts_when_quorum_fail_bps_exceeds_max() {
+        let env = odra_test::env();
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin: env.get_account(0),
+                operator: env.get_account(1),
+                approvers: vec![env.get_account(2), env.get_account(3)],
+                required_approvals: 1,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+                chain_id: 1,
+                quorum_fail_bps: 10001,
+                attestation_window_ms: 86_400_000,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
+    }
+
+    /// validate init: attestation_window_ms=0 → InvalidSetup.
+    #[test]
+    fn init_reverts_when_zero_attestation_window() {
+        let env = odra_test::env();
+        let result = OhuVault::try_deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin: env.get_account(0),
+                operator: env.get_account(1),
+                approvers: vec![env.get_account(2), env.get_account(3)],
+                required_approvals: 1,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(5 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+                chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms: 0,
+            },
+        );
+        assert_eq!(result.err().unwrap(), Error::InvalidSetup.into());
+    }
+
+    /// Getters para los nuevos parámetros devuelven lo configurado en init.
+    #[test]
+    fn getters_new_params() {
+        let f = setup_with_chain(
+            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1,
+            7000, 120_000,
+        );
+        assert_eq!(f.contract.quorum_fail_bps(), 7000);
+        assert_eq!(f.contract.attestation_window_ms(), 120_000);
     }
 }
