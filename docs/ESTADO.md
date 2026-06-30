@@ -4,13 +4,17 @@
 > Ohu**, **qué está construido hoy**, **cómo trabajamos**, y **el roadmap**. Léelo primero; luego
 > profundiza en los documentos enlazados.
 >
-> **Última actualización:** 2026-06-30 · rama `main` @ `68cd805` (pusheado) ·
+> **Última actualización:** 2026-06-30 · rama `main` @ `90b7521` (pusheado) ·
 > **Fase 0 CERRADA · Semana 1 CERRADA.** W1-0/W1-1/W1-2 + fix crítico de escrow-isolation (120 tests
 > verdes) **+ W1-3: OhuVault DESPLEGADO en Casper Testnet y un lote feliz LIQUIDADO E2E on-chain**
 > (deploy `b595b892…`, contrato `contract-833696c8…`; 5 cuentas nativas firmando el settlement M-de-N;
 > ver `infra/deployments/testnet.md`). La **auditoría de cierre GPT-5.5** había hallado un CRÍTICO
 > (purse compartido drenaba escrow earmarked) → **corregido y re-auditado en triple = PASA** (§7).
-> **Pendiente menor:** multisig nativo de la cuenta admin (Parte B, no bloquea). **Próximo: Semana 2.**
+> **Semana 2 EN CURSO (3/5):** **W2-0** atestación ponderada autorizada (cierra S3 #1/#2), **W2-1**
+> disparador paramétrico — **INV-2 activada** (el tally de atestaciones, no M-de-N, autoriza el release),
+> **W2-2** camino `SETTLED_FAIL` (refund + slash + indemnización, pull) — los 3 con **dual audit
+> Claude+Gemini = PASA** (GPT-5.5 sin cuota → cierre triple diferido). Falta W2-3 (`MutualPool`) + W2-4
+> (deploy + E2E fallido). **Pendiente menor:** multisig nativo admin (Parte B, no bloquea).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
@@ -223,14 +227,14 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 
 | Item | Severidad | Dónde se cierra |
 |---|---|---|
-| **S3 #1** — `verify_attestation` NO valida `signer ∈ compradores(lote)` (ponderado por share) | 🔴 crítico-en-diseño, **inerte hoy** (nada consume atestaciones) | **Sem 2** (ya con registro lote→compradores de W1-1) |
-| **S3 #2** — atestación sin `valid_before` (expiry) | 🟠 alto | **Sem 2** |
-| Disparador paramétrico (tally) reemplaza gate M-de-N de `release` | — | **Sem 2** |
+| ~~**S3 #1** — `verify_attestation` no valida `signer ∈ compradores` ponderado~~ | ✅ **CERRADO** — gate `NotABuyer` + tally ponderado | **W2-0** |
+| ~~**S3 #2** — atestación sin `valid_before` (expiry)~~ | ✅ **CERRADO** — `valid_before` dentro de la firma + `AttestationExpired` | **W2-0** |
+| ~~Disparador paramétrico (tally) reemplaza gate M-de-N de `release`~~ | ✅ **CERRADO** — `evaluate_lote` (tally ≥ quórum) → EVAL_OK/FAIL; release exige EVAL_OK (**INV-2 activada**) | **W2-1** |
 | ~~`chain_id==0` no validado en `init`~~ | ✅ **CERRADO** | **W1-0** (`30e51c1`) |
 | ~~**CRÍTICO** — purse compartido: outflows genéricos (`route_micropayment`/`execute`) drenaban escrow earmarked (INV-1/INV-7)~~ | ✅ **CERRADO** (`reserved_lote_balance`, triple audit) | **fix `7e194fd`** |
 | ~~**W1-1** — audit de cierre con **GPT-5.5**~~ | ✅ **HECHO** (halló el crítico ↑) | `codex exec` |
 | **W1-1** — transición a FUNDED **demasiado ansiosa** + griefing 1-mote (3º deposita y excluye compradores) | 🔵 diseño, **inerte hoy** | **Sem 2** (umbral/roster/deadline) |
-| **Fondos atrapados:** sin `withdraw_share`/cancel/timeout (lote OPEN abandonado o FUNDED sin M aprobaciones bloquea fondos) | 🟠 liquidez, **by-design hoy** | **Sem 2** (refund + SETTLED_FAIL) |
+| **Fondos atrapados** — refund de lote fallido | ✅ **CERRADO** vía `SETTLED_FAIL` + `withdraw_settlement` (pull). Falta refund de lote OPEN abandonado / FUNDED sin evaluar (timeout) | **W2-2** (resto Sem 2+) |
 | Operator puede crear lotes basura (ID squatting, no mueve fondos) | 🔵 bajo | Sem 2+ |
 | Rotación/recuperación de approvers (inmutables; pérdida de clave congela M) | 🟠 gobierno | Sem 2+ |
 | Multisig **nativo** (associated keys) — capa 2, falta `KEYS_MANAGER_WASM` (hay que construirlo) | 🟠 (la capa on-chain ya protege) | **W1-3 Parte B / Sem 2** (no bloquea) |
