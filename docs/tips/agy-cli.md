@@ -179,6 +179,7 @@ agy --model "Gemini 3.1 Pro (High)" --add-dir <wt> --print-timeout 900s -p "$MSG
 |---|---|---|
 | “unknown/invalid model” o ignora el modelo | string de `--model` inexacto | usa el string EXACTO de `agy models` con `(High)`/`(Low)` |
 | La respuesta se **corta** / vacía a los ~5 min | `--print-timeout` por defecto (5m) | `--print-timeout 900s` (o más) |
+| **Se CUELGA** (30+ min, 0 salida, ~0% CPU, estado `S`) | `--add-dir` apuntando a un dir enorme (arrastra `target/`, `node_modules/`) → agy se atasca indexando, o el backend no responde | **Acota `--add-dir` a la carpeta de fuentes** (p.ej. `contracts/src`, no el worktree entero). Verificado: un audit que colgó 31 min con el worktree completo corrió bien con `--add-dir contracts/src`. Si igual cuelga, mátalo (`kill <pid>`) y reintenta — suele ser red. |
 | El worker “no hizo nada”, solo describió | faltó `--dangerously-skip-permissions` en print | añádelo (solo worker) |
 | “no encuentra el archivo” / no ve el código | falta `--add-dir` o ruta relativa | `--add-dir <ruta ABSOLUTA>` (repetible) |
 | Cuelga esperando input | arrancó interactivo | usa `-p`/`--print`, no `-i` |
