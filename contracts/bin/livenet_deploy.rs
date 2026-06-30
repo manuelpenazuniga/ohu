@@ -18,11 +18,13 @@
 //! #
 //! # 2. Source the .env:  set -a && source .env && set +a
 //! #
-//! # 3. Build the WASM first:
-//! #    cargo odra build
+//! # 3. Build + lower + deploy en un paso (RECOMENDADO):
+//! #    bash infra/scripts/deploy_testnet.sh
 //! #
-//! # 4. Run the deploy:
-//! #    cargo run --bin ohu_livenet_deploy --features livenet
+//! # NOTA: el WASM crudo de `cargo odra build` trae bulk-memory/sign-ext que la
+//! # VM de Casper RECHAZA. Hay que bajarlos a MVP con `wasm-opt` antes de deployar
+//! # (lo hace el script de arriba). Correr `cargo run` con un WASM sin lowering
+//! # falla on-chain con "Wasm preprocessing error: Bulk memory operations...".
 //! ```
 //!
 //! # Gas
