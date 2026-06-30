@@ -3,4 +3,5 @@
 extern crate alloc;
 
 pub mod attestation;
+pub mod mutual_pool;
 pub mod ohu_vault;

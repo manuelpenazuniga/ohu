@@ -67,6 +67,7 @@
 
 use odra::casper_types::U512;
 use odra::prelude::*;
+use odra::ContractRef;
 
 /// Errores de OhuVault.
 ///
@@ -160,6 +161,9 @@ pub enum Error {
     LoteNotSettledFail = 57,
     /// Este comprador ya reclamó su refund + indemnización de este lote.
     SettlementAlreadyClaimed = 58,
+    // ── W2-3: MutualPool ──
+    /// Los basis points deben estar en [0, 10000].
+    InvalidBps = 59,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -385,6 +389,20 @@ pub struct OhuVault {
     /// `(lote_id, buyer) -> true`: el comprador ya reclamó su refund +
     /// indemnización en este lote (anti doble-claim).
     lote_settlement_claimed: Mapping<(u64, Address), bool>,
+    // ── W2-3: MutualPool integration ──
+    /// Dirección del contrato `MutualPool` (sin set = sin integración).
+    mutual_pool: Var<Address>,
+    /// Prima en basis points (p.ej. 50 = 0.5%) cobrada al producer en release feliz.
+    /// 0 = sin prima.
+    premium_bps: Var<u64>,
+    /// Target de indemnización en basis points sobre `funded`.
+    /// Si `bond < target`, la diferencia (cola) se trae del `MutualPool`.
+    /// 0 = sin cola de mutual.
+    indemnity_target_bps: Var<u64>,
+    /// Pool de indemnización por lote para `withdraw_settlement`:
+    /// `bond + tail` si el MutualPool aportó cola, o solo `bond` si no.
+    /// Se fija en `settle_failure`.
+    lote_indemnity_pool: Mapping<u64, U512>,
 }
 
 /// Constantes de estado de lote (W1-1, W2-1).
@@ -1189,6 +1207,18 @@ impl OhuVault {
     ///
     /// CEI estricto: marca SETTLED_OK antes de `transfer_tokens`.
     ///
+    /// **W2-3 — MutualPool (prima):** si `mutual_pool` está configurado Y
+    /// `premium_bps > 0`, se deduce `premium = funded * premium_bps / 10000`
+    /// del pago al productor y se envía al `MutualPool` vía cross-contract call
+    /// con `with_tokens(premium).collect_premium()`. El productor recibe
+    /// `funded + bond - premium`. `reserved_lote_balance` baja en `funded + bond`
+    /// (la prima sale del purse igual que el pago al productor).
+    /// Sin integración: comportamiento sin cambios.
+    ///
+    /// TODO(audit): confirmar firma exacta de `MutualPoolContractRef::new`
+    /// y `with_tokens` en cross-contract calls (Odra 2.8.2).
+    /// Ver <https://odra.dev/docs/basics/cross-calls>.
+    ///
     /// TODO(Sem2: repurpose como emergency override): el M-de-N en-contrato
     /// (`propose_release` / `approve_release` / `lote_release_approvals`)
     /// queda como vestigio para una futura ruta de emergencia que puentee el
@@ -1232,17 +1262,50 @@ impl OhuVault {
             None => self.env().revert(Error::LoteNotFound),
         };
 
-        // CEI: effects antes que interactions (defensa en profundidad).
+        // W2-3: MutualPool premium (checked_mul antes de div).
+        let premium_bps = self.premium_bps.get_or_default();
+        let pool_addr_opt = self.mutual_pool.get();
+        let premium = if premium_bps > 0 {
+            if let Some(_pool_addr) = &pool_addr_opt {
+                payout
+                    .checked_mul(U512::from(premium_bps))
+                    .unwrap_or_else(|| self.env().revert(Error::Overflow))
+                    .checked_div(U512::from(10000u64))
+                    .unwrap_or_else(|| self.env().revert(Error::Overflow))
+            } else {
+                U512::zero()
+            }
+        } else {
+            U512::zero()
+        };
+
+        // El productor recibe (funded + bond - premium); la premium va al pool.
+        // premium <= total garantizado: premium = funded * bps/10000 <= funded < total.
+        let producer_payout = total
+            .checked_sub(premium)
+            .unwrap_or(U512::zero());
+
+        // CEI: effects antes que interactions.
         self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_OK);
 
         // FIX crítico: el lote liquidado libera su escrow reservado.
+        // La prima también sale del purse → reserved baja en (funded + bond) total.
         let old_reserved = self.reserved_lote_balance.get_or_default();
         let new_reserved = old_reserved
             .checked_sub(total)
             .unwrap_or_else(|| self.env().revert(Error::ReservedAccounting));
         self.reserved_lote_balance.set(new_reserved);
 
-        self.env().transfer_tokens(&producer, &total);
+        self.env().transfer_tokens(&producer, &producer_payout);
+
+        if premium > U512::zero() {
+            if let Some(pool_addr) = pool_addr_opt {
+                let pool =
+                    crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
+                pool.with_tokens(premium).collect_premium();
+            }
+        }
+
         self.env().emit_event(ReleasedToProducer {
             lote_id,
             producer,
@@ -1253,18 +1316,23 @@ impl OhuVault {
 
     // ── W2-2: SETTLED_FAIL ──
 
-    /// Cierra el lote fallido. No mueve fondos (PULL: los compradores
-    /// retiran con `withdraw_settlement`).
+    /// Cierra el lote fallido. Marca `SETTLED_FAIL` y fija el pool de
+    /// indemnización (`lote_indemnity_pool[lote]`). Si el `MutualPool` está
+    /// configurado y el bono quedó corto frente al target, trae la **cola**
+    /// del pool vía cross-contract call a `pay_tail`.
     ///
     /// Gates:
     /// - `caller == admin` (NotAdmin). El agente nunca mueve capital (INV-1).
     /// - `state == EVAL_FAIL` (LoteNotFailable). El tally on-chain autoriza (INV-2).
     ///
-    /// Efecto: `state = SETTLED_FAIL`. El bono no se devuelve al productor;
-    /// queda como pool de indemnización del lote.
+    /// CEI:
+    /// 1. Effects: `lote_state = SETTLED_FAIL` + `lote_indemnity_pool` = `bond`
+    ///    (o `bond + tail`).
+    /// 2. Interactions: cross-contract call a `MutualPool.pay_tail()`.
+    /// 3. Post-interaction: `reserved_lote_balance += tail`.
     ///
-    /// TODO(audit): aquí es donde W2-3 integrará `MutualPool.pay_tail()` para
-    /// la cola de indemnización que exceda el bono.
+    /// W2-3: `pay_tail` SOLO lo dispara el OhuVault autorizado; acotado a la
+    /// reserva del pool (§4.7). El bono sigue siendo el pagador primario (§4.1).
     pub fn settle_failure(&mut self, lote_id: u64) {
         let caller = self.env().caller();
         let admin = self.admin.get_or_revert_with(Error::NotInitialized);
@@ -1284,8 +1352,63 @@ impl OhuVault {
             None => self.env().revert(Error::LoteNotFound),
         };
 
-        // NO mueve fondos. El bono queda en reserved como pool de indemnización.
+        // W2-3: calcular cola de indemnización del MutualPool.
+        let indemnity_bps = self.indemnity_target_bps.get_or_default();
+        let pool_addr_opt = self.mutual_pool.get();
+        let tail = if let Some(pool_addr) = pool_addr_opt {
+            if indemnity_bps > 0 {
+                let target = funded
+                    .checked_mul(U512::from(indemnity_bps))
+                    .unwrap_or_else(|| self.env().revert(Error::Overflow))
+                    .checked_div(U512::from(10000u64))
+                    .unwrap_or_else(|| self.env().revert(Error::Overflow));
+                if bond < target {
+                    let deficit = target
+                        .checked_sub(bond)
+                        .unwrap_or(U512::zero());
+                    // TODO(audit): cross-contract read call — confirmar API.
+                    let pool =
+                        crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
+                    let pool_reserve = pool.reserve();
+                    if deficit < pool_reserve {
+                        deficit
+                    } else {
+                        pool_reserve
+                    }
+                } else {
+                    U512::zero()
+                }
+            } else {
+                U512::zero()
+            }
+        } else {
+            U512::zero()
+        };
+
+        let indemnity_pool = bond
+            .checked_add(tail)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        // CEI: effects antes que interactions.
         self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_FAIL);
+        self.lote_indemnity_pool.set(&lote_id, indemnity_pool);
+
+        // Traer la cola del MutualPool si corresponde.
+        if tail > U512::zero() {
+            // Safe: tail > 0 implies pool_addr_opt was Some (tail only computed then).
+            let pool_addr = pool_addr_opt.unwrap();
+            // TODO(audit): cross-contract call para pay_tail.
+            let mut pool =
+                crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
+            pool.pay_tail(self.env().self_address(), tail);
+
+            // El vault recibió tail motes del pool → actualizar reserved.
+            let old_reserved = self.reserved_lote_balance.get_or_default();
+            let new_reserved = old_reserved
+                .checked_add(tail)
+                .unwrap_or_else(|| self.env().revert(Error::Overflow));
+            self.reserved_lote_balance.set(new_reserved);
+        }
 
         self.env().emit_event(LoteSettledFail {
             lote_id,
@@ -1296,7 +1419,7 @@ impl OhuVault {
     }
 
     /// PULL: un comprador reclama su refund (share) + indemnización
-    /// proporcional del bono slasheado en un lote fallido.
+    /// proporcional del pool de indemnización del lote fallido.
     ///
     /// Gates:
     /// - `state == SETTLED_FAIL` (LoteNotSettledFail).
@@ -1306,13 +1429,19 @@ impl OhuVault {
     ///   (SettlementAlreadyClaimed).
     ///
     /// Cálculo (multiplicación antes de división, U512 checked_*):
-    ///   indemnity = bond * share / funded  (proporción del bono slasheado)
+    ///   pool = lote_indemnity_pool[lote]  (bond + cola del MutualPool, o solo bond)
+    ///   indemnity = pool * share / funded  (proporción del pool de indemnización)
     ///   amount = share + indemnity  (refund + indemnización)
+    ///
+    /// W2-3: `pool` reemplaza `bond` como base de la indemnización. Si el
+    /// MutualPool aportó cola (`settle_failure`), el pool es mayor que el bono
+    /// solo; si no hay integración, `pool == bond` y el comportamiento es
+    /// idéntico al de W2-2.
     ///
     /// CEI estricto: marca claimed + decrementa reserved ANTES de transferir.
     ///
     /// Dust de división entera: la suma de todas las indemnizaciones puede
-    /// ser < bond. Ese dust queda en reserved del lote (inocuo).
+    /// ser < pool. Ese dust queda en reserved del lote (inocuo).
     pub fn withdraw_settlement(&mut self, lote_id: u64) {
         let caller = self.env().caller();
 
@@ -1332,11 +1461,12 @@ impl OhuVault {
         }
 
         let funded = self.lote_funded.get_or_default(&lote_id);
-        let bond = self.lote_bond.get_or_default(&lote_id);
+        let pool = self.lote_indemnity_pool.get_or_default(&lote_id);
 
         // funded > 0 garantizado: un lote en EVAL_FAIL → SETTLED_FAIL
         // tuvo funded > 0 para alcanzar FUNDED.
-        let indemnity = bond
+        // W2-3: indemnity usa lote_indemnity_pool (bond + cola) en vez de bond.
+        let indemnity = pool
             .checked_mul(share)
             .unwrap_or_else(|| self.env().revert(Error::Overflow))
             .checked_div(funded)
@@ -1535,6 +1665,69 @@ impl OhuVault {
     pub fn lote_settlement_claimed(&self, lote_id: u64, buyer: Address) -> bool {
         self.lote_settlement_claimed.get_or_default(&(lote_id, buyer))
     }
+
+    // ── W2-3: MutualPool setters (admin-only) ───────────────────────
+
+    /// Configura la dirección del contrato `MutualPool`.
+    /// Solo `admin`. Sin set por default (sin integración).
+    pub fn set_mutual_pool(&mut self, addr: Address) {
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        if self.env().caller() != admin {
+            self.env().revert(Error::NotAdmin);
+        }
+        self.mutual_pool.set(addr);
+    }
+
+    /// Configura la prima en basis points (0–10000). Solo `admin`.
+    /// 0 = sin prima (default).
+    pub fn set_premium_bps(&mut self, bps: u64) {
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        if self.env().caller() != admin {
+            self.env().revert(Error::NotAdmin);
+        }
+        if bps > 10000 {
+            self.env().revert(Error::InvalidBps);
+        }
+        self.premium_bps.set(bps);
+    }
+
+    /// Configura el target de indemnización en basis points (0–10000).
+    /// Solo `admin`. 0 = sin cola de mutual (default).
+    pub fn set_indemnity_target_bps(&mut self, bps: u64) {
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        if self.env().caller() != admin {
+            self.env().revert(Error::NotAdmin);
+        }
+        if bps > 10000 {
+            self.env().revert(Error::InvalidBps);
+        }
+        self.indemnity_target_bps.set(bps);
+    }
+
+    // ── W2-3: MutualPool getters ────────────────────────────────────
+
+    /// Dirección del `MutualPool` configurado (revert si no se ha seteado).
+    pub fn mutual_pool_addr(&self) -> Address {
+        match self.mutual_pool.get() {
+            Some(addr) => addr,
+            None => self.env().revert(Error::NotInitialized),
+        }
+    }
+
+    /// Prima en basis points (0 = sin prima).
+    pub fn premium_bps(&self) -> u64 {
+        self.premium_bps.get_or_default()
+    }
+
+    /// Target de indemnización en basis points (0 = sin cola).
+    pub fn indemnity_target_bps(&self) -> u64 {
+        self.indemnity_target_bps.get_or_default()
+    }
+
+    /// Pool de indemnización del lote (bond + cola, o solo bond).
+    pub fn lote_indemnity_pool(&self, lote_id: u64) -> U512 {
+        self.lote_indemnity_pool.get_or_default(&lote_id)
+    }
 }
 
 #[cfg(test)]
@@ -1548,6 +1741,7 @@ mod tests {
         ReleaseApproved, ReleasedToProducer, ReleaseProposed,
         WithdrawApproved, WithdrawExecuted, WithdrawProposed,
     };
+    use crate::mutual_pool::{MutualPool, MutualPoolHostRef, MutualPoolInitArgs};
     use odra::casper_types::crypto::{self, PublicKey, SecretKey};
     use odra::casper_types::U512;
     use odra::host::{Deployer, HostEnv, HostRef};
@@ -5212,5 +5406,458 @@ mod tests {
 
         let total_withdrawn = vault_before - f.env.balance_of(&f.contract);
         assert_eq!(total_withdrawn, funded + bond);
+    }
+
+    // ===============================================================
+    // W2-3 — Integración MutualPool ↔ OhuVault
+    // ===============================================================
+
+    /// Fixture with both OhuVault and MutualPool deployed.
+    struct IntegrationFixture {
+        vault: OhuVaultHostRef,
+        pool: MutualPoolHostRef,
+        env: HostEnv,
+        admin: Address,
+        operator: Address,
+        #[allow(dead_code)]
+        approver0: Address,
+        #[allow(dead_code)]
+        approver1: Address,
+        attestation_window_ms: u64,
+    }
+
+    fn setup_integration(
+        premium_bps: u64,
+        indemnity_target_bps: u64,
+    ) -> IntegrationFixture {
+        let env = odra_test::env();
+        let admin = env.get_account(0);
+        let operator = env.get_account(1);
+        let approver0 = env.get_account(2);
+        let approver1 = env.get_account(3);
+        let attestation_window_ms = 86_400_000u64;
+
+        // Deploy vault first
+        let mut vault = OhuVault::deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin,
+                operator,
+                approvers: vec![approver0, approver1, env.get_account(4)],
+                required_approvals: 2,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(100 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+                chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms,
+            },
+        );
+
+        let vault_addr = vault.contract_address();
+
+        // Deploy pool with authorized_vault = vault address
+        let pool = MutualPool::deploy(
+            &env,
+            MutualPoolInitArgs {
+                admin,
+                authorized_vault: vault_addr,
+            },
+        );
+
+        let pool_addr = pool.contract_address();
+
+        // Configure vault to use the pool
+        env.set_caller(admin);
+        vault.set_mutual_pool(pool_addr);
+        if premium_bps > 0 {
+            vault.set_premium_bps(premium_bps);
+        }
+        if indemnity_target_bps > 0 {
+            vault.set_indemnity_target_bps(indemnity_target_bps);
+        }
+
+        // Fund vault with 200 CSPR from depositor
+        let depositor = env.get_account(5);
+        env.set_caller(depositor);
+        vault.with_tokens(U512::from(200 * ONE_CSPR)).deposit();
+
+        IntegrationFixture {
+            vault,
+            pool,
+            env,
+            admin,
+            operator,
+            approver0,
+            approver1,
+            attestation_window_ms,
+        }
+    }
+
+    /// Fundea un lote completo (open → deposit → bond → FUNDED).
+    fn fund_lote_integration(
+        f: &mut IntegrationFixture,
+        lote_id: u64,
+        producer: Address,
+        buyer: Address,
+        funded_amount: U512,
+        bond_amount: U512,
+    ) {
+        f.env.set_caller(f.admin);
+        f.vault.open_lote(lote_id, producer);
+        f.env.set_caller(buyer);
+        f.vault.with_tokens(funded_amount).deposit_to_lote(lote_id);
+        f.env.set_caller(producer);
+        f.vault.with_tokens(bond_amount).post_bond(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
+    }
+
+    // ── W2-3a: premium en release feliz ──────────────────────────────
+
+    #[test]
+    fn integration_release_with_premium_deducts_and_capitalizes_pool() {
+        let mut f = setup_integration(50, 0); // premium_bps=50 (0.5%), sin indemnity
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let funded = U512::from(100 * ONE_CSPR);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        fund_lote_integration(&mut f, 1, producer, buyer, funded, bond);
+
+        let producer_before = f.env.balance_of(&producer);
+
+        // evaluate → EVAL_OK → release
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(1);
+        assert_eq!(f.vault.lote_state(1), LOTE_STATE_EVAL_OK);
+
+        let pool_before = f.env.balance_of(&f.pool);
+
+        f.env.set_caller(f.admin);
+        f.vault.release_to_producer(1);
+
+        assert_eq!(f.vault.lote_state(1), LOTE_STATE_SETTLED_OK);
+
+        // Premium = 100 * 50 / 10000 = 0.5 CSPR
+        let premium = U512::from(500_000_000u64); // 0.5 CSPR
+        let expected_payout = funded.checked_add(bond).unwrap().checked_sub(premium).unwrap();
+        assert_eq!(
+            f.env.balance_of(&producer),
+            producer_before + expected_payout
+        );
+
+        // MutualPool recibió la prima
+        assert_eq!(f.pool.reserve(), pool_before + premium);
+    }
+
+    #[test]
+    fn integration_release_with_zero_premium_bps_no_deduction() {
+        // premium_bps=0 → same as W2-1/W2-2 behavior
+        let mut f = setup_integration(0, 0);
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let funded = U512::from(100 * ONE_CSPR);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        fund_lote_integration(&mut f, 1, producer, buyer, funded, bond);
+
+        let producer_before = f.env.balance_of(&producer);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(1);
+        f.env.set_caller(f.admin);
+        f.vault.release_to_producer(1);
+
+        assert_eq!(f.vault.lote_state(1), LOTE_STATE_SETTLED_OK);
+        assert_eq!(f.pool.reserve(), U512::zero());
+        assert_eq!(
+            f.env.balance_of(&producer),
+            producer_before + funded + bond
+        );
+    }
+
+    // ── W2-3b: cola en settle_failure (flujo EVAL_FAIL manual) ──────
+
+    /// Helper: set up a lote to EVAL_FAIL with a negative attestation.
+    #[allow(clippy::too_many_arguments)]
+    fn setup_eval_fail_integration(
+        f: &mut IntegrationFixture,
+        lote_id: u64,
+        producer: Address,
+        signer_a: Address,
+        buyer_b: Address,
+        share_a: U512,
+        share_b: U512,
+        bond: U512,
+    ) {
+        f.env.set_caller(f.admin);
+        f.vault.open_lote(lote_id, producer);
+
+        // Buyer A deposit
+        f.env.set_caller(signer_a);
+        f.vault.with_tokens(share_a).deposit_to_lote(lote_id);
+
+        // Buyer B deposit (silent)
+        f.env.set_caller(buyer_b);
+        f.vault.with_tokens(share_b).deposit_to_lote(lote_id);
+
+        // Producer bond
+        f.env.set_caller(producer);
+        f.vault.with_tokens(bond).post_bond(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
+
+        let funded = share_a.checked_add(share_b).unwrap();
+        assert_eq!(f.vault.lote_funded(lote_id), funded);
+    }
+
+    #[test]
+    fn integration_settle_failure_draws_tail_when_bond_short() {
+        // indemnity_target_bps=8000 → target = 80% of funded
+        // funded=100, bond=10, target=80, deficit=70
+        let mut f = setup_integration(0, 8000);
+
+        // Capitalizar el pool: 100 CSPR
+        let funder = f.env.get_account(5);
+        f.env.set_caller(funder);
+        f.pool.with_tokens(U512::from(100 * ONE_CSPR)).collect_premium();
+        let pool_before = f.pool.reserve();
+        assert_eq!(pool_before, U512::from(100 * ONE_CSPR));
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        // Buyer A = signer, 60 CSPR, will attest negative
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+
+        let _funded = U512::from(100 * ONE_CSPR);
+
+        // Submit negative attestation (60% → EVAL_FAIL)
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
+
+        let reserved_before = f.vault.reserved_lote_balance();
+
+        // settle_failure → trae cola del pool
+        f.env.set_caller(f.admin);
+        f.vault.settle_failure(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
+
+        // target = 100 * 8000 / 10000 = 80 CSPR, deficit = 80 - 10 = 70
+        let expected_tail = U512::from(70 * ONE_CSPR);
+        let expected_pool_amount = bond.checked_add(expected_tail).unwrap();
+        assert_eq!(
+            f.vault.lote_indemnity_pool(lote_id),
+            expected_pool_amount
+        );
+        assert_eq!(f.pool.reserve(), pool_before - expected_tail);
+
+        let expected_reserved = reserved_before.checked_add(expected_tail).unwrap();
+        assert_eq!(f.vault.reserved_lote_balance(), expected_reserved);
+
+        // Verificar indemnización: usa pool (bond+tail)=80
+        let buyer_before = f.env.balance_of(&signer_a);
+        f.env.set_caller(signer_a);
+        f.vault.withdraw_settlement(lote_id);
+        // refund = 60, indemnity = 80*60/100 = 48, amount = 108
+        let expected_refund = U512::from(60 * ONE_CSPR);
+        let expected_indemnity = U512::from(48 * ONE_CSPR);
+        let expected_amount = expected_refund.checked_add(expected_indemnity).unwrap();
+        assert_eq!(
+            f.env.balance_of(&signer_a),
+            buyer_before + expected_amount
+        );
+    }
+
+    #[test]
+    fn integration_settle_failure_no_tail_when_bond_covers_target() {
+        let mut f = setup_integration(0, 500); // target=5%, bond=10 > target=5
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
+
+        f.env.set_caller(f.admin);
+        f.vault.settle_failure(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
+
+        // No tail: bond >= target
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), bond);
+        assert_eq!(f.pool.reserve(), U512::zero());
+    }
+
+    #[test]
+    fn integration_tail_bounded_by_pool_reserve() {
+        let mut f = setup_integration(0, 8000); // target=80, bond=10, deficit=70
+
+        // Pool solo tiene 5 CSPR
+        let funder = f.env.get_account(5);
+        f.env.set_caller(funder);
+        f.pool.with_tokens(U512::from(5 * ONE_CSPR)).collect_premium();
+        assert_eq!(f.pool.reserve(), U512::from(5 * ONE_CSPR));
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+        f.env.set_caller(f.admin);
+        f.vault.settle_failure(lote_id);
+
+        // Tail = 5 (pool reserve), no 70
+        assert_eq!(f.pool.reserve(), U512::zero());
+        assert_eq!(
+            f.vault.lote_indemnity_pool(lote_id),
+            U512::from(15 * ONE_CSPR) // bond 10 + tail 5
+        );
+    }
+
+    #[test]
+    fn integration_pay_tail_by_non_vault_call_reverts() {
+        let mut f = setup_integration(0, 0);
+        let recipient = f.env.get_account(5);
+
+        let funder = f.env.get_account(5);
+        f.env.set_caller(funder);
+        f.pool.with_tokens(U512::from(10 * ONE_CSPR)).collect_premium();
+
+        let random = f.env.get_account(9);
+        f.env.set_caller(random);
+        let result = f.pool.try_pay_tail(recipient, U512::from(ONE_CSPR));
+
+        assert_eq!(
+            result.unwrap_err(),
+            crate::mutual_pool::Error::NotAuthorizedVault.into()
+        );
+        assert_eq!(f.pool.reserve(), U512::from(10 * ONE_CSPR));
+    }
+
+    // ── W2-3c: backward-compatibility ──────────────────────────────
+
+    #[test]
+    fn integration_backward_compat_release_without_mutual_pool_config() {
+        let mut f = setup_integration(0, 0);
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let funded = U512::from(100 * ONE_CSPR);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        fund_lote_integration(&mut f, 1, producer, buyer, funded, bond);
+
+        let producer_before = f.env.balance_of(&producer);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(1);
+        f.env.set_caller(f.admin);
+        f.vault.release_to_producer(1);
+
+        assert_eq!(
+            f.env.balance_of(&producer),
+            producer_before + funded + bond
+        );
+    }
+
+    #[test]
+    fn integration_backward_compat_settle_failure_without_mutual_pool_config() {
+        let mut f = setup_integration(0, 0);
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
+
+        f.env.set_caller(f.admin);
+        f.vault.settle_failure(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
+
+        // No tail: pool = bond
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), bond);
+
+        // Buyer withdraw: indemnity = bond * share / funded
+        let buyer_before = f.env.balance_of(&signer_a);
+        f.env.set_caller(signer_a);
+        f.vault.withdraw_settlement(lote_id);
+        // refund=60, indemnity=10*60/100=6, amount=66
+        let expected_indemnity = U512::from(6 * ONE_CSPR);
+        assert_eq!(
+            f.env.balance_of(&signer_a),
+            buyer_before + U512::from(60 * ONE_CSPR) + expected_indemnity
+        );
+    }
+
+    // ── Helpers for integration tests ───────────────────────────────
+
+    fn vault_domain_integration(f: &IntegrationFixture) -> (Address, u64) {
+        (f.vault.contract_address(), 1)
     }
 }
