@@ -153,6 +153,13 @@ pub enum Error {
     WindowNotClosed = 54,
     /// El lote no está en estado EVAL_OK (no se puede liberar al productor).
     LoteNotReleasable = 55,
+    // ── W2-2: SETTLED_FAIL ──
+    /// El lote no está en estado EVAL_FAIL (no es fallable).
+    LoteNotFailable = 56,
+    /// El lote no está en estado SETTLED_FAIL (no se puede reclamar settlement).
+    LoteNotSettledFail = 57,
+    /// Este comprador ya reclamó su refund + indemnización de este lote.
+    SettlementAlreadyClaimed = 58,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -274,12 +281,35 @@ pub struct LoteEvaluated {
     pub funded: U512,
 }
 
+// ── W2-2: SETTLED_FAIL ──
+
+/// Evento: el lote falló (settle_failure). Estado → SETTLED_FAIL.
+/// No mueve fondos; el bono queda como pool de indemnización del lote.
+#[odra::event]
+pub struct LoteSettledFail {
+    pub lote_id: u64,
+    pub funded: U512,
+    pub bond: U512,
+    pub producer: Address,
+}
+
+/// Evento: un comprador reclamó su refund + indemnización de un lote fallido.
+/// PULL: cada comprador ejecuta withdraw_settlement.
+#[odra::event]
+pub struct SettlementWithdrawn {
+    pub lote_id: u64,
+    pub buyer: Address,
+    pub refund: U512,
+    pub indemnity: U512,
+    pub amount: U512,
+}
+
 /// Contrato de custodia de Ohu.
 ///
 /// TODO(audit): CES (`emit_event`) es el event standard soportado por Odra.
 /// Verificar si CSPR.cloud indexa CES, native events, o ambos; ajustar a
 /// `emit_native_event` si es necesario. Ver <https://odra.dev/docs/basics/events>.
-#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded, LoteOpened, DepositedToLote, BondPosted, LoteFunded, LoteEvaluated, ReleaseProposed, ReleaseApproved, ReleasedToProducer])]
+#[odra::module(events = [Deposit, MicropaymentRouted, WithdrawProposed, WithdrawApproved, WithdrawExecuted, AttestationRecorded, LoteOpened, DepositedToLote, BondPosted, LoteFunded, LoteEvaluated, LoteSettledFail, SettlementWithdrawn, ReleaseProposed, ReleaseApproved, ReleasedToProducer])]
 pub struct OhuVault {
     /// Cuenta que ejecuta releases grandes (`caller == admin` en `execute`).
     admin: Var<Address>,
@@ -351,6 +381,10 @@ pub struct OhuVault {
     lote_release_approvals: Mapping<u64, u8>,
     /// `(lote_id, approver) -> true`: anti doble-aprobación.
     lote_release_has_approved: Mapping<(u64, Address), bool>,
+    // ── W2-2: settlement fail ──
+    /// `(lote_id, buyer) -> true`: el comprador ya reclamó su refund +
+    /// indemnización en este lote (anti doble-claim).
+    lote_settlement_claimed: Mapping<(u64, Address), bool>,
 }
 
 /// Constantes de estado de lote (W1-1, W2-1).
@@ -360,6 +394,7 @@ const LOTE_STATE_FUNDED: u8 = 2;
 const LOTE_STATE_SETTLED_OK: u8 = 3;
 const LOTE_STATE_EVAL_OK: u8 = 4;
 const LOTE_STATE_EVAL_FAIL: u8 = 5;
+const LOTE_STATE_SETTLED_FAIL: u8 = 6;
 
 #[odra::module]
 impl OhuVault {
@@ -1216,6 +1251,121 @@ impl OhuVault {
         });
     }
 
+    // ── W2-2: SETTLED_FAIL ──
+
+    /// Cierra el lote fallido. No mueve fondos (PULL: los compradores
+    /// retiran con `withdraw_settlement`).
+    ///
+    /// Gates:
+    /// - `caller == admin` (NotAdmin). El agente nunca mueve capital (INV-1).
+    /// - `state == EVAL_FAIL` (LoteNotFailable). El tally on-chain autoriza (INV-2).
+    ///
+    /// Efecto: `state = SETTLED_FAIL`. El bono no se devuelve al productor;
+    /// queda como pool de indemnización del lote.
+    ///
+    /// TODO(audit): aquí es donde W2-3 integrará `MutualPool.pay_tail()` para
+    /// la cola de indemnización que exceda el bono.
+    pub fn settle_failure(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        if caller != admin {
+            self.env().revert(Error::NotAdmin);
+        }
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_EVAL_FAIL {
+            self.env().revert(Error::LoteNotFailable);
+        }
+
+        let funded = self.lote_funded.get_or_default(&lote_id);
+        let bond = self.lote_bond.get_or_default(&lote_id);
+        let producer = match self.lote_producer.get(&lote_id) {
+            Some(p) => p,
+            None => self.env().revert(Error::LoteNotFound),
+        };
+
+        // NO mueve fondos. El bono queda en reserved como pool de indemnización.
+        self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_FAIL);
+
+        self.env().emit_event(LoteSettledFail {
+            lote_id,
+            funded,
+            bond,
+            producer,
+        });
+    }
+
+    /// PULL: un comprador reclama su refund (share) + indemnización
+    /// proporcional del bono slasheado en un lote fallido.
+    ///
+    /// Gates:
+    /// - `state == SETTLED_FAIL` (LoteNotSettledFail).
+    /// - `caller` es comprador: `share = lote_share[(lote, caller)] > 0`
+    ///   (NotABuyer, ya existente).
+    /// - No reclamado antes: `lote_settlement_claimed[(lote, caller)] == false`
+    ///   (SettlementAlreadyClaimed).
+    ///
+    /// Cálculo (multiplicación antes de división, U512 checked_*):
+    ///   indemnity = bond * share / funded  (proporción del bono slasheado)
+    ///   amount = share + indemnity  (refund + indemnización)
+    ///
+    /// CEI estricto: marca claimed + decrementa reserved ANTES de transferir.
+    ///
+    /// Dust de división entera: la suma de todas las indemnizaciones puede
+    /// ser < bond. Ese dust queda en reserved del lote (inocuo).
+    pub fn withdraw_settlement(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_SETTLED_FAIL {
+            self.env().revert(Error::LoteNotSettledFail);
+        }
+
+        let share = self.lote_share.get_or_default(&(lote_id, caller));
+        if share == U512::zero() {
+            self.env().revert(Error::NotABuyer);
+        }
+
+        let claim_key = (lote_id, caller);
+        if self.lote_settlement_claimed.get_or_default(&claim_key) {
+            self.env().revert(Error::SettlementAlreadyClaimed);
+        }
+
+        let funded = self.lote_funded.get_or_default(&lote_id);
+        let bond = self.lote_bond.get_or_default(&lote_id);
+
+        // funded > 0 garantizado: un lote en EVAL_FAIL → SETTLED_FAIL
+        // tuvo funded > 0 para alcanzar FUNDED.
+        let indemnity = bond
+            .checked_mul(share)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow))
+            .checked_div(funded)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        let amount = share
+            .checked_add(indemnity)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        // CEI: effects antes que interactions.
+        self.lote_settlement_claimed.set(&claim_key, true);
+
+        let old_reserved = self.reserved_lote_balance.get_or_default();
+        let new_reserved = old_reserved
+            .checked_sub(amount)
+            .unwrap_or_else(|| self.env().revert(Error::ReservedAccounting));
+        self.reserved_lote_balance.set(new_reserved);
+
+        self.env().transfer_tokens(&caller, &amount);
+
+        self.env().emit_event(SettlementWithdrawn {
+            lote_id,
+            buyer: caller,
+            refund: share,
+            indemnity,
+            amount,
+        });
+    }
+
     // ── Getters de atestación (S3) ──
 
     /// ¿La atestación para `(lote_id, signer)` ya fue registrada?
@@ -1378,6 +1528,13 @@ impl OhuVault {
     pub fn lote_release_approvals(&self, lote_id: u64) -> u8 {
         self.lote_release_approvals.get_or_default(&lote_id)
     }
+
+    // ── W2-2: getters de settlement fail ──
+
+    /// ¿El comprador ya reclamó su refund + indemnización de este lote fallido?
+    pub fn lote_settlement_claimed(&self, lote_id: u64, buyer: Address) -> bool {
+        self.lote_settlement_claimed.get_or_default(&(lote_id, buyer))
+    }
 }
 
 #[cfg(test)]
@@ -1385,8 +1542,8 @@ mod tests {
     use super::{
         AttestationRecorded, BondPosted, DepositedToLote, Deposit, Error, LoteFunded, LoteOpened,
         LOTE_STATE_EVAL_FAIL, LOTE_STATE_EVAL_OK,
-        LOTE_STATE_FUNDED, LOTE_STATE_OPEN, LOTE_STATE_SETTLED_OK,
-        LoteEvaluated,
+        LOTE_STATE_FUNDED, LOTE_STATE_OPEN, LOTE_STATE_SETTLED_FAIL, LOTE_STATE_SETTLED_OK,
+        LoteEvaluated, LoteSettledFail, SettlementWithdrawn,
         MicropaymentRouted, OhuVault, OhuVaultHostRef, OhuVaultInitArgs,
         ReleaseApproved, ReleasedToProducer, ReleaseProposed,
         WithdrawApproved, WithdrawExecuted, WithdrawProposed,
@@ -4617,5 +4774,393 @@ mod tests {
         );
         assert_eq!(f.contract.quorum_fail_bps(), 7000);
         assert_eq!(f.contract.attestation_window_ms(), 120_000);
+    }
+
+    // ===============================================================
+    // W2-2 — SETTLED_FAIL (settle_failure + withdraw_settlement)
+    // ===============================================================
+
+    /// Flujo completo hasta EVAL_FAIL: open → deposit (2 buyers 60/40)
+    /// → post_bond (50) → FUNDED → atestación negativa ≥60% → evaluate
+    /// → EVAL_FAIL. Retorna (producer, [buyer_a, buyer_b], funded, bond).
+    fn setup_eval_fail(f: &mut Fixture, lote_id: u64) -> (Address, Address, Address, U512, U512) {
+        let producer = f.env.get_account(7);
+        let bond = U512::from(50 * ONE_CSPR);
+
+        open_lote(f, lote_id, producer);
+
+        // Buyer A: 60 CSPR — atestará no-recibido (≥60% para disparar EVAL_FAIL)
+        let (vc_addr, chain_id) = vault_domain(f);
+        let (_sk_a, pk_a, sig_a, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(f, lote_id, signer_a, 60);
+
+        // Buyer B: 40 CSPR — silencio (recibido por default)
+        let buyer_b = f.env.get_account(9);
+        f.env.set_caller(buyer_b);
+        f.contract
+            .with_tokens(U512::from(40 * ONE_CSPR))
+            .deposit_to_lote(lote_id);
+
+        let funded = f.contract.lote_funded(lote_id);
+        assert_eq!(funded, U512::from(100 * ONE_CSPR));
+
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(lote_id);
+        assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_FUNDED);
+
+        // Submit atestación negativa de A (60% → ≥ quorum 60%)
+        f.env.set_caller(f.operator);
+        f.contract.verify_attestation(lote_id, 1, false, u64::MAX, pk_a, sig_a);
+
+        // Cerrar ventana + evaluar → EVAL_FAIL
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(lote_id);
+        assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
+
+        (producer, signer_a, buyer_b, funded, bond)
+    }
+
+    // ── settle_failure: positivos ───────────────────────────────────
+
+    #[test]
+    fn settle_failure_by_admin_on_eval_fail_succeeds() {
+        let mut f = simple_setup();
+        let (producer, _a, _b, funded, bond) = setup_eval_fail(&mut f, 1);
+
+        let vault_before = f.env.balance_of(&f.contract);
+        let reserved_before = f.contract.reserved_lote_balance();
+
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_FAIL);
+        // Los fondos NO se movieron.
+        assert_eq!(f.env.balance_of(&f.contract), vault_before);
+        assert_eq!(f.contract.reserved_lote_balance(), reserved_before);
+        // Evento
+        assert!(f.env.emitted_event(
+            &f.contract,
+            LoteSettledFail {
+                lote_id: 1,
+                funded,
+                bond,
+                producer,
+            }
+        ));
+    }
+
+    // ── settle_failure: negativos ──────────────────────────────────
+
+    #[test]
+    fn settle_failure_on_eval_ok_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        // Silencio total → EVAL_OK
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_settle_failure(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFailable.into());
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+    }
+
+    #[test]
+    fn settle_failure_on_funded_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_settle_failure(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotFailable.into());
+    }
+
+    #[test]
+    fn settle_failure_by_non_admin_reverts() {
+        let mut f = simple_setup();
+        setup_eval_fail(&mut f, 1);
+
+        f.env.set_caller(f.operator);
+        let result = f.contract.try_settle_failure(1);
+        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+
+        f.env.set_caller(f.approver0);
+        let result = f.contract.try_settle_failure(1);
+        assert_eq!(result.unwrap_err(), Error::NotAdmin.into());
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_FAIL);
+    }
+
+    // ── withdraw_settlement: positivos ──────────────────────────────
+
+    /// Dos compradores 60/40 de 100, bono 50.
+    /// A: share=60, refund=60, indemnity=50*60/100=30, amount=90
+    /// B: share=40, refund=40, indemnity=50*40/100=20, amount=60
+    #[test]
+    fn withdraw_settlement_exact_arithmetic() {
+        let mut f = simple_setup();
+        let (_producer, buyer_a, buyer_b, funded, bond) = setup_eval_fail(&mut f, 1);
+
+        // settle_failure antes de reclamar
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_FAIL);
+
+        let balance_before = f.env.balance_of(&f.contract);
+        let reserved_before = f.contract.reserved_lote_balance();
+
+        // Buyer A reclama
+        let a_before = f.env.balance_of(&buyer_a);
+        f.env.set_caller(buyer_a);
+        f.contract.withdraw_settlement(1);
+        assert!(f.contract.lote_settlement_claimed(1, buyer_a));
+
+        let expected_a = U512::from(60 * ONE_CSPR) + U512::from(30 * ONE_CSPR);
+        assert_eq!(f.env.balance_of(&buyer_a), a_before + expected_a);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            SettlementWithdrawn {
+                lote_id: 1,
+                buyer: buyer_a,
+                refund: U512::from(60 * ONE_CSPR),
+                indemnity: U512::from(30 * ONE_CSPR),
+                amount: expected_a,
+            }
+        ));
+
+        // Buyer B reclama
+        let b_before = f.env.balance_of(&buyer_b);
+        f.env.set_caller(buyer_b);
+        f.contract.withdraw_settlement(1);
+        assert!(f.contract.lote_settlement_claimed(1, buyer_b));
+
+        let expected_b = U512::from(40 * ONE_CSPR) + U512::from(20 * ONE_CSPR);
+        assert_eq!(f.env.balance_of(&buyer_b), b_before + expected_b);
+        assert!(f.env.emitted_event(
+            &f.contract,
+            SettlementWithdrawn {
+                lote_id: 1,
+                buyer: buyer_b,
+                refund: U512::from(40 * ONE_CSPR),
+                indemnity: U512::from(20 * ONE_CSPR),
+                amount: expected_b,
+            }
+        ));
+
+        // Vault: se fue funded + bond (= 150) en total
+        assert_eq!(
+            f.env.balance_of(&f.contract),
+            balance_before - (funded + bond)
+        );
+        // Reserved bajó exactamente en lo retirado (funded + bond).
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            reserved_before - (funded + bond)
+        );
+    }
+
+    /// Verifica que reserved_lote_balance baja exactamente en cada
+    /// withdraw individual, no de golpe.
+    #[test]
+    fn withdraw_settlement_reserved_decrements_per_withdraw() {
+        let mut f = simple_setup();
+        let (_producer, buyer_a, buyer_b, funded, bond) = setup_eval_fail(&mut f, 1);
+
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+
+        let reserved_before = f.contract.reserved_lote_balance();
+        assert_eq!(reserved_before, funded + bond);
+
+        // Buyer A → reserved baja en 90
+        f.env.set_caller(buyer_a);
+        f.contract.withdraw_settlement(1);
+        let expected_a = U512::from(90 * ONE_CSPR);
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            reserved_before - expected_a
+        );
+
+        // Buyer B → reserved baja en 60 más, total = 150 (funded + bond)
+        f.env.set_caller(buyer_b);
+        f.contract.withdraw_settlement(1);
+        let expected_b = U512::from(60 * ONE_CSPR);
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            reserved_before - (expected_a + expected_b)
+        );
+    }
+
+    // ── withdraw_settlement: negativos ──────────────────────────────
+
+    #[test]
+    fn withdraw_settlement_before_settle_failure_reverts() {
+        let mut f = simple_setup();
+        let (_producer, buyer_a, _b, _funded, _bond) = setup_eval_fail(&mut f, 1);
+
+        f.env.set_caller(buyer_a);
+        let result = f.contract.try_withdraw_settlement(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotSettledFail.into());
+    }
+
+    #[test]
+    fn withdraw_settlement_double_claim_reverts() {
+        let mut f = simple_setup();
+        let (_producer, buyer_a, _b, _funded, _bond) = setup_eval_fail(&mut f, 1);
+
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+
+        f.env.set_caller(buyer_a);
+        f.contract.withdraw_settlement(1);
+
+        let result = f.contract.try_withdraw_settlement(1);
+        assert_eq!(result.unwrap_err(), Error::SettlementAlreadyClaimed.into());
+    }
+
+    #[test]
+    fn withdraw_settlement_non_buyer_reverts() {
+        let mut f = simple_setup();
+        let (_producer, _a, _b, _funded, _bond) = setup_eval_fail(&mut f, 1);
+
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+
+        let random = f.env.get_account(10);
+        f.env.set_caller(random);
+        let result = f.contract.try_withdraw_settlement(1);
+        assert_eq!(result.unwrap_err(), Error::NotABuyer.into());
+    }
+
+    #[test]
+    fn withdraw_settlement_on_eval_ok_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(10 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_EVAL_OK);
+
+        let buyer = f.env.get_account(8);
+        f.env.set_caller(buyer);
+        let result = f.contract.try_withdraw_settlement(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotSettledFail.into());
+    }
+
+    // ── INV-7: aislamiento entre lotes fallidos ─────────────────────
+
+    #[test]
+    fn inv7_two_failed_lotes_withdraw_isolated() {
+        let mut f = simple_setup();
+
+        // Lote 1: EVAL_FAIL con buyers A(60) + B(40), bond=50
+        let (_p0, a1, b1, f1, bond1) = setup_eval_fail(&mut f, 1);
+        // Lote 2: EVAL_FAIL con buyers C(60) + D(40), bond=50
+        let (_p1, a2, b2, f2, bond2) = setup_eval_fail(&mut f, 2);
+
+        // settle_failure ambos
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+        f.contract.settle_failure(2);
+
+        let reserved_before = f.contract.reserved_lote_balance();
+        assert_eq!(reserved_before, f1 + bond1 + f2 + bond2);
+
+        // Withdraw de Lote 1 A
+        let a1_before = f.env.balance_of(&a1);
+        f.env.set_caller(a1);
+        f.contract.withdraw_settlement(1);
+        let expected_a1 = U512::from(90 * ONE_CSPR);
+        assert_eq!(f.env.balance_of(&a1), a1_before + expected_a1);
+
+        // Lote 2 intacto
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_SETTLED_FAIL);
+        assert_eq!(f.contract.lote_funded(2), f2);
+        assert_eq!(f.contract.lote_bond(2), bond2);
+
+        // Withdraw de Lote 2 A — verifica que no roba fondos del lote 1
+        let a2_before = f.env.balance_of(&a2);
+        f.env.set_caller(a2);
+        f.contract.withdraw_settlement(2);
+        assert_eq!(f.env.balance_of(&a2), a2_before + expected_a1); // misma aritmética
+
+        // Ambos lotes pueden liquidar sus buyers sin interferencia
+        f.env.set_caller(b1);
+        f.contract.withdraw_settlement(1);
+        f.env.set_caller(b2);
+        f.contract.withdraw_settlement(2);
+
+        // reserved bajó exactamente en funded+bond de ambos lotes
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            reserved_before - (f1 + bond1 + f2 + bond2)
+        );
+    }
+
+    #[test]
+    fn inv7_lote_a_withdraw_does_not_alter_lote_b_reserved() {
+        let mut f = simple_setup();
+
+        let (_p0, a1, _b1, _f1, _bond1) = setup_eval_fail(&mut f, 1);
+        let (_p1, _a2, _b2, _f2, _bond2) = setup_eval_fail(&mut f, 2);
+
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+        f.contract.settle_failure(2);
+
+        let reserved_before = f.contract.reserved_lote_balance();
+        let lote1_reserved = U512::from(150 * ONE_CSPR); // 100 funded + 50 bond
+
+        // Withdraw full de lote 1 buyer A (60 CSPR refund + 30 indemnity = 90)
+        f.env.set_caller(a1);
+        f.contract.withdraw_settlement(1);
+
+        // Lote 2 sigue con su reserved intacto
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            reserved_before - U512::from(90 * ONE_CSPR)
+        );
+        // El remanente del lote 1 = 150 - 90 = 60 CSPR (lo de buyer B)
+        // Lote 2 = 150 CSPR → total reserved = 60 + 150 = 210
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            lote1_reserved - U512::from(90 * ONE_CSPR) + U512::from(150 * ONE_CSPR)
+        );
+    }
+
+    /// Opcional: la suma de todos los withdraws de un lote
+    /// ≈ funded + bond (salvo dust de división entera).
+    #[test]
+    fn withdraw_settlement_total_approx_funded_plus_bond() {
+        let mut f = simple_setup();
+        let (_producer, buyer_a, buyer_b, funded, bond) = setup_eval_fail(&mut f, 1);
+
+        f.env.set_caller(f.admin);
+        f.contract.settle_failure(1);
+
+        let vault_before = f.env.balance_of(&f.contract);
+
+        f.env.set_caller(buyer_a);
+        f.contract.withdraw_settlement(1);
+        f.env.set_caller(buyer_b);
+        f.contract.withdraw_settlement(1);
+
+        let total_withdrawn = vault_before - f.env.balance_of(&f.contract);
+        assert_eq!(total_withdrawn, funded + bond);
     }
 }
