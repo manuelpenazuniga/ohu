@@ -4970,6 +4970,56 @@ mod tests {
         );
     }
 
+    /// Propiedad semántica (observación audit Gemini W2-2): en un lote FALLIDO,
+    /// un comprador que atestó POSITIVO (received=true) IGUAL recupera su refund +
+    /// indemnización. El derecho a withdraw depende SOLO de lote_share, no del
+    /// veredicto que firmó el comprador (cuando el lote falla colectivamente,
+    /// todos recuperan su escrow).
+    #[test]
+    fn withdraw_settlement_positive_attestor_still_refunded() {
+        let mut f = simple_setup();
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let bond = U512::from(50 * ONE_CSPR);
+        open_lote(&mut f, lote_id, producer);
+        let (vc_addr, chain_id) = vault_domain(&f);
+
+        // Buyer A: 60 CSPR, atesta NO-recibido (dispara EVAL_FAIL: 60% ≥ quorum 60%).
+        let (_sk_a, pk_a, sig_a, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, lote_id, signer_a, 60);
+
+        // Buyer C: 40 CSPR, atesta RECIBIDO (positivo) — el caso que faltaba.
+        let (_sk_c, pk_c, sig_c, signer_c) =
+            sign_attestation(lote_id, 2, true, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, lote_id, signer_c, 40);
+
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(lote_id);
+
+        // Ambas atestaciones on-chain (la positiva de C NO reduce el tally negativo).
+        f.env.set_caller(f.operator);
+        f.contract
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk_a, sig_a);
+        f.contract
+            .verify_attestation(lote_id, 2, true, u64::MAX, pk_c, sig_c);
+
+        // Cerrar ventana → evaluar → EVAL_FAIL → settle.
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.contract.evaluate_lote(lote_id);
+        assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
+        f.contract.settle_failure(lote_id);
+
+        // C (atestó POSITIVO) IGUAL reclama: refund 40 + indemnity 50*40/100 = 20 = 60.
+        let c_before = f.env.balance_of(&signer_c);
+        f.env.set_caller(signer_c);
+        f.contract.withdraw_settlement(lote_id);
+        assert!(f.contract.lote_settlement_claimed(lote_id, signer_c));
+        let expected_c = U512::from(40 * ONE_CSPR) + U512::from(20 * ONE_CSPR);
+        assert_eq!(f.env.balance_of(&signer_c), c_before + expected_c);
+    }
+
     /// Verifica que reserved_lote_balance baja exactamente en cada
     /// withdraw individual, no de golpe.
     #[test]
