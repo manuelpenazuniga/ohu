@@ -139,6 +139,10 @@ pub enum Error {
     ReleaseAlreadyProposed = 48,
     /// No hay propuesta de release abierta para este lote.
     ReleaseNotProposed = 49,
+    /// El productor no puede ser admin, operator ni approver (FIX 4 — separación de roles).
+    ProducerIsPrivileged = 50,
+    /// Error contable del reservado de lote (underflow en reserved_lote_balance).
+    ReservedAccounting = 51,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -289,9 +293,14 @@ pub struct OhuVault {
     /// S3: identificador de cadena para domain separation (fix #4).
     chain_id: Var<u64>,
     // ── W1-1: modelo de lote (INV-7: escrow earmarked) ──
+    /// INV-7 (FIX crítico): suma tracked de CSPR reservado para lotes activos.
+    /// Se incrementa en `deposit_to_lote` y `post_bond`; se decrementa en
+    /// `release_to_producer`. Los outflows genéricos (`route_micropayment`,
+    /// `execute`) validan contra `self_balance() - reserved_lote_balance`.
+    reserved_lote_balance: Var<U512>,
     /// Productor asignado a cada lote.
     lote_producer: Mapping<u64, Address>,
-    /// Estado del lote: 0=inexistente, 1=OPEN, 2=FUNDED.
+    /// Estado del lote: 0=inexistente, 1=OPEN, 2=FUNDED, 3=SETTLED_OK.
     lote_state: Mapping<u64, u8>,
     /// Suma total de shares depositadas en el lote (Σ depósitos de compradores).
     /// INV-7: esta contabilidad es POR LOTE, nunca se deriva de self_balance().
@@ -400,6 +409,7 @@ impl OhuVault {
         // deploy (está documentado en Odra 2.8.2). Ver <https://odra.dev/docs/>.
         self.window_start.set(self.env().get_block_time());
         self.accumulated.set(U512::zero());
+        self.reserved_lote_balance.set(U512::zero());
         self.required_approvals.set(required_approvals);
         self.next_request_id.set(0u64);
         self.chain_id.set(chain_id);
@@ -472,19 +482,27 @@ impl OhuVault {
         let mut accumulated = self.accumulated.get_or_revert_with(Error::NotInitialized);
         let now = self.env().get_block_time();
 
-        if now >= window_start + epoch_window_ms {
+        if now.saturating_sub(window_start) >= epoch_window_ms {
             window_start = now;
             accumulated = U512::zero();
             self.window_start.set(window_start);
         }
 
-        let new_accumulated = accumulated + amount;
+        let new_accumulated = accumulated
+            .checked_add(amount)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
         if new_accumulated > epoch_cap {
             self.env().revert(Error::EpochCapExceeded);
         }
 
-        let balance = self.env().self_balance();
-        if amount > balance {
+        // FIX crítico: sólo se puede gastar saldo NO reservado para lotes (INV-7).
+        let reserved = self.reserved_lote_balance.get_or_default();
+        let free = self
+            .env()
+            .self_balance()
+            .checked_sub(reserved)
+            .unwrap_or(U512::zero());
+        if amount > free {
             self.env().revert(Error::InsufficientBalance);
         }
 
@@ -603,8 +621,15 @@ impl OhuVault {
             Some(a) => a,
             None => self.env().revert(Error::NotInitialized),
         };
-        let balance = self.env().self_balance();
-        if amount > balance {
+
+        // FIX crítico: ejecución genérica no puede gastar escrow reservado para lotes (INV-7).
+        let reserved = self.reserved_lote_balance.get_or_default();
+        let free = self
+            .env()
+            .self_balance()
+            .checked_sub(reserved)
+            .unwrap_or(U512::zero());
+        if amount > free {
             self.env().revert(Error::InsufficientBalance);
         }
 
@@ -732,6 +757,17 @@ impl OhuVault {
             self.env().revert(Error::NotAnAccount);
         }
 
+        // FIX 4: el productor no puede ser un rol privilegiado del vault.
+        if producer == admin {
+            self.env().revert(Error::ProducerIsPrivileged);
+        }
+        if producer == operator {
+            self.env().revert(Error::ProducerIsPrivileged);
+        }
+        if self.is_approver.get_or_default(&producer) {
+            self.env().revert(Error::ProducerIsPrivileged);
+        }
+
         self.lote_producer.set(&lote_id, producer);
         self.lote_state.set(&lote_id, LOTE_STATE_OPEN);
         // lote_funded y lote_bond comienzan en ceros (default de Mapping).
@@ -787,6 +823,13 @@ impl OhuVault {
             .checked_add(amount)
             .unwrap_or_else(|| self.env().revert(Error::Overflow));
         self.lote_funded.set(&lote_id, new_funded);
+
+        // FIX crítico: el CSPR depositado al lote queda reservado (INV-7).
+        let old_reserved = self.reserved_lote_balance.get_or_default();
+        let new_reserved = old_reserved
+            .checked_add(amount)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+        self.reserved_lote_balance.set(new_reserved);
 
         self.env().emit_event(DepositedToLote {
             lote_id,
@@ -846,6 +889,13 @@ impl OhuVault {
         }
 
         self.lote_bond.set(&lote_id, amount);
+
+        // FIX crítico: el bono depositado al lote queda reservado (INV-7).
+        let old_reserved = self.reserved_lote_balance.get_or_default();
+        let new_reserved = old_reserved
+            .checked_add(amount)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+        self.reserved_lote_balance.set(new_reserved);
 
         self.env().emit_event(BondPosted {
             lote_id,
@@ -990,6 +1040,14 @@ impl OhuVault {
 
         // CEI: effects antes que interactions (defensa en profundidad).
         self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_OK);
+
+        // FIX crítico: el lote liquidado libera su escrow reservado.
+        let old_reserved = self.reserved_lote_balance.get_or_default();
+        let new_reserved = old_reserved
+            .checked_sub(total)
+            .unwrap_or_else(|| self.env().revert(Error::ReservedAccounting));
+        self.reserved_lote_balance.set(new_reserved);
+
         self.env().transfer_tokens(&producer, &total);
         self.env().emit_event(ReleasedToProducer {
             lote_id,
@@ -1091,7 +1149,7 @@ impl OhuVault {
 
     // ── W1-1: getters de lote ──
 
-    /// Estado del lote: 0=inexistente, 1=OPEN, 2=FUNDED.
+    /// Estado del lote: 0=inexistente, 1=OPEN, 2=FUNDED, 3=SETTLED_OK.
     pub fn lote_state(&self, lote_id: u64) -> u8 {
         self.lote_state.get_or_default(&lote_id)
     }
@@ -1119,6 +1177,13 @@ impl OhuVault {
     /// Bono depositado por el productor para este lote (0 si no existe).
     pub fn lote_bond(&self, lote_id: u64) -> U512 {
         self.lote_bond.get_or_default(&lote_id)
+    }
+
+    /// Suma tracked del escrow reservado para lotes activos (INV-7, FIX crítico).
+    /// Los outflows genéricos (`route_micropayment`, `execute`) validan contra
+    /// `self_balance() - reserved_lote_balance`.
+    pub fn reserved_lote_balance(&self) -> U512 {
+        self.reserved_lote_balance.get_or_default()
     }
 
     // ── W1-2: getters de settlement ──
@@ -3458,5 +3523,300 @@ mod tests {
 
         // Lote no existente → 0
         assert_eq!(f.contract.lote_release_approvals(99), 0);
+    }
+
+    // ===============================================================
+    // FIX crítico: aislamiento de escrow earmarked (audit GPT-5.5)
+    // Tests de raideo — el escrow de lote es INTOCABLE por outflows
+    // genéricos (route_micropayment, execute).
+    // ===============================================================
+
+    /// FIX-raid: el operator NO puede gastar CSPR reservado para lotes vía route_micropayment.
+    #[test]
+    fn raid_route_micropayment_cannot_spend_lote_escrow() {
+        let mut f = setup_with(
+            U512::from(ONE_CSPR),              // cap por llamada = 1 CSPR
+            2,
+            U512::from(10 * ONE_CSPR),         // epoch_cap holgado
+            3_600_000,
+        );
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let lote_amount = U512::from(50 * ONE_CSPR);
+
+        // Deposita 50 CSPR a un lote → reserved_lote_balance sube a 50 CSPR.
+        open_lote(&mut f, 1, producer);
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(lote_amount).deposit_to_lote(1);
+
+        // self_balance ≈ 150 CSPR (100 setup + 50 lote), free ≈ 100 CSPR.
+        let balance = f.env.balance_of(&f.contract);
+        let reserved = f.contract.reserved_lote_balance();
+        assert_eq!(reserved, lote_amount);
+        assert!(balance > reserved);
+
+        // Un micropago de 2 CSPR cabe en self_balance pero NO en free (solo hay ~100 libres).
+        // Esperamos revert: el vault tiene 150, free son 100, pero el cap por llamada es 1 CSPR,
+        // así que un micropago de 1 CSPR (cap exacto) cabe en free.
+        // → intentamos uno de 1 CSPR y luego probamos que el exceso revierte.
+
+        // Primero probamos: un micropago de 1 CSPR contra el free sí debe pasar.
+        f.env.set_caller(f.operator);
+        f.contract
+            .route_micropayment(f.recipient, U512::from(ONE_CSPR));
+
+        // Ahora drenamos el saldo libre completamente con execute genérico.
+        // Pero antes: sin lote, execute también es genérico, puede consumir free.
+        // Drena los ~99 CSPR libres que quedan via M-de-N.
+        let free_before = f.env.balance_of(&f.contract)
+            .checked_sub(f.contract.reserved_lote_balance())
+            .unwrap();
+        f.env.set_caller(f.admin);
+        let id = f.contract.propose_withdraw(f.recipient, free_before);
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id);
+        f.env.set_caller(f.admin);
+        f.contract.execute(id);
+
+        // Ahora self_balance ≈ reserved (solo queda escrow de lote), free ≈ 0.
+        // route_micropayment debe revertir porque no hay saldo libre.
+        f.env.set_caller(f.operator);
+        let result = f
+            .contract
+            .try_route_micropayment(f.recipient, U512::from(ONE_CSPR));
+        assert_eq!(result.unwrap_err(), Error::InsufficientBalance.into());
+
+        // Verifica que el escrow del lote sigue intacto.
+        assert_eq!(f.contract.reserved_lote_balance(), lote_amount);
+        assert_eq!(f.contract.lote_funded(1), lote_amount);
+    }
+
+    /// FIX-raid: el admin NO puede drenar escrow de lote vía execute genérico.
+    #[test]
+    fn raid_execute_cannot_drain_lote_escrow() {
+        let mut f = setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let lote_amount = U512::from(40 * ONE_CSPR);
+
+        // Deposita a un lote → reserved sube.
+        open_lote(&mut f, 1, producer);
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(lote_amount).deposit_to_lote(1);
+
+        let reserved = f.contract.reserved_lote_balance();
+        assert_eq!(reserved, lote_amount);
+
+        // Propone y aprueba un execute genérico por un monto que excede `free`.
+        // self_balance = 140, reserved = 40, free = 100.
+        // Ejecutar 120 debería revertir.
+        f.env.set_caller(f.admin);
+        let id = f
+            .contract
+            .propose_withdraw(f.recipient, U512::from(120 * ONE_CSPR));
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_execute(id);
+        assert_eq!(result.unwrap_err(), Error::InsufficientBalance.into());
+        assert!(!f.contract.request_executed(id));
+
+        // El lote sigue intacto.
+        assert_eq!(f.contract.lote_funded(1), lote_amount);
+        assert_eq!(f.contract.reserved_lote_balance(), lote_amount);
+    }
+
+    /// FIX-raid: un retiro pre-aprobado no puede consumir depósitos de lote posteriores.
+    #[test]
+    fn raid_preapproved_withdraw_cannot_consume_future_lote_deposits() {
+        let mut f = setup_with(
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(10 * ONE_CSPR),
+            3_600_000,
+        );
+        // Drena casi todo el vault para que quede con poco saldo libre.
+        f.env.set_caller(f.admin);
+        let id_drain = f
+            .contract
+            .propose_withdraw(f.recipient, U512::from(95 * ONE_CSPR));
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id_drain);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id_drain);
+        f.env.set_caller(f.admin);
+        f.contract.execute(id_drain);
+        // Vault ≈ 5 CSPR libres.
+
+        // Propone y aprueba un execute genérico de 3 CSPR (< 5 libre, ok por ahora).
+        f.env.set_caller(f.admin);
+        let id = f
+            .contract
+            .propose_withdraw(f.recipient, U512::from(3 * ONE_CSPR));
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id);
+
+        // Luego un comprador deposita a un lote → reserved sube.
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(10 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        // El execute genérico YA NO puede consumir esos 3 CSPR porque el balance
+        // libre ahora es menor (parte está reservada para el lote).
+        // self_balance ≈ 5 + 10 = 15, reserved = 10, free ≈ 5.
+        // El retiro de 3 CSPR cabe en free → debería pasar.
+        f.env.set_caller(f.admin);
+        f.contract.execute(id);
+        assert!(f.contract.request_executed(id));
+
+        // Segundo retiro: ahora self_balance ≈ 12, reserved = 10, free ≈ 2.
+        // Proponer 3 CSPR > free → revert en execute.
+        f.env.set_caller(f.admin);
+        let id2 = f
+            .contract
+            .propose_withdraw(f.recipient, U512::from(3 * ONE_CSPR));
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id2);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id2);
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_execute(id2);
+        assert_eq!(result.unwrap_err(), Error::InsufficientBalance.into());
+
+        // El escrow del lote sigue intacto.
+        assert_eq!(f.contract.reserved_lote_balance(), U512::from(10 * ONE_CSPR));
+        assert_eq!(f.contract.lote_funded(1), U512::from(10 * ONE_CSPR));
+    }
+
+    /// FIX-raid: reserved_lote_balance decrece correctamente tras release_to_producer.
+    #[test]
+    fn reserved_decreases_on_release() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, producer, funded, bond);
+
+        let reserved_before = f.contract.reserved_lote_balance();
+        assert_eq!(reserved_before, funded + bond);
+
+        // Release
+        f.env.set_caller(f.admin);
+        f.contract.propose_release(1);
+        f.env.set_caller(f.approver0);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.approver1);
+        f.contract.approve_release(1);
+        f.env.set_caller(f.admin);
+        f.contract.release_to_producer(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
+        let reserved_after = f.contract.reserved_lote_balance();
+        assert_eq!(reserved_after, reserved_before - (funded + bond));
+        // Si no hay más lotes, reserved debe ser cero.
+        assert_eq!(reserved_after, U512::zero());
+    }
+
+    /// FIX-raid: dos lotes FUNDED, execute genérico no puede dejarlos sin respaldo (INV-7).
+    #[test]
+    fn inv7_two_lotes_generic_withdraw_cannot_break_settlement() {
+        let mut f = simple_setup();
+        let p0 = f.env.get_account(7);
+        let p1 = f.env.get_account(8);
+        let _buyer = f.env.get_account(9);
+        let funded0 = U512::from(30 * ONE_CSPR);
+        let bond0 = U512::from(5 * ONE_CSPR);
+        let funded1 = U512::from(40 * ONE_CSPR);
+        let bond1 = U512::from(5 * ONE_CSPR);
+        fund_lote(&mut f, 1, p0, funded0, bond0);
+        fund_lote(&mut f, 2, p1, funded1, bond1);
+
+        let reserved = f.contract.reserved_lote_balance();
+        assert_eq!(reserved, funded0 + bond0 + funded1 + bond1);
+
+        // self_balance > reserved porque el setup puso 100 CSPR + depósitos de lote.
+        // free = self_balance - reserved.
+        // Intentamos un execute genérico que dejaría el vault sin respaldo para uno de los lotes.
+        // free debe ser >= amount para que pase.
+        let balance = f.env.balance_of(&f.contract);
+        let free = balance.checked_sub(reserved).unwrap();
+        assert!(free > U512::zero());
+
+        // Ejecutar un retiro genérico por `free` — los dos lotes quedan respaldados
+        // (self_balance después = reserved exacto).
+        f.env.set_caller(f.admin);
+        let id = f.contract.propose_withdraw(f.recipient, free);
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id);
+        f.env.set_caller(f.admin);
+        f.contract.execute(id);
+
+        // Ahora self_balance == reserved; execute genérico adicional revierte.
+        f.env.set_caller(f.admin);
+        let id2 = f
+            .contract
+            .propose_withdraw(f.recipient, U512::from(ONE_CSPR));
+        f.env.set_caller(f.approver0);
+        f.contract.approve(id2);
+        f.env.set_caller(f.approver1);
+        f.contract.approve(id2);
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_execute(id2);
+        assert_eq!(result.unwrap_err(), Error::InsufficientBalance.into());
+
+        // Ambos lotes siguen FUNDED y pueden liquidarse.
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        assert_eq!(f.contract.lote_state(2), LOTE_STATE_FUNDED);
+        assert_eq!(f.contract.lote_funded(1), funded0);
+        assert_eq!(f.contract.lote_bond(1), bond0);
+        assert_eq!(f.contract.lote_funded(2), funded1);
+        assert_eq!(f.contract.lote_bond(2), bond1);
+    }
+
+    /// FIX 4: el producer no puede ser el admin.
+    #[test]
+    fn open_lote_producer_cannot_be_admin() {
+        let mut f = simple_setup();
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_open_lote(1, f.admin);
+        assert_eq!(result.unwrap_err(), Error::ProducerIsPrivileged.into());
+    }
+
+    /// FIX 4: el producer no puede ser el operator.
+    #[test]
+    fn open_lote_producer_cannot_be_operator() {
+        let mut f = simple_setup();
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_open_lote(1, f.operator);
+        assert_eq!(result.unwrap_err(), Error::ProducerIsPrivileged.into());
+    }
+
+    /// FIX 4: el producer no puede ser un approver.
+    #[test]
+    fn open_lote_producer_cannot_be_approver() {
+        let mut f = simple_setup();
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_open_lote(1, f.approver0);
+        assert_eq!(result.unwrap_err(), Error::ProducerIsPrivileged.into());
+    }
+
+    /// FIX: reserved_lote_balance getter devuelve 0 antes de cualquier lote.
+    #[test]
+    fn reserved_lote_balance_starts_at_zero() {
+        let f = simple_setup();
+        assert_eq!(f.contract.reserved_lote_balance(), U512::zero());
     }
 }
