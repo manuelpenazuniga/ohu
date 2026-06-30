@@ -143,6 +143,11 @@ pub enum Error {
     ProducerIsPrivileged = 50,
     /// Error contable del reservado de lote (underflow en reserved_lote_balance).
     ReservedAccounting = 51,
+    // ── W2-0: atestación ponderada y autorizada ──
+    /// El firmante no es comprador del lote (lote_share == 0 en ese lote).
+    NotABuyer = 52,
+    /// La atestación expiró (now >= valid_before).
+    AttestationExpired = 53,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -309,6 +314,11 @@ pub struct OhuVault {
     lote_share: Mapping<(u64, Address), U512>,
     /// Bono de cumplimiento depositado por el productor del lote.
     lote_bond: Mapping<u64, U512>,
+    // ── W2-0: tally ponderado de atestaciones ──
+    /// Suma de shares de firmantes que atestaron NO-recibido para el lote.
+    lote_tally_negative: Mapping<u64, U512>,
+    /// Suma de shares de firmantes que atestaron SÍ-recibido para el lote.
+    lote_tally_positive: Mapping<u64, U512>,
     // ── W1-2: settlement M-de-N lote-aware ──
     /// `true` si ya hay una propuesta de release abierta para este lote.
     lote_release_proposed: Mapping<u64, bool>,
@@ -650,26 +660,28 @@ impl OhuVault {
     /// Verifica una atestación Ed25519 firmada off-chain y la registra on-chain.
     ///
     /// El firmante (comprador) firma el mensaje `"OhuAttestation:" || lote_id ||
-    /// nonce || received || verifying_contract || chain_id` con su clave Ed25519.
-    /// El agente retransmite la firma pagando el gas (gasless para el firmante).
+    /// nonce || received || verifying_contract || chain_id || valid_before`
+    /// con su clave Ed25519. El agente retransmite la firma pagando el gas
+    /// (gasless para el firmante).
     ///
     /// # Verificación
     /// 1. Decodifica `public_key_bytes` (32 bytes) y `signature_bytes` (64 bytes).
-    /// 2. Reconstruye el mensaje (con `verifyingContract = self_address()` y el
-    ///    `chain_id` guardado en init) y verifica la firma Ed25519.
+    /// 2. Reconstruye el mensaje (con `verifyingContract = self_address()`, el
+    ///    `chain_id` guardado en init, y `valid_before`) y verifica la firma Ed25519.
     /// 3. Deriva `AccountHash` de la clave pública → identidad del firmante.
-    /// 4. Anti-replay (fix #3): scoped a `(signer, lote_id)` vía
+    /// 4. Expiry (S3 #2): revierte si `now >= valid_before`.
+    /// 5. Autorización (S3 #1): revierte si el firmante no es comprador del lote
+    ///    (`lote_share[(lote_id, signer)] == 0`).
+    /// 6. Anti-replay (fix #3): scoped a `(signer, lote_id)` vía
     ///    `attestation_recorded`. Una atestación por comprador por lote.
-    /// 5. Domain separation (fix #4): `verifyingContract` y `chain_id` van en el
-    ///    mensaje firmado, impidiendo replay cross-contract/cross-chain.
+    /// 7. Tally ponderado: acumula la share del firmante en `lote_tally_positive`
+    ///    o `lote_tally_negative` según `received`.
+    /// 8. Domain separation (fix #4): `verifyingContract`, `chain_id` y `valid_before`
+    ///    van en el mensaje firmado, impidiendo replay cross-contract/cross-chain.
     ///
     /// # Retorna
     /// `true` si la atestación es válida y se registró; revierte en caso
-    /// contrario (firma inválida, replay, etc.).
-    ///
-    /// ATENCIÓN: NO autorizada (no verifica signer ∈ compradores(lote)) ni con
-    /// expiry (valid_before). NO conectar settlement a esto hasta Semana 2, que
-    /// añade autorización ponderada + valid_before.
+    /// contrario (firma inválida, expiry, no autorizada, replay, etc.).
     ///
     /// TODO(audit): migrar a EIP-712 cuando `casper-eip-712` (v1.2.0+) sea
     /// compatible con Odra 2.8.2. El mensaje sería el digest EIP-712 en lugar
@@ -679,6 +691,7 @@ impl OhuVault {
         lote_id: u64,
         nonce: u64,
         received: bool,
+        valid_before: u64,
         public_key_bytes: [u8; 32],
         signature_bytes: [u8; 64],
     ) -> bool {
@@ -687,12 +700,15 @@ impl OhuVault {
         let verifying_contract = self.env().self_address();
         let chain_id = self.chain_id.get_or_revert_with(Error::NotInitialized);
 
+        // Gate 1: verificar firma Ed25519 (más costoso, pero debe ir primero:
+        // si la firma no es válida no tiene sentido validar nada más).
         let signer = verify_attestation_signature(
             lote_id,
             nonce,
             received,
             verifying_contract,
             chain_id,
+            valid_before,
             public_key_bytes,
             signature_bytes,
         );
@@ -712,13 +728,42 @@ impl OhuVault {
             },
         };
 
-        // Anti-replay (fix #3): una atestación por comprador por lote.
+        // Gate 2: expiry (S3 #2) — barato: una lectura + comparación.
+        // W2-0: valid_before va DENTRO del mensaje firmado (binding).
+        if self.env().get_block_time() >= valid_before {
+            self.env().revert(Error::AttestationExpired);
+        }
+
+        // Gate 3: autorización (S3 #1) — el firmante debe ser comprador del lote.
+        let share = self.lote_share.get_or_default(&(lote_id, signer));
+        if share == U512::zero() {
+            self.env().revert(Error::NotABuyer);
+        }
+
+        // Gate 4: anti-replay (fix #3) — una atestación por comprador por lote.
         let replay_key = (lote_id, signer);
         if self.attestation_recorded.get_or_default(&replay_key) {
             self.env().revert(Error::AttestationNonceAlreadyUsed);
         }
 
-        // Registrar.
+        // Gate 5: acumular tally ponderado (W2-0).
+        // Mapping de Odra no es iterable → acumulación INCREMENTAL al llegar
+        // cada atestación. `share = lote_share[(lote_id, signer)]` es el peso.
+        if received {
+            let current = self.lote_tally_positive.get_or_default(&lote_id);
+            let new_total = current
+                .checked_add(share)
+                .unwrap_or_else(|| self.env().revert(Error::Overflow));
+            self.lote_tally_positive.set(&lote_id, new_total);
+        } else {
+            let current = self.lote_tally_negative.get_or_default(&lote_id);
+            let new_total = current
+                .checked_add(share)
+                .unwrap_or_else(|| self.env().revert(Error::Overflow));
+            self.lote_tally_negative.set(&lote_id, new_total);
+        }
+
+        // Registrar anti-replay + emitir evento.
         self.attestation_recorded.set(&replay_key, true);
 
         self.env().emit_event(AttestationRecorded {
@@ -1067,6 +1112,16 @@ impl OhuVault {
     /// `chain_id` fijado en init (domain separation, fix #4).
     pub fn chain_id(&self) -> u64 {
         self.chain_id.get_or_revert_with(Error::NotInitialized)
+    }
+
+    /// Suma de shares de firmantes que atestaron NO-recibido para el lote (W2-0).
+    pub fn lote_tally_negative(&self, lote_id: u64) -> U512 {
+        self.lote_tally_negative.get_or_default(&lote_id)
+    }
+
+    /// Suma de shares de firmantes que atestaron SÍ-recibido para el lote (W2-0).
+    pub fn lote_tally_positive(&self, lote_id: u64) -> U512 {
+        self.lote_tally_positive.get_or_default(&lote_id)
     }
 
     // -----------------------------------------------------------------
@@ -2082,21 +2137,43 @@ mod tests {
     // S3 — Atestaciones gasless (INV-5): Ed25519 + anti-replay
     // ===============================================================
 
-    /// Genera un par de claves Ed25519, firma una atestación y devuelve los
-    /// bytes crudos de clave pública (32) y firma (64).
+    thread_local! {
+        /// Contador para repartir cuentas de test FONDEADAS (índice 10..19) como
+        /// firmantes-compradores distintos. Ver sign_attestation.
+        static NEXT_BUYER_IDX: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Firma una atestación COMO una cuenta de test fondeada (firmante = comprador,
+    /// requisito del gate NotABuyer) y devuelve `(secret_key, pk_bytes[32],
+    /// sig_bytes[64], signer)`. La cuenta se reparte de `NEXT_BUYER_IDX` (10..19).
     fn sign_attestation(
         lote_id: u64,
         nonce: u64,
         received: bool,
         verifying_contract: Address,
         chain_id: u64,
+        valid_before: u64,
     ) -> (SecretKey, [u8; 32], [u8; 64], Address) {
-        let (secret_key, public_key) = crypto::generate_ed25519_keypair();
+        // W2-0 fix: el firmante DEBE ser un comprador fondeado (el gate NotABuyer
+        // exige lote_share > 0, lo que requiere depositar → necesita fondos).
+        // odra-test fondea get_account(0..19) derivando la cuenta k del secret [k;32]
+        // (ver odra_core::crypto::generate_key_pairs). El fixture usa los roles en
+        // 0..9, así que los compradores usan 10..19. Un contador acotado a ese rango
+        // da firmantes DISTINTOS y SIEMPRE fondeados (cargo test reusa threads, por eso
+        // el módulo: un contador monótono se saldría de [10,19] a cuentas sin fondos).
+        let idx = NEXT_BUYER_IDX.with(|c| {
+            let i = c.get();
+            c.set(i.wrapping_add(1));
+            10u8 + (i % 10)
+        });
+        let secret_key = SecretKey::ed25519_from_bytes([idx; 32])
+            .expect("ed25519 secret from [idx;32]");
+        let public_key = PublicKey::from(&secret_key);
         let account_hash = public_key.to_account_hash();
         let signer = Address::Account(account_hash);
 
         let message = crate::attestation::build_attestation_message(
-            lote_id, nonce, received, verifying_contract, chain_id,
+            lote_id, nonce, received, verifying_contract, chain_id, valid_before,
         );
         let signature = crypto::sign(&message, &secret_key, &public_key);
 
@@ -2118,10 +2195,11 @@ mod tests {
         received: bool,
         verifying_contract: Address,
         chain_id: u64,
+        valid_before: u64,
     ) -> [u8; 64] {
         let pk = PublicKey::from(sk);
         let msg = crate::attestation::build_attestation_message(
-            lote_id, nonce, received, verifying_contract, chain_id,
+            lote_id, nonce, received, verifying_contract, chain_id, valid_before,
         );
         let sig = crypto::sign(&msg, sk, &pk);
         Into::<Vec<u8>>::into(&sig).try_into().unwrap()
@@ -2130,6 +2208,26 @@ mod tests {
     /// Devuelve el `(verifying_contract, chain_id)` de la fixture actual.
     fn vault_domain(f: &Fixture) -> (Address, u64) {
         (f.contract.contract_address(), f.chain_id)
+    }
+
+    /// W2-0: asegura que `buyer` sea comprador del lote (necesario para el gate
+    /// de autorización). Abre el lote si no existe y deposita `share` CSPR.
+    fn ensure_buyer(f: &mut Fixture, lote_id: u64, buyer: Address, share_cspr: u64) {
+        let producer = f.env.get_account(7);
+        f.env.set_caller(f.admin);
+        // Solo abre si el lote no existe todavía.
+        if f.contract.lote_state(lote_id) == 0 {
+            f.contract.open_lote(lote_id, producer);
+        }
+        f.env.set_caller(buyer);
+        let result = f
+            .contract
+            .with_tokens(U512::from(share_cspr * ONE_CSPR))
+            .try_deposit_to_lote(lote_id);
+        // Si falla, mostramos el error para debug.
+        if let Err(e) = result {
+            panic!("ensure_buyer: deposit_to_lote failed for lote {} buyer {:?}: {:?}", lote_id, buyer, e);
+        }
     }
 
     // ── Positivos ────────────────────────────────────────────────────
@@ -2143,12 +2241,13 @@ mod tests {
         let (vc_addr, chain_id) = vault_domain(&f);
 
         let (_sk, pk_bytes, sig_bytes, signer) =
-            sign_attestation(lote_id, nonce, received, vc_addr, chain_id);
+            sign_attestation(lote_id, nonce, received, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, lote_id, signer, 10);
         f.env.set_caller(f.operator);
         let result = f
             .contract
-            .verify_attestation(lote_id, nonce, received, pk_bytes, sig_bytes);
+            .verify_attestation(lote_id, nonce, received, u64::MAX, pk_bytes, sig_bytes);
 
         assert!(result);
         assert!(f.contract.attestation_recorded(lote_id, signer));
@@ -2168,13 +2267,25 @@ mod tests {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
         let (_sk, pk_bytes, sig_bytes, signer) =
-            sign_attestation(2, 1, false, vc_addr, chain_id);
+            sign_attestation(2, 1, false, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 2, signer, 10);
         f.env.set_caller(f.operator);
-        let result = f.contract.verify_attestation(2, 1, false, pk_bytes, sig_bytes);
+        let ok = f
+            .contract
+            .verify_attestation(2, 1, false, u64::MAX, pk_bytes, sig_bytes);
 
-        assert!(result);
+        assert!(ok);
         assert!(f.contract.attestation_recorded(2, signer));
+        assert!(f.env.emitted_event(
+            &f.contract,
+            AttestationRecorded {
+                lote_id: 2,
+                signer,
+                received: false,
+                nonce: 1,
+            }
+        ));
     }
 
     #[test]
@@ -2184,13 +2295,15 @@ mod tests {
         let (vc_addr, chain_id) = vault_domain(&f);
 
         let (_sk1, pk1, sig1, signer1) =
-            sign_attestation(lote_id, 1, true, vc_addr, chain_id);
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, lote_id, signer1, 10);
         let (_sk2, pk2, sig2, signer2) =
-            sign_attestation(lote_id, 1, true, vc_addr, chain_id);
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, lote_id, signer2, 10);
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(lote_id, 1, true, pk1, sig1));
-        assert!(f.contract.verify_attestation(lote_id, 1, true, pk2, sig2));
+        assert!(f.contract.verify_attestation(lote_id, 1, true, u64::MAX, pk1, sig1));
+        assert!(f.contract.verify_attestation(lote_id, 1, true, u64::MAX, pk2, sig2));
 
         assert!(f.contract.attestation_recorded(lote_id, signer1));
         assert!(f.contract.attestation_recorded(lote_id, signer2));
@@ -2202,17 +2315,19 @@ mod tests {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
         let (sk, pk, _, signer) =
-            sign_attestation(1, 1, true, vc_addr, chain_id);
+            sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 1, signer, 10);
+        ensure_buyer(&mut f, 2, signer, 10);
         // Firma ambos lotes.
-        let sig_a = sign_second(&sk, 1, 1, true, vc_addr, chain_id);
-        let sig_b = sign_second(&sk, 2, 2, true, vc_addr, chain_id);
+        let sig_a = sign_second(&sk, 1, 1, true, vc_addr, chain_id, u64::MAX);
+        let sig_b = sign_second(&sk, 2, 2, true, vc_addr, chain_id, u64::MAX);
 
         f.env.set_caller(f.operator);
         // Submit lote B (nonce=2) primero.
-        assert!(f.contract.verify_attestation(2, 2, true, pk, sig_b));
+        assert!(f.contract.verify_attestation(2, 2, true, u64::MAX, pk, sig_b));
         // Luego lote A (nonce=1) — debe pasar porque el scope es (signer, lote_id).
-        assert!(f.contract.verify_attestation(1, 1, true, pk, sig_a));
+        assert!(f.contract.verify_attestation(1, 1, true, u64::MAX, pk, sig_a));
 
         assert!(f.contract.attestation_recorded(1, signer));
         assert!(f.contract.attestation_recorded(2, signer));
@@ -2223,29 +2338,33 @@ mod tests {
     fn attestation_same_signer_different_lote_succeeds() {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
-        let (sk, pk, _, _signer) =
-            sign_attestation(1, 1, true, vc_addr, chain_id);
+        let (sk, pk, _, signer) =
+            sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
 
-        let sig1 = sign_second(&sk, 1, 1, true, vc_addr, chain_id);
-        let sig2 = sign_second(&sk, 2, 100, true, vc_addr, chain_id);
+        ensure_buyer(&mut f, 1, signer, 10);
+        ensure_buyer(&mut f, 2, signer, 10);
+        let sig1 = sign_second(&sk, 1, 1, true, vc_addr, chain_id, u64::MAX);
+        let sig2 = sign_second(&sk, 2, 100, true, vc_addr, chain_id, u64::MAX);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 1, true, pk, sig1));
-        assert!(f.contract.verify_attestation(2, 100, true, pk, sig2));
+        assert!(f.contract.verify_attestation(1, 1, true, u64::MAX, pk, sig1));
+        assert!(f.contract.verify_attestation(2, 100, true, u64::MAX, pk, sig2));
     }
 
     #[test]
     fn attestation_same_nonce_different_signer_succeeds() {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
-        let (_sk1, pk1, sig1, _s1) =
-            sign_attestation(1, 3, true, vc_addr, chain_id);
-        let (_sk2, pk2, sig2, _s2) =
-            sign_attestation(1, 3, true, vc_addr, chain_id);
+        let (_sk1, pk1, sig1, s1) =
+            sign_attestation(1, 3, true, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, 1, s1, 10);
+        let (_sk2, pk2, sig2, s2) =
+            sign_attestation(1, 3, true, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 1, s2, 10);
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 3, true, pk1, sig1));
-        assert!(f.contract.verify_attestation(1, 3, true, pk2, sig2));
+        assert!(f.contract.verify_attestation(1, 3, true, u64::MAX, pk1, sig1));
+        assert!(f.contract.verify_attestation(1, 3, true, u64::MAX, pk2, sig2));
     }
 
     // ── Negativos ────────────────────────────────────────────────────
@@ -2255,15 +2374,16 @@ mod tests {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true, vc_addr, chain_id);
+            sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 1, signer, 10);
         let mut bad_pk = pk_bytes;
         bad_pk[0] ^= 0xFF;
 
         f.env.set_caller(f.operator);
         let result = f
             .contract
-            .try_verify_attestation(1, 1, true, bad_pk, sig_bytes);
+            .try_verify_attestation(1, 1, true, u64::MAX, bad_pk, sig_bytes);
 
         assert!(result.is_err());
         assert!(!f.contract.attestation_recorded(1, signer));
@@ -2274,15 +2394,16 @@ mod tests {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true, vc_addr, chain_id);
+            sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 1, signer, 10);
         let mut bad_sig = sig_bytes;
         bad_sig[10] ^= 0xFF;
 
         f.env.set_caller(f.operator);
         let result = f
             .contract
-            .try_verify_attestation(1, 1, true, pk_bytes, bad_sig);
+            .try_verify_attestation(1, 1, true, u64::MAX, pk_bytes, bad_sig);
 
         assert!(result.is_err());
         assert!(!f.contract.attestation_recorded(1, signer));
@@ -2293,12 +2414,13 @@ mod tests {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true, vc_addr, chain_id);
+            sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 1, signer, 10);
         f.env.set_caller(f.operator);
         let result = f
             .contract
-            .try_verify_attestation(1, 1, false, pk_bytes, sig_bytes);
+            .try_verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes);
 
         assert!(result.is_err());
         assert!(!f.contract.attestation_recorded(1, signer));
@@ -2309,12 +2431,13 @@ mod tests {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 5, true, vc_addr, chain_id);
+            sign_attestation(1, 5, true, vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 1, signer, 10);
         f.env.set_caller(f.operator);
         let result = f
             .contract
-            .try_verify_attestation(1, 3, true, pk_bytes, sig_bytes);
+            .try_verify_attestation(1, 3, true, u64::MAX, pk_bytes, sig_bytes);
 
         assert!(result.is_err());
         assert!(!f.contract.attestation_recorded(1, signer));
@@ -2325,17 +2448,18 @@ mod tests {
     fn attestation_replay_same_lote_same_signer_reverts() {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
-        let (sk, pk, _, _signer) =
-            sign_attestation(1, 5, true, vc_addr, chain_id);
-        let sig = sign_second(&sk, 1, 5, true, vc_addr, chain_id);
+        let (sk, pk, _, signer) =
+            sign_attestation(1, 5, true, vc_addr, chain_id, u64::MAX);
+        ensure_buyer(&mut f, 1, signer, 10);
+        let sig = sign_second(&sk, 1, 5, true, vc_addr, chain_id, u64::MAX);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 5, true, pk, sig));
+        assert!(f.contract.verify_attestation(1, 5, true, u64::MAX, pk, sig));
 
         // Replay exacto del mismo payload → attestation_recorded ya es true.
         let result = f
             .contract
-            .try_verify_attestation(1, 5, true, pk, sig);
+            .try_verify_attestation(1, 5, true, u64::MAX, pk, sig);
 
         assert_eq!(
             result.unwrap_err(),
@@ -2357,14 +2481,15 @@ mod tests {
         assert_ne!(f.contract.contract_address(), fake_vc_addr);
 
         // Firma con la dirección FALSA.
-        let (_, pk_bytes, sig_bytes, _signer) =
-            sign_attestation(1, 1, true, fake_vc_addr, chain_id);
+        let (_, pk_bytes, sig_bytes, signer) =
+            sign_attestation(1, 1, true, fake_vc_addr, chain_id, u64::MAX);
 
+        ensure_buyer(&mut f, 1, signer, 10);
         f.env.set_caller(f.operator);
         // El vault usa su dirección REAL en el mensaje, no `fake_vc_addr` → firma no coincide.
         let result = f
             .contract
-            .try_verify_attestation(1, 1, true, pk_bytes, sig_bytes);
+            .try_verify_attestation(1, 1, true, u64::MAX, pk_bytes, sig_bytes);
 
         assert!(result.is_err());
     }
@@ -2378,16 +2503,140 @@ mod tests {
         let (vc_addr, _) = vault_domain(&f);
         // Firma con chain_id=1 (incorrecto).
         let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true, vc_addr, 1);
+            sign_attestation(1, 1, true, vc_addr, 1, u64::MAX);
 
+        ensure_buyer(&mut f, 1, signer, 10);
         f.env.set_caller(f.operator);
         // El vault usa chain_id=999, pero la firma es sobre chain_id=1.
         let result = f
             .contract
-            .try_verify_attestation(1, 1, true, pk_bytes, sig_bytes);
+            .try_verify_attestation(1, 1, true, u64::MAX, pk_bytes, sig_bytes);
 
         assert!(result.is_err());
         assert!(!f.contract.attestation_recorded(1, signer));
+    }
+
+    // ===============================================================
+    // W2-0 — Atestación ponderada y autorizada (S3 #1 + S3 #2)
+    // ===============================================================
+
+    /// Un firmante sin lote_share en el lote → revierte NotABuyer (S3 #1).
+    #[test]
+    fn attestation_non_buyer_reverts() {
+        let mut f = setup();
+        let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let valid_before = u64::MAX;
+
+        let (_sk, pk_bytes, sig_bytes, _signer) =
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id, valid_before);
+
+        f.env.set_caller(f.operator);
+        let result = f
+            .contract
+            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+
+        assert_eq!(result.unwrap_err(), Error::NotABuyer.into());
+    }
+
+    /// Expiry: valid_before <= now → revierte AttestationExpired (S3 #2).
+    #[test]
+    fn attestation_expired_reverts() {
+        let mut f = setup();
+        let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
+        // Usamos un valid_before fijo en 100_000 ms.
+        let valid_before = 100_000u64;
+
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id, valid_before);
+
+        ensure_buyer(&mut f, lote_id, signer, 10);
+
+        // Avanzar el reloj para que now >= valid_before.
+        f.env.advance_block_time(valid_before);
+
+        f.env.set_caller(f.operator);
+        let result = f
+            .contract
+            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+
+        assert_eq!(result.unwrap_err(), Error::AttestationExpired.into());
+    }
+
+    /// Tally ponderado: dos compradores con shares distintas atestan
+    /// received=false → lote_tally_negative = suma exacta de sus shares.
+    /// Un tercero con received=true → lote_tally_positive = su share.
+    #[test]
+    fn attestation_weighted_tally_correct() {
+        let mut f = setup();
+        let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let valid_before = u64::MAX;
+
+        // Comprador A: share = 3 CSPR, atesta NO-recibido.
+        let (_sk_a, pk_a, sig_a, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, valid_before);
+        ensure_buyer(&mut f, lote_id, signer_a, 3);
+
+        // Comprador B: share = 7 CSPR, atesta NO-recibido.
+        let (_sk_b, pk_b, sig_b, signer_b) =
+            sign_attestation(lote_id, 2, false, vc_addr, chain_id, valid_before);
+        ensure_buyer(&mut f, lote_id, signer_b, 7);
+
+        // Comprador C: share = 5 CSPR, atesta SÍ-recibido.
+        let (_sk_c, pk_c, sig_c, signer_c) =
+            sign_attestation(lote_id, 3, true, vc_addr, chain_id, valid_before);
+        ensure_buyer(&mut f, lote_id, signer_c, 5);
+
+        f.env.set_caller(f.operator);
+
+        // A atesta no-recibido.
+        assert!(f.contract.verify_attestation(lote_id, 1, false, valid_before, pk_a, sig_a));
+        // B atesta no-recibido.
+        assert!(f.contract.verify_attestation(lote_id, 2, false, valid_before, pk_b, sig_b));
+        // C atesta sí-recibido.
+        assert!(f.contract.verify_attestation(lote_id, 3, true, valid_before, pk_c, sig_c));
+
+        // Verificar tally.
+        assert_eq!(
+            f.contract.lote_tally_negative(lote_id),
+            U512::from(10 * ONE_CSPR) // 3 + 7 = 10 CSPR
+        );
+        assert_eq!(
+            f.contract.lote_tally_positive(lote_id),
+            U512::from(5 * ONE_CSPR) // solo C
+        );
+    }
+
+    /// Una atestación válida y a tiempo de un comprador → NO revierte y
+    /// acumula su peso en el tally correspondiente.
+    #[test]
+    fn attestation_valid_accumulates_weight() {
+        let mut f = setup();
+        let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let valid_before = u64::MAX;
+
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, valid_before);
+        ensure_buyer(&mut f, lote_id, signer, 4);
+
+        f.env.set_caller(f.operator);
+        let result = f
+            .contract
+            .verify_attestation(lote_id, 1, false, valid_before, pk_bytes, sig_bytes);
+
+        assert!(result);
+        assert!(f.contract.attestation_recorded(lote_id, signer));
+        assert_eq!(
+            f.contract.lote_tally_negative(lote_id),
+            U512::from(4 * ONE_CSPR)
+        );
+        assert_eq!(
+            f.contract.lote_tally_positive(lote_id),
+            U512::zero()
+        );
     }
 
     // ===============================================================

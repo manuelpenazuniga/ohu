@@ -4,7 +4,7 @@
 //!
 //! El firmante (comprador) produce una firma Ed25519 off-chain sobre el mensaje
 //! `"OhuAttestation:" || lote_id || nonce || received || verifying_contract ||
-//! chain_id` (sin gas). El agente la retransmite on-chain llamando
+//! chain_id || valid_before` (sin gas). El agente la retransmite on-chain llamando
 //! [`OhuVault::verify_attestation`].
 //!
 //! La verificación on-chain usa `casper_types::crypto::verify` (pura, sin host
@@ -127,10 +127,12 @@ fn address_hash_bytes(addr: &Address) -> [u8; 32] {
 ///
 /// Formato:
 /// `"OhuAttestation:" || lote_id (BE u64) || nonce (BE u64) || received (1 byte)
-///  || verifying_contract_hash (32 bytes) || chain_id (BE u64)`
+///  || verifying_contract_hash (32 bytes) || chain_id (BE u64) || valid_before (BE u64)`
 ///
 /// `verifying_contract` es la dirección del propio vault (self_address()).
 /// `chain_id` lo fija el deployer en init y se guarda en el contrato.
+/// `valid_before` es la marca de tiempo (ms, `get_block_time()`) tras la cual
+/// la atestación expira (W2-0, S3 #2). Va DENTRO del mensaje firmado (binding).
 /// Ambos se incluyen para prevenir replay cross-contract/cross-chain (fix #4).
 pub fn build_attestation_message(
     lote_id: u64,
@@ -138,6 +140,7 @@ pub fn build_attestation_message(
     received: bool,
     verifying_contract: Address,
     chain_id: u64,
+    valid_before: u64,
 ) -> Vec<u8> {
     let mut msg = Vec::from(ATTESTATION_MSG_PREFIX);
     msg.extend_from_slice(&lote_id.to_be_bytes());
@@ -145,6 +148,7 @@ pub fn build_attestation_message(
     msg.push(received as u8);
     msg.extend_from_slice(&address_hash_bytes(&verifying_contract));
     msg.extend_from_slice(&chain_id.to_be_bytes());
+    msg.extend_from_slice(&valid_before.to_be_bytes());
     msg
 }
 
@@ -154,6 +158,7 @@ pub fn build_attestation_message(
 /// - `lote_id`, `nonce`, `received`: el payload de la atestación.
 /// - `verifying_contract`: dirección del vault (incluida en el mensaje, fix #4).
 /// - `chain_id`: identificador de cadena (incluido en el mensaje, fix #4).
+/// - `valid_before`: marca de tiempo de expiración (ms, incluido en el mensaje, W2-0).
 /// - `public_key_bytes`: 32 bytes de la clave pública Ed25519 (raw, sin tag).
 /// - `signature_bytes`: 64 bytes de la firma Ed25519 (raw, sin tag).
 ///
@@ -165,12 +170,14 @@ pub fn build_attestation_message(
 /// por `verify_eip712_attestation` que usará `recover_secp256k1` del crate
 /// `casper-eip-712`. El mensaje a firmar será el digest EIP-712:
 /// `keccak256("\x19\x01" || domainSeparator || hashStruct(attestation))`.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_attestation_signature(
     lote_id: u64,
     nonce: u64,
     received: bool,
     verifying_contract: Address,
     chain_id: u64,
+    valid_before: u64,
     public_key_bytes: [u8; ED25519_PK_LEN],
     signature_bytes: [u8; ED25519_SIG_LEN],
 ) -> Result<Address, AttestationError> {
@@ -180,7 +187,9 @@ pub fn verify_attestation_signature(
     let signature = Signature::ed25519(signature_bytes)
         .map_err(|_| AttestationError::InvalidSignatureBytes)?;
 
-    let message = build_attestation_message(lote_id, nonce, received, verifying_contract, chain_id);
+    let message = build_attestation_message(
+        lote_id, nonce, received, verifying_contract, chain_id, valid_before,
+    );
 
     crypto::verify(&message, &signature, &public_key)
         .map_err(|_| AttestationError::InvalidSignature)?;
