@@ -4,9 +4,11 @@
 > Ohu**, **qué está construido hoy**, **cómo trabajamos**, y **el roadmap**. Léelo primero; luego
 > profundiza en los documentos enlazados.
 >
-> **Última actualización:** 2026-06-29 · rama `main` @ `fee21a7` (**+6 sobre `origin/main`, sin
-> pushear**) · **Fase 0 CERRADA**; **Semana 1 EN CURSO: W1-0 + W1-1 + W1-2 mergeadas (111 tests
-> verdes); W1-3 (deploy Testnet) siguiente** — requiere `casper-client`.
+> **Última actualización:** 2026-06-29 · rama `main` @ `7e194fd` (**sin pushear desde `6b9753f`**) ·
+> **Fase 0 CERRADA**; **Semana 1 EN CURSO: W1-0/W1-1/W1-2 + fix crítico de escrow-isolation mergeados
+> (120 tests verdes); solo falta W1-3 (deploy Testnet)** — requiere `casper-client`.
+> La **auditoría de cierre GPT-5.5** halló un CRÍTICO (purse compartido drenaba escrow earmarked) →
+> **corregido y re-auditado en triple (Claude+Gemini+GPT-5.5 = PASA)**. Ver §7.
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
@@ -190,6 +192,11 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
   `propose_release`/`approve_release`/`release_to_producer`, estado `SETTLED_OK`, CEI estricto,
   paga `funded+bond` al productor). `fee21a7` — DeepSeek V4 Pro, **audit dual Claude + Gemini
   (PASA sin fixes)**. **111 tests verdes.**
+- **W1-fix (crítico)** ✅ **aislamiento de escrow** — la auditoría de cierre **GPT-5.5** halló que el
+  purse compartido permitía a `route_micropayment`/`execute` drenar el escrow earmarked (INV-1/INV-7).
+  Fix: `reserved_lote_balance` (los outflows genéricos solo gastan `balance − reserved`) + epoch
+  `saturating_sub` + producer ∉ {admin,operator,approvers}. `7e194fd` — DeepSeek V4 Pro,
+  **re-audit triple Claude + Gemini + GPT-5.5 = PASA**. **120 tests verdes.**
 - **W1-3** 🔜 **deploy real a Testnet** + E2E feliz + **multisig nativo real** (cierra el TODO de S2).
   ⚠️ requiere instalar `casper-client` (no presente en macOS).
 
@@ -211,12 +218,16 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 | **S3 #2** — atestación sin `valid_before` (expiry) | 🟠 alto | **Sem 2** |
 | Disparador paramétrico (tally) reemplaza gate M-de-N de `release` | — | **Sem 2** |
 | ~~`chain_id==0` no validado en `init`~~ | ✅ **CERRADO** | **W1-0** (`30e51c1`) |
-| **W1-1** — transición a FUNDED **demasiado ansiosa** (`bond>0 ∧ funded>0` ⇒ 1 depósito cierra el lote y bloquea más compradores) | 🔵 diseño, **inerte hoy** | **Sem 2** (umbral paramétrico) |
-| **W1-1** — audit de cierre con **GPT-5.5** pendiente (sin cupo OpenAI hoy) | 🟢 confianza | **gran audit de fin de día** |
-| Multisig **nativo** (associated keys) — capa 2, falta `KEYS_MANAGER_WASM` | 🟠 (la capa on-chain ya protege) | **W1-3** (requiere `casper-client`) |
-| `placeholder.rs` huérfano | 🟢 limpieza | cualquier toque de contracts |
-| Migración EIP-712 completa (hoy ruta activa = Ed25519, permitida por spec) | 🟢 roadmap | Sem 2+ |
-| **Pushear `main` al remoto** (+4 commits sin pushear) / dominio + marca de "Ohu" | — | cuando decidas |
+| ~~**CRÍTICO** — purse compartido: outflows genéricos (`route_micropayment`/`execute`) drenaban escrow earmarked (INV-1/INV-7)~~ | ✅ **CERRADO** (`reserved_lote_balance`, triple audit) | **fix `7e194fd`** |
+| ~~**W1-1** — audit de cierre con **GPT-5.5**~~ | ✅ **HECHO** (halló el crítico ↑) | `codex exec` |
+| **W1-1** — transición a FUNDED **demasiado ansiosa** + griefing 1-mote (3º deposita y excluye compradores) | 🔵 diseño, **inerte hoy** | **Sem 2** (umbral/roster/deadline) |
+| **Fondos atrapados:** sin `withdraw_share`/cancel/timeout (lote OPEN abandonado o FUNDED sin M aprobaciones bloquea fondos) | 🟠 liquidez, **by-design hoy** | **Sem 2** (refund + SETTLED_FAIL) |
+| Operator puede crear lotes basura (ID squatting, no mueve fondos) | 🔵 bajo | Sem 2+ |
+| Rotación/recuperación de approvers (inmutables; pérdida de clave congela M) | 🟠 gobierno | Sem 2+ |
+| Multisig **nativo** (associated keys) — capa 2, falta `KEYS_MANAGER_WASM` (hay que construirlo) | 🟠 (la capa on-chain ya protege) | **W1-3** |
+| `deploy.sh` es stub + init args **desactualizados** (lista 5 de S2; el `init` real son 8) | 🟡 | **W1-3** |
+| `casper-client` sin instalar (falló `cargo install` por timeout de red) | 🟡 | **W1-3** (reintentar) |
+| `placeholder.rs` huérfano · Migración EIP-712 completa | 🟢 | limpieza / Sem 2+ |
 
 ---
 
@@ -238,11 +249,15 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 ## 9. Cómo retomar (para Claude)
 
 1. Lee este doc + `CLAUDE.md` + la sección relevante de `ohu.md`/`techs-specs.md`.
-2. Estado: `git -C . log --oneline -5` en `fase-0`; `cd contracts && cargo odra test` para
-   confirmar verde.
-3. Próxima acción concreta: **arrancar W1-1 (+W1-0)** — abrir un worktree aislado
-   (`git worktree add ../ohu-w1 -b spike/w1-lote main`), darle a **DeepSeek V4 Pro** (o Kimi K2.7
-   Code) el `_wrapper.md` + el brief de W1-1, y **auditar** el resultado
-   (**GPT-5.5 + Gemini 3.1 Pro high + Claude**) contra los criterios de `semana-1.md` y los
-   invariantes (en especial **INV-7**).
-4. Tras cada tarea de contrato: **audit dual** → merge ff a `fase-0`.
+2. Estado: `git -C . log --oneline -6` en `main`; `cd contracts && cargo odra test` → **120 verdes**.
+3. **Próxima acción concreta: W1-3** (deploy Testnet) — cierra Semana 1. No es contrato auditable en
+   VM sino **infra con dependencias externas**: (a) instalar `casper-client` (`cargo install
+   casper-client` falló por red; reintentar); (b) **construir el `KEYS_MANAGER_WASM`** (interfaz
+   `add_key`/`set_thresholds` documentada en `setup_admin_account.sh`); (c) reescribir `deploy.sh`
+   (stub; init args desactualizados → son **8** hoy: admin, operator, approvers, required_approvals,
+   micropayment_cap, **epoch_cap, epoch_window_ms, chain_id**); (d) cuenta Testnet fondeada (faucet).
+4. **Herramientas CLI** (validadas): implementa `opencode run --dir <wt> -m opencode-go/<modelo>`;
+   audita Gemini `agy --model "Gemini 3.1 Pro (High)" --add-dir <wt> -p` y GPT-5.5
+   `codex exec -s read-only -m gpt-5.5 -c mcp_servers="{}"`. Detalle en `model-routing.md`.
+5. **Disciplina:** todo lo que toca fondos → **audit triple** (Claude + Gemini + GPT-5.5) y el pase
+   holístico de cierre **antes de cualquier deploy** (cazó el crítico de escrow que el por-tarea no vio).
