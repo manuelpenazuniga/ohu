@@ -9,6 +9,11 @@ repository = "https://github.com/casper-agentic/ohu"
 
 [dependencies]
 odra = { version = "2.8.2", default-features = false }
+odra-casper-livenet-env = { version = "2.8.2", optional = true }
+
+[features]
+default = []
+livenet = ["odra-casper-livenet-env"]
 
 [dev-dependencies]
 odra-test = { version = "2.8.2", default-features = false }
@@ -31,4 +36,10 @@ test = false
 [[bin]]
 name = "ohu_contracts_build_schema"
 path = "bin/build_schema.rs"
+test = false
+
+[[bin]]
+name = "ohu_livenet_deploy"
+path = "bin/livenet_deploy.rs"
+required-features = ["livenet"]
 test = false
