@@ -1415,6 +1415,7 @@ mod tests {
         epoch_cap: U512,
         epoch_window_ms: u64,
         chain_id: u64,
+        #[allow(dead_code)]
         quorum_fail_bps: u64,
         attestation_window_ms: u64,
     }
