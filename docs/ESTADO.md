@@ -4,11 +4,13 @@
 > Ohu**, **qué está construido hoy**, **cómo trabajamos**, y **el roadmap**. Léelo primero; luego
 > profundiza en los documentos enlazados.
 >
-> **Última actualización:** 2026-06-29 · rama `main` @ `7e194fd` (**sin pushear desde `6b9753f`**) ·
-> **Fase 0 CERRADA**; **Semana 1 EN CURSO: W1-0/W1-1/W1-2 + fix crítico de escrow-isolation mergeados
-> (120 tests verdes); solo falta W1-3 (deploy Testnet)** — requiere `casper-client`.
-> La **auditoría de cierre GPT-5.5** halló un CRÍTICO (purse compartido drenaba escrow earmarked) →
-> **corregido y re-auditado en triple (Claude+Gemini+GPT-5.5 = PASA)**. Ver §7.
+> **Última actualización:** 2026-06-30 · rama `main` @ `68cd805` (pusheado) ·
+> **Fase 0 CERRADA · Semana 1 CERRADA.** W1-0/W1-1/W1-2 + fix crítico de escrow-isolation (120 tests
+> verdes) **+ W1-3: OhuVault DESPLEGADO en Casper Testnet y un lote feliz LIQUIDADO E2E on-chain**
+> (deploy `b595b892…`, contrato `contract-833696c8…`; 5 cuentas nativas firmando el settlement M-de-N;
+> ver `infra/deployments/testnet.md`). La **auditoría de cierre GPT-5.5** había hallado un CRÍTICO
+> (purse compartido drenaba escrow earmarked) → **corregido y re-auditado en triple = PASA** (§7).
+> **Pendiente menor:** multisig nativo de la cuenta admin (Parte B, no bloquea). **Próximo: Semana 2.**
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
@@ -197,8 +199,15 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
   Fix: `reserved_lote_balance` (los outflows genéricos solo gastan `balance − reserved`) + epoch
   `saturating_sub` + producer ∉ {admin,operator,approvers}. `7e194fd` — DeepSeek V4 Pro,
   **re-audit triple Claude + Gemini + GPT-5.5 = PASA**. **120 tests verdes.**
-- **W1-3** 🔜 **deploy real a Testnet** + E2E feliz + **multisig nativo real** (cierra el TODO de S2).
-  ⚠️ requiere instalar `casper-client` (no presente en macOS).
+- **W1-3** ✅ **deploy real a Testnet + lote feliz E2E on-chain.** OhuVault desplegado vía **Odra
+  livenet** (`contract-833696c8…`, package `hash-6c1a1366…`, tx `b595b892…`). E2E completo firmado
+  por 5 cuentas nativas distintas: `open_lote`(admin)→`deposit`(buyer,10)→`post_bond`(producer,5)=FUNDED
+  →`propose`(approver0)→`approve`×2 (M-de-N)→`release`(admin)=SETTLED_OK; escrow `funded+bond`=15 CSPR
+  liberado al producer. `2b9a928`+`68cd805`. Ver `infra/deployments/testnet.md` (8 tx hashes).
+  Resueltos en el camino: `casper-client` instalado, RPC vivo (`node.testnet.casper.network`),
+  **WASM lowering a MVP con wasm-opt** (bulk-memory/sign-ext), `deploy_testnet.sh` reproducible.
+  ⏳ **Pendiente (Parte B, no bloquea W1):** `KEYS_MANAGER_WASM` + `setup_admin_account` real (multisig
+  nativo de la cuenta admin — la capa M-de-N **on-chain** ya protege; ver §7).
 
 ### 🗓️ Semanas 2-4 (de `ohu.md §11`)
 - **Sem 2 — Atestación + mutual:** disparador **paramétrico** (reemplaza el gate M-de-N por
@@ -224,9 +233,10 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 | **Fondos atrapados:** sin `withdraw_share`/cancel/timeout (lote OPEN abandonado o FUNDED sin M aprobaciones bloquea fondos) | 🟠 liquidez, **by-design hoy** | **Sem 2** (refund + SETTLED_FAIL) |
 | Operator puede crear lotes basura (ID squatting, no mueve fondos) | 🔵 bajo | Sem 2+ |
 | Rotación/recuperación de approvers (inmutables; pérdida de clave congela M) | 🟠 gobierno | Sem 2+ |
-| Multisig **nativo** (associated keys) — capa 2, falta `KEYS_MANAGER_WASM` (hay que construirlo) | 🟠 (la capa on-chain ya protege) | **W1-3** |
-| `deploy.sh` es stub + init args **desactualizados** (lista 5 de S2; el `init` real son 8) | 🟡 | **W1-3** |
-| `casper-client` sin instalar (falló `cargo install` por timeout de red) | 🟡 | **W1-3** (reintentar) |
+| Multisig **nativo** (associated keys) — capa 2, falta `KEYS_MANAGER_WASM` (hay que construirlo) | 🟠 (la capa on-chain ya protege) | **W1-3 Parte B / Sem 2** (no bloquea) |
+| ~~`deploy.sh` stub + init args desactualizados~~ | ✅ **CERRADO** — deploy real vía livenet (`deploy_testnet.sh`, 8 args) | **W1-3** (`2b9a928`) |
+| ~~`casper-client` sin instalar~~ | ✅ **CERRADO** (v5.0.1; el bloqueo era proxy Varnish del ISP) | **W1-3** |
+| **WASM bulk-memory rechazado por la VM** (toolchain 2026 + std precompilada) | ✅ **CERRADO** — lowering MVP con `wasm-opt` en `deploy_testnet.sh` | **W1-3** |
 | `placeholder.rs` huérfano · Migración EIP-712 completa | 🟢 | limpieza / Sem 2+ |
 
 ---
@@ -250,12 +260,14 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 
 1. Lee este doc + `CLAUDE.md` + la sección relevante de `ohu.md`/`techs-specs.md`.
 2. Estado: `git -C . log --oneline -6` en `main`; `cd contracts && cargo odra test` → **120 verdes**.
-3. **Próxima acción concreta: W1-3** (deploy Testnet) — cierra Semana 1. No es contrato auditable en
-   VM sino **infra con dependencias externas**: (a) instalar `casper-client` (`cargo install
-   casper-client` falló por red; reintentar); (b) **construir el `KEYS_MANAGER_WASM`** (interfaz
-   `add_key`/`set_thresholds` documentada en `setup_admin_account.sh`); (c) reescribir `deploy.sh`
-   (stub; init args desactualizados → son **8** hoy: admin, operator, approvers, required_approvals,
-   micropayment_cap, **epoch_cap, epoch_window_ms, chain_id**); (d) cuenta Testnet fondeada (faucet).
+   Despliegue Testnet vivo en `infra/deployments/testnet.md` (contrato + 8 tx del E2E).
+3. **Semana 1 CERRADA** (W1-0/1/2 + fix crítico + deploy real + lote E2E on-chain). **Próxima acción:
+   Semana 2** (atestación + disparador paramétrico + `MutualPool` + camino `SETTLED_FAIL`; cierra los
+   gates S3 #1/#2 — ver §7). **Opcional antes:** Parte B de W1-3 = **`KEYS_MANAGER_WASM`** (interfaz
+   `add_key`/`set_thresholds` en `setup_admin_account.sh`) para el multisig nativo de la cuenta admin
+   (no bloquea: la capa M-de-N on-chain ya protege). Deploy/E2E se reproducen con
+   `bash infra/scripts/deploy_testnet.sh` y `cargo run --bin ohu_livenet_e2e --features livenet`
+   (requieren `binaryen` + `.env` + cuentas fondeadas).
 4. **Herramientas CLI** (validadas): implementa `opencode run --dir <wt> -m opencode-go/<modelo>`;
    audita Gemini `agy --model "Gemini 3.1 Pro (High)" --add-dir <wt> -p` y GPT-5.5
    `codex exec -s read-only -m gpt-5.5 -c mcp_servers="{}"`. Detalle en `model-routing.md`.
