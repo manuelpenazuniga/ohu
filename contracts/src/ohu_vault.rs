@@ -400,9 +400,14 @@ pub struct OhuVault {
     /// 0 = sin cola de mutual.
     indemnity_target_bps: Var<u64>,
     /// Pool de indemnización por lote para `withdraw_settlement`:
-    /// `bond + tail` si el MutualPool aportó cola, o solo `bond` si no.
+    /// solo el bono. La cola se guarda en `lote_tail` y la paga el MutualPool
+    /// directo al comprador en cada `withdraw_settlement` (Casper-safe).
     /// Se fija en `settle_failure`.
     lote_indemnity_pool: Mapping<u64, U512>,
+    /// Cola de indemnización del MutualPool para este lote (no está en el vault;
+    /// se paga directo al comprador vía `pay_tail(caller, tail_share)` en cada
+    /// `withdraw_settlement`). Se fija en `settle_failure`.
+    lote_tail: Mapping<u64, U512>,
 }
 
 /// Constantes de estado de lote (W1-1, W2-1).
@@ -1316,23 +1321,23 @@ impl OhuVault {
 
     // ── W2-2: SETTLED_FAIL ──
 
-    /// Cierra el lote fallido. Marca `SETTLED_FAIL` y fija el pool de
-    /// indemnización (`lote_indemnity_pool[lote]`). Si el `MutualPool` está
-    /// configurado y el bono quedó corto frente al target, trae la **cola**
-    /// del pool vía cross-contract call a `pay_tail`.
+    /// Cierra el lote fallido. Marca `SETTLED_FAIL` y fija:
+    /// - `lote_indemnity_pool[lote] = bond` (el bono, que está en el vault).
+    /// - `lote_tail[lote] = tail` (la cola del MutualPool; NO se trae al vault).
+    ///
+    /// **FIX CRÍTICO (Casper WASM):** NO transfiere la cola en este paso porque
+    /// `transfer_tokens` a un `Address::Contract` revierte on-chain. La cola la
+    /// paga el MutualPool directo al comprador (Address::Account → permitido) en
+    /// cada `withdraw_settlement`.
     ///
     /// Gates:
     /// - `caller == admin` (NotAdmin). El agente nunca mueve capital (INV-1).
     /// - `state == EVAL_FAIL` (LoteNotFailable). El tally on-chain autoriza (INV-2).
     ///
-    /// CEI:
-    /// 1. Effects: `lote_state = SETTLED_FAIL` + `lote_indemnity_pool` = `bond`
-    ///    (o `bond + tail`).
-    /// 2. Interactions: cross-contract call a `MutualPool.pay_tail()`.
-    /// 3. Post-interaction: `reserved_lote_balance += tail`.
+    /// CEI: solo effects (no interactions, no transferencias). El pool no se toca.
     ///
-    /// W2-3: `pay_tail` SOLO lo dispara el OhuVault autorizado; acotado a la
-    /// reserva del pool (§4.7). El bono sigue siendo el pagador primario (§4.1).
+    /// W2-3: el bono sigue siendo el pagador primario; la cola es acotada a la
+    /// reserva del pool y se cobra per-cápita en cada withdraw.
     pub fn settle_failure(&mut self, lote_id: u64) {
         let caller = self.env().caller();
         let admin = self.admin.get_or_revert_with(Error::NotInitialized);
@@ -1366,7 +1371,6 @@ impl OhuVault {
                     let deficit = target
                         .checked_sub(bond)
                         .unwrap_or(U512::zero());
-                    // TODO(audit): cross-contract read call — confirmar API.
                     let pool =
                         crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
                     let pool_reserve = pool.reserve();
@@ -1385,30 +1389,12 @@ impl OhuVault {
             U512::zero()
         };
 
-        let indemnity_pool = bond
-            .checked_add(tail)
-            .unwrap_or_else(|| self.env().revert(Error::Overflow));
-
-        // CEI: effects antes que interactions.
+        // CEI: effects (solo escrituras, sin transferencias ni cross-calls).
+        // FIX CRÍTICO: la cola NO se trae al vault; se guarda en lote_tail y
+        // el comprador la cobra directo del pool en withdraw_settlement.
         self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_FAIL);
-        self.lote_indemnity_pool.set(&lote_id, indemnity_pool);
-
-        // Traer la cola del MutualPool si corresponde.
-        if tail > U512::zero() {
-            // Safe: tail > 0 implies pool_addr_opt was Some (tail only computed then).
-            let pool_addr = pool_addr_opt.unwrap();
-            // TODO(audit): cross-contract call para pay_tail.
-            let mut pool =
-                crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
-            pool.pay_tail(self.env().self_address(), tail);
-
-            // El vault recibió tail motes del pool → actualizar reserved.
-            let old_reserved = self.reserved_lote_balance.get_or_default();
-            let new_reserved = old_reserved
-                .checked_add(tail)
-                .unwrap_or_else(|| self.env().revert(Error::Overflow));
-            self.reserved_lote_balance.set(new_reserved);
-        }
+        self.lote_indemnity_pool.set(&lote_id, bond);
+        self.lote_tail.set(&lote_id, tail);
 
         self.env().emit_event(LoteSettledFail {
             lote_id,
@@ -1418,8 +1404,15 @@ impl OhuVault {
         });
     }
 
-    /// PULL: un comprador reclama su refund (share) + indemnización
-    /// proporcional del pool de indemnización del lote fallido.
+    /// PULL: un comprador reclama su refund (share) + indemnización de un lote
+    /// fallido, desde DOS fuentes:
+    ///
+    /// 1. **VAULT** (`transfer_tokens → cuenta`, Casper-safe):
+    ///    `refund = share`, `bond_indemnity = lote_indemnity_pool[lote] * share / funded`
+    ///    (= `bond * share / funded`). Total vault = `share + bond_indemnity`.
+    ///
+    /// 2. **POOL** (`MutualPool.pay_tail(caller, tail_share)`, destinatario cuenta →
+    ///    Casper-safe): `tail_share = lote_tail[lote] * share / funded`.
     ///
     /// Gates:
     /// - `state == SETTLED_FAIL` (LoteNotSettledFail).
@@ -1428,20 +1421,17 @@ impl OhuVault {
     /// - No reclamado antes: `lote_settlement_claimed[(lote, caller)] == false`
     ///   (SettlementAlreadyClaimed).
     ///
-    /// Cálculo (multiplicación antes de división, U512 checked_*):
-    ///   pool = lote_indemnity_pool[lote]  (bond + cola del MutualPool, o solo bond)
-    ///   indemnity = pool * share / funded  (proporción del pool de indemnización)
-    ///   amount = share + indemnity  (refund + indemnización)
+    /// CEI estricto: marca claimed + decrementa reserved (solo la parte vault) ANTES
+    /// de transferir.
     ///
-    /// W2-3: `pool` reemplaza `bond` como base de la indemnización. Si el
-    /// MutualPool aportó cola (`settle_failure`), el pool es mayor que el bono
-    /// solo; si no hay integración, `pool == bond` y el comportamiento es
-    /// idéntico al de W2-2.
+    /// W2-3 FIX CRÍTICO (Casper WASM): la cola se paga directo al comprador
+    /// (Address::Account → `transfer_tokens` permitido), NO a través del vault
+    /// (Address::Contract → `transfer_tokens` revierte on-chain). `pay_tail` valida
+    /// `amount <= reserve` en el momento del withdraw; si la reserva del pool ya no
+    /// alcanza, el withdraw revierte — es un riesgo de liquidez, no de pérdida.
     ///
-    /// CEI estricto: marca claimed + decrementa reserved ANTES de transferir.
-    ///
-    /// Dust de división entera: la suma de todas las indemnizaciones puede
-    /// ser < pool. Ese dust queda en reserved del lote (inocuo).
+    /// Dust de división entera: la suma de todas las indemnizaciones puede ser
+    /// < pool/tail. Ese dust queda en el vault/pool (inocuo).
     pub fn withdraw_settlement(&mut self, lote_id: u64) {
         let caller = self.env().caller();
 
@@ -1461,19 +1451,33 @@ impl OhuVault {
         }
 
         let funded = self.lote_funded.get_or_default(&lote_id);
-        let pool = self.lote_indemnity_pool.get_or_default(&lote_id);
+        let pool = self.lote_indemnity_pool.get_or_default(&lote_id); // bond only
 
-        // funded > 0 garantizado: un lote en EVAL_FAIL → SETTLED_FAIL
-        // tuvo funded > 0 para alcanzar FUNDED.
-        // W2-3: indemnity usa lote_indemnity_pool (bond + cola) en vez de bond.
-        let indemnity = pool
+        // Indemnity from vault (bond portion).
+        let bond_indemnity = pool
             .checked_mul(share)
             .unwrap_or_else(|| self.env().revert(Error::Overflow))
             .checked_div(funded)
             .unwrap_or_else(|| self.env().revert(Error::Overflow));
 
-        let amount = share
-            .checked_add(indemnity)
+        // Tail from MutualPool (paid directly to buyer account — Casper-safe).
+        let tail_pool = self.lote_tail.get_or_default(&lote_id);
+        let tail_share = tail_pool
+            .checked_mul(share)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow))
+            .checked_div(funded)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        let amount_vault = share
+            .checked_add(bond_indemnity)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        let indemnity = bond_indemnity
+            .checked_add(tail_share)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        let amount_total = amount_vault
+            .checked_add(tail_share)
             .unwrap_or_else(|| self.env().revert(Error::Overflow));
 
         // CEI: effects antes que interactions.
@@ -1481,18 +1485,31 @@ impl OhuVault {
 
         let old_reserved = self.reserved_lote_balance.get_or_default();
         let new_reserved = old_reserved
-            .checked_sub(amount)
+            .checked_sub(amount_vault) // Solo la parte que sale del vault
             .unwrap_or_else(|| self.env().revert(Error::ReservedAccounting));
         self.reserved_lote_balance.set(new_reserved);
 
-        self.env().transfer_tokens(&caller, &amount);
+        // Transfer from vault (share + bond_indemnity → cuenta, Casper-safe).
+        self.env().transfer_tokens(&caller, &amount_vault);
+
+        // Transfer from MutualPool (tail_share → cuenta del comprador, Casper-safe).
+        // pay_tail valida caller==authorized_vault y amount<=reserve en el momento.
+        // Si la reserva del pool ya no alcanza, revierte — liquidez, no pérdida.
+        if tail_share > U512::zero() {
+            let pool_addr = match self.mutual_pool.get() {
+                Some(addr) => addr,
+                None => self.env().revert(Error::NotInitialized),
+            };
+            let mut pool = crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
+            pool.pay_tail(caller, tail_share);
+        }
 
         self.env().emit_event(SettlementWithdrawn {
             lote_id,
             buyer: caller,
             refund: share,
             indemnity,
-            amount,
+            amount: amount_total,
         });
     }
 
@@ -1724,9 +1741,15 @@ impl OhuVault {
         self.indemnity_target_bps.get_or_default()
     }
 
-    /// Pool de indemnización del lote (bond + cola, o solo bond).
+    /// Pool de indemnización del lote (solo el bono; la cola está en `lote_tail`).
     pub fn lote_indemnity_pool(&self, lote_id: u64) -> U512 {
         self.lote_indemnity_pool.get_or_default(&lote_id)
+    }
+
+    /// Cola de indemnización del lote desde el MutualPool.
+    /// 0 si no hay integración o el bono cubrió el target.
+    pub fn lote_tail(&self, lote_id: u64) -> U512 {
+        self.lote_tail.get_or_default(&lote_id)
     }
 }
 
@@ -5641,8 +5664,6 @@ mod tests {
             bond,
         );
 
-        let _funded = U512::from(100 * ONE_CSPR);
-
         // Submit negative attestation (60% → EVAL_FAIL)
         f.env.set_caller(f.operator);
         f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
@@ -5652,37 +5673,56 @@ mod tests {
         f.vault.evaluate_lote(lote_id);
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
 
+        let vault_balance_before = f.env.balance_of(&f.vault);
         let reserved_before = f.vault.reserved_lote_balance();
 
-        // settle_failure → trae cola del pool
+        // settle_failure — NO mueve fondos, NO toca el pool
         f.env.set_caller(f.admin);
         f.vault.settle_failure(lote_id);
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
 
         // target = 100 * 8000 / 10000 = 80 CSPR, deficit = 80 - 10 = 70
         let expected_tail = U512::from(70 * ONE_CSPR);
-        let expected_pool_amount = bond.checked_add(expected_tail).unwrap();
-        assert_eq!(
-            f.vault.lote_indemnity_pool(lote_id),
-            expected_pool_amount
-        );
-        assert_eq!(f.pool.reserve(), pool_before - expected_tail);
+        // lote_indemnity_pool = bond only (no tail)
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), bond);
+        // lote_tail almacena la cola
+        assert_eq!(f.vault.lote_tail(lote_id), expected_tail);
+        // Pool NO se tocó en settle
+        assert_eq!(f.pool.reserve(), pool_before);
+        // Vault balance y reserved NO cambiaron
+        assert_eq!(f.env.balance_of(&f.vault), vault_balance_before);
+        assert_eq!(f.vault.reserved_lote_balance(), reserved_before);
 
-        let expected_reserved = reserved_before.checked_add(expected_tail).unwrap();
-        assert_eq!(f.vault.reserved_lote_balance(), expected_reserved);
-
-        // Verificar indemnización: usa pool (bond+tail)=80
+        // Withdraw buyer A: recibe de DOS fuentes
+        //  VAULT: refund=60 + bond_indemnity=10*60/100=6 = 66
+        //  POOL: tail_share=70*60/100=42
+        //  total = 66 + 42 = 108
         let buyer_before = f.env.balance_of(&signer_a);
+        let pool_before_withdraw = f.pool.reserve();
         f.env.set_caller(signer_a);
         f.vault.withdraw_settlement(lote_id);
-        // refund = 60, indemnity = 80*60/100 = 48, amount = 108
-        let expected_refund = U512::from(60 * ONE_CSPR);
-        let expected_indemnity = U512::from(48 * ONE_CSPR);
-        let expected_amount = expected_refund.checked_add(expected_indemnity).unwrap();
+
+        let expected_vault_amount = U512::from(60 * ONE_CSPR) + U512::from(6 * ONE_CSPR); // 66
+        let expected_tail_share = U512::from(42 * ONE_CSPR);
+        let expected_total = expected_vault_amount + expected_tail_share; // 108
         assert_eq!(
             f.env.balance_of(&signer_a),
-            buyer_before + expected_amount
+            buyer_before + expected_total
         );
+        // Pool bajó SOLO en tail_share de este comprador (no el tail entero)
+        assert_eq!(f.pool.reserve(), pool_before_withdraw - expected_tail_share);
+
+        // Evento: indemnity = bond_indemnity + tail_share = 6 + 42 = 48
+        assert!(f.env.emitted_event(
+            &f.vault,
+            SettlementWithdrawn {
+                lote_id,
+                buyer: signer_a,
+                refund: U512::from(60 * ONE_CSPR),
+                indemnity: U512::from(48 * ONE_CSPR),
+                amount: expected_total,
+            }
+        ));
     }
 
     #[test]
@@ -5755,12 +5795,27 @@ mod tests {
         f.env.set_caller(f.admin);
         f.vault.settle_failure(lote_id);
 
-        // Tail = 5 (pool reserve), no 70
-        assert_eq!(f.pool.reserve(), U512::zero());
+        // Tail = min(deficit=70, reserve=5) = 5
+        // lote_indemnity_pool = bond only (10)
+        // lote_tail = 5
+        // Pool NO se tocó en settle
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), bond);
+        assert_eq!(f.vault.lote_tail(lote_id), U512::from(5 * ONE_CSPR));
+        assert_eq!(f.pool.reserve(), U512::from(5 * ONE_CSPR));
+
+        // Withdraw buyer A (60 CSPR):
+        //  VAULT: refund=60 + bond*60/100=6 = 66
+        //  POOL: tail*60/100 = 5*60/100 = 3
+        let buyer_before = f.env.balance_of(&signer_a);
+        f.env.set_caller(signer_a);
+        f.vault.withdraw_settlement(lote_id);
+
         assert_eq!(
-            f.vault.lote_indemnity_pool(lote_id),
-            U512::from(15 * ONE_CSPR) // bond 10 + tail 5
+            f.env.balance_of(&signer_a),
+            buyer_before + U512::from(69 * ONE_CSPR) // 66 + 3
         );
+        // Pool: 5 - 3 = 2
+        assert_eq!(f.pool.reserve(), U512::from(2 * ONE_CSPR));
     }
 
     #[test]
@@ -5785,9 +5840,63 @@ mod tests {
 
     // ── W2-3c: backward-compatibility ──────────────────────────────
 
+    /// Variante REAL sin pool configurado: nunca se llama set_mutual_pool.
+    fn setup_integration_no_pool() -> IntegrationFixture {
+        let env = odra_test::env();
+        let admin = env.get_account(0);
+        let operator = env.get_account(1);
+        let approver0 = env.get_account(2);
+        let approver1 = env.get_account(3);
+        let attestation_window_ms = 86_400_000u64;
+
+        let vault = OhuVault::deploy(
+            &env,
+            OhuVaultInitArgs {
+                admin,
+                operator,
+                approvers: vec![approver0, approver1, env.get_account(4)],
+                required_approvals: 2,
+                micropayment_cap: U512::from(ONE_CSPR),
+                epoch_cap: U512::from(100 * ONE_CSPR),
+                epoch_window_ms: 3_600_000,
+                chain_id: 1,
+                quorum_fail_bps: 6000,
+                attestation_window_ms,
+            },
+        );
+
+        let vault_addr = vault.contract_address();
+
+        // Deploy pool but NEVER configure it in vault
+        let pool = MutualPool::deploy(
+            &env,
+            MutualPoolInitArgs {
+                admin,
+                authorized_vault: vault_addr,
+            },
+        );
+
+        // Fund vault with 200 CSPR from depositor
+        let depositor = env.get_account(5);
+        env.set_caller(depositor);
+        vault.with_tokens(U512::from(200 * ONE_CSPR)).deposit();
+
+        IntegrationFixture {
+            vault,
+            pool,
+            env,
+            admin,
+            operator,
+            approver0,
+            approver1,
+            attestation_window_ms,
+        }
+    }
+
     #[test]
     fn integration_backward_compat_release_without_mutual_pool_config() {
-        let mut f = setup_integration(0, 0);
+        // W2-2 behavior: no pool, no premium, release identical to W2-1.
+        let mut f = setup_integration_no_pool();
         let producer = f.env.get_account(7);
         let buyer = f.env.get_account(8);
         let funded = U512::from(100 * ONE_CSPR);
@@ -5803,15 +5912,19 @@ mod tests {
         f.env.set_caller(f.admin);
         f.vault.release_to_producer(1);
 
+        // Full payout (no premium deduction) = W2-2 behavior
         assert_eq!(
             f.env.balance_of(&producer),
             producer_before + funded + bond
         );
+        // Pool untouched (never linked)
+        assert_eq!(f.pool.reserve(), U512::zero());
     }
 
     #[test]
     fn integration_backward_compat_settle_failure_without_mutual_pool_config() {
-        let mut f = setup_integration(0, 0);
+        // W2-2 behavior: no pool, no tail, settlement identical to W2-2.
+        let mut f = setup_integration_no_pool();
 
         let lote_id = 1u64;
         let producer = f.env.get_account(7);
@@ -5840,10 +5953,13 @@ mod tests {
         f.vault.settle_failure(lote_id);
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
 
-        // No tail: pool = bond
+        // No tail: pool not linked → lote_indemnity_pool = bond, lote_tail = 0
         assert_eq!(f.vault.lote_indemnity_pool(lote_id), bond);
+        assert_eq!(f.vault.lote_tail(lote_id), U512::zero());
+        // Pool untouched
+        assert_eq!(f.pool.reserve(), U512::zero());
 
-        // Buyer withdraw: indemnity = bond * share / funded
+        // Buyer withdraw: indemnity = bond * share / funded (W2-2 behavior)
         let buyer_before = f.env.balance_of(&signer_a);
         f.env.set_caller(signer_a);
         f.vault.withdraw_settlement(lote_id);
@@ -5852,6 +5968,183 @@ mod tests {
         assert_eq!(
             f.env.balance_of(&signer_a),
             buyer_before + U512::from(60 * ONE_CSPR) + expected_indemnity
+        );
+    }
+
+    // ── W2-3d: dos lotes compitiendo por reserva del pool ───────────
+
+    #[test]
+    fn integration_two_failed_lotes_competing_for_pool_reserve() {
+        // indemnity_target_bps=8000 → target=80% funded
+        // Pool: solo 10 CSPR.
+        // Lote 1: bond=10, deficit=70 → tail_l1 = min(70, 10) = 10
+        // Lote 2: se abre DESPUÉS de que lote 1 ya fijó su tail;
+        //   bond=10, deficit=70, pero pool reserve=10 → tail_l2 = 10 también
+        //   (settle failure solo LEE la reserva, no la consume).
+        // En los withdraws, ambos lotes compiten por la misma reserva:
+        //   buyer A lote 1 (60%) → tail_share_l1 = 10*60/100=6 → pool: 4
+        //   buyer A lote 2 (60%) → tail_share_l2 = 10*60/100=6 → pool: revierte? No, pool tiene 4 → intenta 6 → InsufficientReserve
+        let mut f = setup_integration(0, 8000);
+
+        // Capitalizar el pool: solo 10 CSPR
+        let funder = f.env.get_account(5);
+        f.env.set_caller(funder);
+        f.pool.with_tokens(U512::from(10 * ONE_CSPR)).collect_premium();
+        assert_eq!(f.pool.reserve(), U512::from(10 * ONE_CSPR));
+
+        let producer = f.env.get_account(7);
+        let bond = U512::from(10 * ONE_CSPR);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+
+        // ── Lote 1 ──
+        let l1_id = 1u64;
+        let (_sk1, pk1, sig1, signer_a1) =
+            sign_attestation(l1_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b1 = f.env.get_account(9);
+        setup_eval_fail_integration(
+            &mut f, l1_id, producer,
+            signer_a1, buyer_b1,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(l1_id, 1, false, u64::MAX, pk1, sig1);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(l1_id);
+        f.vault.settle_failure(l1_id);
+
+        // Lote 1: lote_indemnity_pool=bond=10, lote_tail=10 (pool tenía 10)
+        assert_eq!(f.vault.lote_indemnity_pool(l1_id), bond);
+        assert_eq!(f.vault.lote_tail(l1_id), U512::from(10 * ONE_CSPR));
+        // Pool NO bajó
+        assert_eq!(f.pool.reserve(), U512::from(10 * ONE_CSPR));
+
+        // ── Lote 2 ──
+        let l2_id = 2u64;
+        let (_sk2, pk2, sig2, signer_a2) =
+            sign_attestation(l2_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b2 = f.env.get_account(10);
+        setup_eval_fail_integration(
+            &mut f, l2_id, producer,
+            signer_a2, buyer_b2,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(l2_id, 1, false, u64::MAX, pk2, sig2);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(l2_id);
+        f.vault.settle_failure(l2_id);
+
+        // Lote 2: también tail=10 (pool aún tiene 10 en settle)
+        assert_eq!(f.vault.lote_indemnity_pool(l2_id), bond);
+        assert_eq!(f.vault.lote_tail(l2_id), U512::from(10 * ONE_CSPR));
+        // Pool sigue en 10
+        assert_eq!(f.pool.reserve(), U512::from(10 * ONE_CSPR));
+
+        // ── Withdraw L1 buyer A (60 CSPR) ──
+        let a1_before = f.env.balance_of(&signer_a1);
+        f.env.set_caller(signer_a1);
+        f.vault.withdraw_settlement(l1_id);
+        // VAULT: refund=60 + bond*60/100=6 = 66
+        // POOL: tail*60/100 = 10*60/100 = 6
+        // total = 72
+        assert_eq!(f.env.balance_of(&signer_a1), a1_before + U512::from(72 * ONE_CSPR));
+        // Pool: 10 - 6 = 4
+        assert_eq!(f.pool.reserve(), U512::from(4 * ONE_CSPR));
+
+        // ── Withdraw L2 buyer A (60 CSPR) ──
+        // tail_share = 10*60/100 = 6, pero pool solo tiene 4 → revierte InsufficientReserve
+        f.env.set_caller(signer_a2);
+        let result = f.vault.try_withdraw_settlement(l2_id);
+        assert_eq!(
+            result.unwrap_err(),
+            crate::mutual_pool::Error::InsufficientReserve.into()
+        );
+        // El vault NO perdió fondos: ni vault balance ni reserved cambiaron por este revert
+        // (El estado del claim no se marcó porque el revert deshace todo.)
+        assert!(!f.vault.lote_settlement_claimed(l2_id, signer_a2));
+
+        // ── Withdraw L2 buyer B (40 CSPR) desde el pool residual ──
+        // tail_share = 10*40/100 = 4, pool tiene 4 → justo alcanza
+        let b2_before = f.env.balance_of(&buyer_b2);
+        f.env.set_caller(buyer_b2);
+        f.vault.withdraw_settlement(l2_id);
+        // VAULT: refund=40 + 10*40/100=4 = 44
+        // POOL: 10*40/100=4
+        assert_eq!(f.env.balance_of(&buyer_b2), b2_before + U512::from(48 * ONE_CSPR));
+        assert_eq!(f.pool.reserve(), U512::zero());
+
+        // ── L2 buyer A retry ahora revierte porque pool quedó vacío ──
+        f.env.set_caller(signer_a2);
+        let result2 = f.vault.try_withdraw_settlement(l2_id);
+        assert_eq!(
+            result2.unwrap_err(),
+            crate::mutual_pool::Error::InsufficientReserve.into()
+        );
+    }
+
+    /// Después de todos los withdraws de un lote con cola, self_balance(vault)
+    /// >= reserved_lote_balance (el tail nunca entró al vault).
+    #[test]
+    fn integration_after_full_withdraw_reserved_leq_balance() {
+        let mut f = setup_integration(0, 8000); // target=80%, funded=100, bond=10
+
+        // Capitalizar el pool: 100 CSPR
+        let funder = f.env.get_account(5);
+        f.env.set_caller(funder);
+        f.pool.with_tokens(U512::from(100 * ONE_CSPR)).collect_premium();
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+        let bond = U512::from(10 * ONE_CSPR);
+
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+        f.vault.settle_failure(lote_id);
+
+        // lote_tail=70, lote_indemnity_pool=10
+        assert_eq!(f.vault.lote_tail(lote_id), U512::from(70 * ONE_CSPR));
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), bond);
+
+        // Withdraw buyer A
+        f.env.set_caller(signer_a);
+        f.vault.withdraw_settlement(lote_id);
+        // Withdraw buyer B
+        f.env.set_caller(buyer_b);
+        f.vault.withdraw_settlement(lote_id);
+
+        // Ambos reclamaron
+        assert!(f.vault.lote_settlement_claimed(lote_id, signer_a));
+        assert!(f.vault.lote_settlement_claimed(lote_id, buyer_b));
+
+        // INVARIANTE: self_balance(vault) >= reserved_lote_balance
+        let vault_balance = f.env.balance_of(&f.vault);
+        let reserved = f.vault.reserved_lote_balance();
+        assert!(
+            vault_balance >= reserved,
+            "self_balance({}) < reserved({})",
+            vault_balance,
+            reserved
         );
     }
 
