@@ -49,3 +49,9 @@ name = "ohu_livenet_e2e"
 path = "bin/livenet_e2e.rs"
 required-features = ["livenet"]
 test = false
+
+[[bin]]
+name = "ohu_livenet_e2e_fail"
+path = "bin/livenet_e2e_fail.rs"
+required-features = ["livenet"]
+test = false
