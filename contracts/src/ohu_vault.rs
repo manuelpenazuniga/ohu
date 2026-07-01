@@ -169,8 +169,11 @@ pub enum Error {
     /// (funded * indemnity_target_bps / 10000). Aumentar el bono o reducir
     /// el target. El lote permanece OPEN.
     BondBelowMinimum = 60,
-    /// El productor del lote no puede comprar su propio lote (anti-colusión).
+    /// El productor del lote no puede comprar su propio lote (endurecimiento).
     ProducerCannotBuy = 61,
+    /// El depósito haría que el target de indemnización supere el bono ya
+    /// posteado (funding lock). Reducir el depósito o aumentar el bono.
+    FundingExceedsBond = 62,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -415,6 +418,10 @@ pub struct OhuVault {
     /// se paga directo al comprador vía `pay_tail(caller, tail_share)` en cada
     /// `withdraw_settlement`). Se fija en `settle_failure`.
     lote_tail: Mapping<u64, U512>,
+    /// Snapshot del target (funded * indemnity_target_bps / 10000) al momento
+    /// de la transición a FUNDED. Se usa en settle_failure para que cambios
+    /// de governance post-FUNDED no afecten lotes ya fondeados (fix 3b).
+    lote_target: Mapping<u64, U512>,
 }
 
 /// Constantes de estado de lote (W1-1, W2-1).
@@ -933,14 +940,15 @@ impl OhuVault {
     /// - El lote debe estar en estado OPEN (no FUNDED/SETTLED).
     /// - `attached_value() > 0`.
     /// - `caller` debe ser Address::Account (no contrato, INV-3).
-    /// - `caller` no puede ser el `lote_producer` (anti-colusión).
+    /// - `caller` no puede ser el `lote_producer` (endurecimiento: evita el
+    ///   auto-claim directo; C-1 garantiza que el productor no gana incluso
+    ///   con cuentas Sybil, pero este gate no es defensa anti-Sybil completa).
+    /// - Si el bono ya fue posteado (`lote_bond > 0`), el target del nuevo
+    ///   funded no puede exceder el bono (`FundingExceedsBond`). Esto evita
+    ///   el atrapamiento de fondos (no se puede completar el bono ni cancelar).
     ///
     /// INV-7: los fondos se contabilizan por lote en los Mappings, nunca
     /// desde `self_balance()`. Dos lotes jamás comparten saldo entre sí.
-    ///
-    /// TODO(audit): si el lote ya tiene bono y este es el primer depósito,
-    /// la transición a FUNDED ocurre aquí mismo (regla conservadora: se
-    /// necesita tanto bono como fondeo > 0).
     #[odra(payable)]
     pub fn deposit_to_lote(&mut self, lote_id: u64) {
         let buyer = self.env().caller();
@@ -965,7 +973,10 @@ impl OhuVault {
             self.env().revert(Error::LoteNotOpen);
         }
 
-        // #6 (audit, anti-colusión): el productor no puede comprar su propio lote.
+        // #6 (audit, endurecimiento): evita auto-claim directo del productor.
+        // C-1 (bond >= target) garantiza que el productor no gana incluso con
+        // cuentas Sybil como comprador; este gate es hardening, no defensa
+        // anti-Sybil completa.
         let producer = match self.lote_producer.get(&lote_id) {
             Some(p) => p,
             None => self.env().revert(Error::LoteNotFound),
@@ -981,12 +992,31 @@ impl OhuVault {
         let new_share = old_share
             .checked_add(amount)
             .unwrap_or_else(|| self.env().revert(Error::Overflow));
-        self.lote_share.set(&share_key, new_share);
 
         let old_funded = self.lote_funded.get_or_default(&lote_id);
         let new_funded = old_funded
             .checked_add(amount)
             .unwrap_or_else(|| self.env().revert(Error::Overflow));
+
+        // Fix lock: si el bono ya fue posteado, rechazar depósito que haría
+        // target > bond. Así bond >= target se mantiene siempre y el lote
+        // nunca queda atascado en OPEN (bond insuficiente + sin poder completar).
+        let lote_bond_amount = self.lote_bond.get_or_default(&lote_id);
+        if lote_bond_amount > U512::zero() {
+            let indemnity_bps = self.indemnity_target_bps.get_or_default();
+            if indemnity_bps > 0 {
+                let new_target = new_funded
+                    .checked_mul(U512::from(indemnity_bps))
+                    .unwrap_or_else(|| self.env().revert(Error::Overflow))
+                    .checked_div(U512::from(10000u64))
+                    .unwrap_or_else(|| self.env().revert(Error::Overflow));
+                if new_target > lote_bond_amount {
+                    self.env().revert(Error::FundingExceedsBond);
+                }
+            }
+        }
+
+        self.lote_share.set(&share_key, new_share);
         self.lote_funded.set(&lote_id, new_funded);
 
         // FIX crítico: el CSPR depositado al lote queda reservado (INV-7).
@@ -1097,8 +1127,10 @@ impl OhuVault {
     /// Funded puede crecer con depósitos mientras OPEN, por eso el target
     /// se calcula con el funded FINAL (al momento de la transición).
     ///
-    /// Si el bono es insuficiente, el lote sigue OPEN; su rescate es
-    /// cancel/refund TODO(Sem2), fuera de scope.
+    /// Fix 3b (snapshot): guarda `lote_target[lote]` = target al momento
+    /// de FUNDED. Esto inmuniza lotes fondeados contra cambios de
+    /// `indemnity_target_bps` por governance (settle_failure usa el snapshot,
+    /// no el bps actual).
     ///
     /// INV-7: solo opera sobre el lote indicado; no cruza contabilidad
     /// entre lotes.
@@ -1116,23 +1148,24 @@ impl OhuVault {
         // C-1 (audit): garantía dura — el bono debe cubrir el target de
         // indemnización con el funded FINAL.
         let indemnity_bps = self.indemnity_target_bps.get_or_default();
-        if indemnity_bps > 0 {
-            let target = funded
-                .checked_mul(U512::from(indemnity_bps))
-                .unwrap_or_else(|| self.env().revert(Error::Overflow))
-                .checked_div(U512::from(10000u64))
-                .unwrap_or_else(|| self.env().revert(Error::Overflow));
-            // Si bond < target, el lote NO transiciona (queda OPEN).
-            // Consecuencia asumida: el bono cubre toda la indemnización y
-            // el tail del pool es 0 en el flujo normal (§4.1).
-            if bond < target {
-                return;
-            }
+        // target se computa siempre (incluyendo bps=0 → target=0)
+        // para el snapshot y para que el gate duro funcione consistentemente.
+        let target = funded
+            .checked_mul(U512::from(indemnity_bps))
+            .unwrap_or_else(|| self.env().revert(Error::Overflow))
+            .checked_div(U512::from(10000u64))
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+        if indemnity_bps > 0 && bond < target {
+            // C-1: bono insuficiente, el lote NO transiciona (queda OPEN).
+            return;
         }
 
         self.lote_state.set(&lote_id, LOTE_STATE_FUNDED);
         self.lote_funded_at
             .set(&lote_id, self.env().get_block_time());
+        // Fix 3b: snapshot del target al FUNDED para inmunidad contra
+        // cambios de governance post-FUNDED.
+        self.lote_target.set(&lote_id, target);
         self.env().emit_event(LoteFunded { lote_id });
     }
 
@@ -1391,28 +1424,27 @@ impl OhuVault {
     // ── W2-2: SETTLED_FAIL ──
 
     /// Cierra el lote fallido. Marca `SETTLED_FAIL` y fija:
-    /// - `lote_indemnity_pool[lote] = indemnity = min(bond, target)`.
-    ///   §4.2: indemnity está acotada y es estrictamente menor que funded.
-    /// - `lote_tail[lote] = tail` (cola del MutualPool; con bond>=target es 0).
+    /// - `lote_indemnity_pool[lote] = indemnity = min(bond, lote_target)`.
+    ///   Usa el snapshot guardado en `lote_target` al momento de FUNDED
+    ///   (fix 3b). §4.2: indemnity está acotada al target snapshot,
+    ///   inmune a cambios de governance post-FUNDED.
+    /// - `lote_tail[lote] = 0` (tail == 0 por construcción: C-1 garantiza
+    ///   bond >= lote_target al FUNDED).
     ///
-    /// **FIX CRÍTICO (Casper WASM):** NO transfiere la cola en este paso porque
-    /// `transfer_tokens` a un `Address::Contract` revierte on-chain. La cola la
-    /// paga el MutualPool directo al comprador (Address::Account → permitido) en
-    /// cada `withdraw_settlement`.
+    /// **C-2 (audit):** si `bond > lote_target`, el excedente
+    /// `bond - lote_target` se libera del `reserved_lote_balance`. Es
+    /// surplus slasheado que queda como free balance del vault.
     ///
-    /// **C-2 (audit):** si `bond > target`, el excedente `bond - target` se
-    /// libera del `reserved_lote_balance` (checked_sub). Es surplus slasheado
-    /// que queda como free balance del vault; la gobernanza puede rutearlo al
-    /// pool (TODO).
+    /// **bps=0:** si `indemnity_target_bps` era 0 al FUNDED,
+    /// `lote_target = 0` → `indemnity = 0`, `excess = bond` (todo el bono
+    /// se libera; los compradores reciben solo su refund).
     ///
     /// Gates:
     /// - `caller == admin` (NotAdmin). El agente nunca mueve capital (INV-1).
     /// - `state == EVAL_FAIL` (LoteNotFailable). El tally on-chain autoriza (INV-2).
     ///
-    /// CEI: solo effects (no interactions, no transferencias). El pool no se toca.
-    ///
-    /// Con bond>=target (C-1), min(bond,target)=target y tail=0. El flujo normal
-    /// no usa el pool; el pool queda como reserva/backstop de primas.
+    /// CEI estricto: solo effects (escrituras de estado), sin cross-calls ni
+    /// transferencias. El pool no se toca (tail=0 por construcción, fix CEI).
     pub fn settle_failure(&mut self, lote_id: u64) {
         let caller = self.env().caller();
         let admin = self.admin.get_or_revert_with(Error::NotInitialized);
@@ -1432,24 +1464,22 @@ impl OhuVault {
             None => self.env().revert(Error::LoteNotFound),
         };
 
-        // C-2 (audit): target de indemnización acotado (§4.2).
-        let indemnity_bps = self.indemnity_target_bps.get_or_default();
-        let (indemnity, excess) = if indemnity_bps > 0 {
-            let target = funded
-                .checked_mul(U512::from(indemnity_bps))
-                .unwrap_or_else(|| self.env().revert(Error::Overflow))
-                .checked_div(U512::from(10000u64))
-                .unwrap_or_else(|| self.env().revert(Error::Overflow));
-            // indemnity = min(bond, target); con bond>=target => indemnity=target
-            let indemnity = if bond < target { bond } else { target };
-            let excess = bond
-                .checked_sub(indemnity)
-                .unwrap_or(U512::zero());
-            (indemnity, excess)
+        // C-2 (audit, fix 3b): usar snapshot del target al FUNDED.
+        // Inmune a cambios de indemnity_target_bps post-FUNDED.
+        let lote_target_val = self.lote_target.get_or_default(&lote_id);
+
+        // indemnity = min(bond, lote_target).
+        // Con bond >= lote_target (C-1): indemnity = lote_target.
+        // Con bps=0: lote_target=0 → indemnity=0.
+        let indemnity = if bond < lote_target_val {
+            bond
         } else {
-            // Sin target: el bono completo fluye a los compradores.
-            (bond, U512::zero())
+            lote_target_val
         };
+
+        let excess = bond
+            .checked_sub(indemnity)
+            .unwrap_or(U512::zero());
 
         // C-2 (audit): liberar excedente del reserved (surplus slasheado).
         if excess > U512::zero() {
@@ -1460,42 +1490,12 @@ impl OhuVault {
             self.reserved_lote_balance.set(new_reserved);
         }
 
-        // W2-3: calcular cola de indemnización del MutualPool.
-        // Con bond>=target (C-1), tail = max(target-bond, 0) = 0.
-        // El path del tail se conserva por si governance cambia bps post-FUNDED.
-        let pool_addr_opt = self.mutual_pool.get();
-        let tail = if let Some(pool_addr) = pool_addr_opt {
-            if indemnity_bps > 0 {
-                let target = funded
-                    .checked_mul(U512::from(indemnity_bps))
-                    .unwrap_or_else(|| self.env().revert(Error::Overflow))
-                    .checked_div(U512::from(10000u64))
-                    .unwrap_or_else(|| self.env().revert(Error::Overflow));
-                if bond < target {
-                    let deficit = target
-                        .checked_sub(bond)
-                        .unwrap_or(U512::zero());
-                    let pool =
-                        crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
-                    let pool_reserve = pool.reserve();
-                    if deficit < pool_reserve {
-                        deficit
-                    } else {
-                        pool_reserve
-                    }
-                } else {
-                    U512::zero()
-                }
-            } else {
-                U512::zero()
-            }
-        } else {
-            U512::zero()
-        };
+        // Tail = 0 por construcción: C-1 garantiza bond >= lote_target al
+        // FUNDED, así que max(lote_target - bond, 0) ≡ 0. El pool no se toca
+        // (sin cross-call → CEI estricto, fix CEI).
+        let tail = U512::zero();
 
-        // CEI: effects (solo escrituras, sin transferencias ni cross-calls).
-        // FIX CRÍTICO: la cola NO se trae al vault; se guarda en lote_tail y
-        // el comprador la cobra directo del pool en withdraw_settlement.
+        // CEI: effects (solo escrituras, sin cross-calls ni transferencias).
         self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_FAIL);
         self.lote_indemnity_pool.set(&lote_id, indemnity);
         self.lote_tail.set(&lote_id, tail);
@@ -1855,6 +1855,12 @@ impl OhuVault {
     /// 0 si no hay integración o el bono cubrió el target.
     pub fn lote_tail(&self, lote_id: u64) -> U512 {
         self.lote_tail.get_or_default(&lote_id)
+    }
+
+    /// Snapshot del target al momento de FUNDED.
+    /// 0 si indemnity_target_bps era 0 al fondear.
+    pub fn lote_target(&self, lote_id: u64) -> U512 {
+        self.lote_target.get_or_default(&lote_id)
     }
 }
 
@@ -5158,9 +5164,15 @@ mod tests {
         f.contract.settle_failure(1);
 
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_FAIL);
-        // Los fondos NO se movieron.
+        // bps=0 → lote_target=0 → indemnity=0, excess=bond freed from reserved.
+        assert_eq!(f.contract.lote_indemnity_pool(1), U512::zero());
+        assert_eq!(f.contract.lote_tail(1), U512::zero());
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            reserved_before - bond
+        );
+        // Los fondos NO se movieron del vault (solo reserved bajó).
         assert_eq!(f.env.balance_of(&f.contract), vault_before);
-        assert_eq!(f.contract.reserved_lote_balance(), reserved_before);
         // Evento
         assert!(f.env.emitted_event(
             &f.contract,
@@ -5226,13 +5238,15 @@ mod tests {
 
     // ── withdraw_settlement: positivos ──────────────────────────────
 
-    /// Dos compradores 60/40 de 100, bono 50.
-    /// A: share=60, refund=60, indemnity=50*60/100=30, amount=90
-    /// B: share=40, refund=40, indemnity=50*40/100=20, amount=60
+    /// Dos compradores 60/40 de 100, bono 50. Con bps=0 (default):
+    /// lote_target=0 → indemnity=0, exceso=bond=50 liberado en settle.
+    /// A: share=60, refund=60, indemnity=0, amount=60
+    /// B: share=40, refund=40, indemnity=0, amount=40
+    /// Vault paga solo funded=100; excess=50 freed from reserved.
     #[test]
     fn withdraw_settlement_exact_arithmetic() {
         let mut f = simple_setup();
-        let (_producer, buyer_a, buyer_b, funded, bond) = setup_eval_fail(&mut f, 1);
+        let (_producer, buyer_a, buyer_b, funded, _bond) = setup_eval_fail(&mut f, 1);
 
         // settle_failure antes de reclamar
         f.env.set_caller(f.admin);
@@ -5241,6 +5255,7 @@ mod tests {
 
         let balance_before = f.env.balance_of(&f.contract);
         let reserved_before = f.contract.reserved_lote_balance();
+        // reserved_before = funded (settle freed bond as excess)
 
         // Buyer A reclama
         let a_before = f.env.balance_of(&buyer_a);
@@ -5248,7 +5263,7 @@ mod tests {
         f.contract.withdraw_settlement(1);
         assert!(f.contract.lote_settlement_claimed(1, buyer_a));
 
-        let expected_a = U512::from(60 * ONE_CSPR) + U512::from(30 * ONE_CSPR);
+        let expected_a = U512::from(60 * ONE_CSPR); // refund=60, indemnity=0
         assert_eq!(f.env.balance_of(&buyer_a), a_before + expected_a);
         assert!(f.env.emitted_event(
             &f.contract,
@@ -5256,7 +5271,7 @@ mod tests {
                 lote_id: 1,
                 buyer: buyer_a,
                 refund: U512::from(60 * ONE_CSPR),
-                indemnity: U512::from(30 * ONE_CSPR),
+                indemnity: U512::zero(),
                 amount: expected_a,
             }
         ));
@@ -5267,7 +5282,7 @@ mod tests {
         f.contract.withdraw_settlement(1);
         assert!(f.contract.lote_settlement_claimed(1, buyer_b));
 
-        let expected_b = U512::from(40 * ONE_CSPR) + U512::from(20 * ONE_CSPR);
+        let expected_b = U512::from(40 * ONE_CSPR); // refund=40, indemnity=0
         assert_eq!(f.env.balance_of(&buyer_b), b_before + expected_b);
         assert!(f.env.emitted_event(
             &f.contract,
@@ -5275,20 +5290,19 @@ mod tests {
                 lote_id: 1,
                 buyer: buyer_b,
                 refund: U512::from(40 * ONE_CSPR),
-                indemnity: U512::from(20 * ONE_CSPR),
+                indemnity: U512::zero(),
                 amount: expected_b,
             }
         ));
 
-        // Vault: se fue funded + bond (= 150) en total
+        // Vault: paid funded=100. Reserved bajó por funded.
         assert_eq!(
             f.env.balance_of(&f.contract),
-            balance_before - (funded + bond)
+            balance_before - funded
         );
-        // Reserved bajó exactamente en lo retirado (funded + bond).
         assert_eq!(
             f.contract.reserved_lote_balance(),
-            reserved_before - (funded + bond)
+            reserved_before - funded
         );
     }
 
@@ -5333,12 +5347,12 @@ mod tests {
         assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
         f.contract.settle_failure(lote_id);
 
-        // C (atestó POSITIVO) IGUAL reclama: refund 40 + indemnity 50*40/100 = 20 = 60.
+        // C (atestó POSITIVO) IGUAL reclama: refund 40 + indemnity 0 (bps=0) = 40.
         let c_before = f.env.balance_of(&signer_c);
         f.env.set_caller(signer_c);
         f.contract.withdraw_settlement(lote_id);
         assert!(f.contract.lote_settlement_claimed(lote_id, signer_c));
-        let expected_c = U512::from(40 * ONE_CSPR) + U512::from(20 * ONE_CSPR);
+        let expected_c = U512::from(40 * ONE_CSPR); // refund only
         assert_eq!(f.env.balance_of(&signer_c), c_before + expected_c);
     }
 
@@ -5347,30 +5361,31 @@ mod tests {
     #[test]
     fn withdraw_settlement_reserved_decrements_per_withdraw() {
         let mut f = simple_setup();
-        let (_producer, buyer_a, buyer_b, funded, bond) = setup_eval_fail(&mut f, 1);
+        let (_producer, buyer_a, buyer_b, funded, _bond) = setup_eval_fail(&mut f, 1);
 
         f.env.set_caller(f.admin);
         f.contract.settle_failure(1);
 
-        let reserved_before = f.contract.reserved_lote_balance();
-        assert_eq!(reserved_before, funded + bond);
+        // bps=0 → excess=bond freed in settle. reserved = funded after settle.
+        let reserved_after_settle = f.contract.reserved_lote_balance();
+        assert_eq!(reserved_after_settle, funded);
 
-        // Buyer A → reserved baja en 90
+        // Buyer A → reserved baja en 60 (refund 60, indemnity 0)
         f.env.set_caller(buyer_a);
         f.contract.withdraw_settlement(1);
-        let expected_a = U512::from(90 * ONE_CSPR);
+        let expected_a = U512::from(60 * ONE_CSPR);
         assert_eq!(
             f.contract.reserved_lote_balance(),
-            reserved_before - expected_a
+            reserved_after_settle - expected_a
         );
 
-        // Buyer B → reserved baja en 60 más, total = 150 (funded + bond)
+        // Buyer B → reserved baja en 40 más, total funded=100
         f.env.set_caller(buyer_b);
         f.contract.withdraw_settlement(1);
-        let expected_b = U512::from(60 * ONE_CSPR);
+        let expected_b = U512::from(40 * ONE_CSPR);
         assert_eq!(
             f.contract.reserved_lote_balance(),
-            reserved_before - (expected_a + expected_b)
+            reserved_after_settle - (expected_a + expected_b)
         );
     }
 
@@ -5440,9 +5455,9 @@ mod tests {
     fn inv7_two_failed_lotes_withdraw_isolated() {
         let mut f = simple_setup();
 
-        // Lote 1: EVAL_FAIL con buyers A(60) + B(40), bond=50
-        let (_p0, a1, b1, f1, bond1) = setup_eval_fail(&mut f, 1);
-        // Lote 2: EVAL_FAIL con buyers C(60) + D(40), bond=50
+        // Lote 1: EVAL_FAIL with buyers A(60) + B(40), bond=50
+        let (_p0, a1, b1, f1, _bond1) = setup_eval_fail(&mut f, 1);
+        // Lote 2: EVAL_FAIL with buyers C(60) + D(40), bond=50
         let (_p1, a2, b2, f2, bond2) = setup_eval_fail(&mut f, 2);
 
         // settle_failure ambos
@@ -5450,14 +5465,15 @@ mod tests {
         f.contract.settle_failure(1);
         f.contract.settle_failure(2);
 
-        let reserved_before = f.contract.reserved_lote_balance();
-        assert_eq!(reserved_before, f1 + bond1 + f2 + bond2);
+        // bps=0 → excess=bond freed per lote. reserved after settle = funded1+funded2.
+        let reserved_after_settle = f.contract.reserved_lote_balance();
+        assert_eq!(reserved_after_settle, f1 + f2);
 
-        // Withdraw de Lote 1 A
+        // Withdraw de Lote 1 A (60 CSPR refund)
         let a1_before = f.env.balance_of(&a1);
         f.env.set_caller(a1);
         f.contract.withdraw_settlement(1);
-        let expected_a1 = U512::from(90 * ONE_CSPR);
+        let expected_a1 = U512::from(60 * ONE_CSPR);
         assert_eq!(f.env.balance_of(&a1), a1_before + expected_a1);
 
         // Lote 2 intacto
@@ -5465,11 +5481,11 @@ mod tests {
         assert_eq!(f.contract.lote_funded(2), f2);
         assert_eq!(f.contract.lote_bond(2), bond2);
 
-        // Withdraw de Lote 2 A — verifica que no roba fondos del lote 1
+        // Withdraw de Lote 2 A
         let a2_before = f.env.balance_of(&a2);
         f.env.set_caller(a2);
         f.contract.withdraw_settlement(2);
-        assert_eq!(f.env.balance_of(&a2), a2_before + expected_a1); // misma aritmética
+        assert_eq!(f.env.balance_of(&a2), a2_before + expected_a1);
 
         // Ambos lotes pueden liquidar sus buyers sin interferencia
         f.env.set_caller(b1);
@@ -5477,11 +5493,8 @@ mod tests {
         f.env.set_caller(b2);
         f.contract.withdraw_settlement(2);
 
-        // reserved bajó exactamente en funded+bond de ambos lotes
-        assert_eq!(
-            f.contract.reserved_lote_balance(),
-            reserved_before - (f1 + bond1 + f2 + bond2)
-        );
+        // reserved = 0 (todo funded de ambos lotes fue retirado)
+        assert_eq!(f.contract.reserved_lote_balance(), U512::zero());
     }
 
     #[test]
@@ -5495,32 +5508,27 @@ mod tests {
         f.contract.settle_failure(1);
         f.contract.settle_failure(2);
 
-        let reserved_before = f.contract.reserved_lote_balance();
-        let lote1_reserved = U512::from(150 * ONE_CSPR); // 100 funded + 50 bond
+        // bps=0 → excess=bond=50 freed per lote. reserved after settle = 100+100=200.
+        let reserved_after = f.contract.reserved_lote_balance();
+        assert_eq!(reserved_after, U512::from(200 * ONE_CSPR));
 
-        // Withdraw full de lote 1 buyer A (60 CSPR refund + 30 indemnity = 90)
+        // Withdraw de lote 1 buyer A (60 CSPR refund)
         f.env.set_caller(a1);
         f.contract.withdraw_settlement(1);
 
-        // Lote 2 sigue con su reserved intacto
+        // Reserva restante: 140 (100 del lote 2 + 40 del buyer B del lote 1)
         assert_eq!(
             f.contract.reserved_lote_balance(),
-            reserved_before - U512::from(90 * ONE_CSPR)
-        );
-        // El remanente del lote 1 = 150 - 90 = 60 CSPR (lo de buyer B)
-        // Lote 2 = 150 CSPR → total reserved = 60 + 150 = 210
-        assert_eq!(
-            f.contract.reserved_lote_balance(),
-            lote1_reserved - U512::from(90 * ONE_CSPR) + U512::from(150 * ONE_CSPR)
+            reserved_after - U512::from(60 * ONE_CSPR)
         );
     }
 
-    /// Opcional: la suma de todos los withdraws de un lote
-    /// ≈ funded + bond (salvo dust de división entera).
+    /// Conservación: con bps=0, el vault paga solo funded=100 (refund).
+    /// Excess=bond=50 fue liberado en settle. Σ payouts = funded.
     #[test]
     fn withdraw_settlement_total_approx_funded_plus_bond() {
         let mut f = simple_setup();
-        let (_producer, buyer_a, buyer_b, funded, bond) = setup_eval_fail(&mut f, 1);
+        let (_producer, buyer_a, buyer_b, funded, _bond) = setup_eval_fail(&mut f, 1);
 
         f.env.set_caller(f.admin);
         f.contract.settle_failure(1);
@@ -5533,7 +5541,8 @@ mod tests {
         f.contract.withdraw_settlement(1);
 
         let total_withdrawn = vault_before - f.env.balance_of(&f.contract);
-        assert_eq!(total_withdrawn, funded + bond);
+        // bps=0 → solo refunds (funded), no indemnity.
+        assert_eq!(total_withdrawn, funded);
     }
 
     // ===============================================================
@@ -5941,12 +5950,12 @@ mod tests {
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_OPEN);
     }
 
-    /// C-1 (audit, garantía dura vía depósito tardío): bond=10, luego
-    /// depositan funded=100 (target=80 con el funded final). post_bond
-    /// pasó con funded=0 → target=0. Pero try_transition_to_funded en
-    /// deposit_to_lote ve bond=10 < target=80 → queda OPEN.
+    /// C-1 (audit, fix lock ronda 2): bond=10, luego intentan depositar
+    /// funded=100 → target=80 > bond → deposit revierte FundingExceedsBond.
+    /// El depósito no procede; el lote sigue OPEN con bond=10, funded=0.
+    /// El productor puede repostear bono suficiente para que el lote proceda.
     #[test]
-    fn c1_bond_posted_before_deposit_insufficient_stays_open() {
+    fn c1_bond_posted_before_deposit_insufficient_reverts() {
         let mut f = setup_integration(0, 8000); // target=80% funded
 
         let lote_id = 1u64;
@@ -5963,16 +5972,17 @@ mod tests {
             .post_bond(lote_id);
         assert_eq!(f.vault.lote_bond(lote_id), U512::from(10 * ONE_CSPR));
 
-        // Luego depositan 100 CSPR → funded=100. try_transition_to_funded
-        // ve bond=10 < target=80 → NO transiciona.
+        // Intentan depositar 100 CSPR → target=80 > bond=10 → FundingExceedsBond.
         f.env.set_caller(buyer);
-        f.vault
+        let result = f
+            .vault
             .with_tokens(U512::from(100 * ONE_CSPR))
-            .deposit_to_lote(lote_id);
+            .try_deposit_to_lote(lote_id);
+        assert_eq!(result.unwrap_err(), Error::FundingExceedsBond.into());
 
-        // Queda OPEN: bond insuficiente con el funded final.
+        // Lote sigue OPEN, funded=0 (el depósito revertió).
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_OPEN);
-        assert_eq!(f.vault.lote_funded(lote_id), U512::from(100 * ONE_CSPR));
+        assert_eq!(f.vault.lote_funded(lote_id), U512::zero());
         assert_eq!(f.vault.lote_bond(lote_id), U512::from(10 * ONE_CSPR));
     }
 
@@ -6081,7 +6091,7 @@ mod tests {
 
     #[test]
     fn integration_backward_compat_settle_failure_without_mutual_pool_config() {
-        // W2-2 behavior: no pool, no tail, settlement identical to W2-2.
+        // bps=0 → lote_target=0 → indemnity=0, excess=bond liberado.
         let mut f = setup_integration_no_pool();
 
         let lote_id = 1u64;
@@ -6111,21 +6121,19 @@ mod tests {
         f.vault.settle_failure(lote_id);
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
 
-        // No tail: pool not linked → lote_indemnity_pool = bond, lote_tail = 0
-        assert_eq!(f.vault.lote_indemnity_pool(lote_id), bond);
+        // bps=0 → lote_target=0 → indemnity=0, excess=bond freed.
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), U512::zero());
         assert_eq!(f.vault.lote_tail(lote_id), U512::zero());
         // Pool untouched
         assert_eq!(f.pool.reserve(), U512::zero());
 
-        // Buyer withdraw: indemnity = bond * share / funded (W2-2 behavior)
+        // Buyer withdraw: refund=60, indemnity=0 → amount=60
         let buyer_before = f.env.balance_of(&signer_a);
         f.env.set_caller(signer_a);
         f.vault.withdraw_settlement(lote_id);
-        // refund=60, indemnity=10*60/100=6, amount=66
-        let expected_indemnity = U512::from(6 * ONE_CSPR);
         assert_eq!(
             f.env.balance_of(&signer_a),
-            buyer_before + U512::from(60 * ONE_CSPR) + expected_indemnity
+            buyer_before + U512::from(60 * ONE_CSPR)
         );
     }
 
@@ -6443,6 +6451,368 @@ mod tests {
             f.env.balance_of(&buyer_b),
             b_before + U512::from(72 * ONE_CSPR)
         );
+    }
+
+    // ── Ronda 2 audit: lock fix (FundingExceedsBond) ──────────────────
+
+    /// Bond=80 posteado primero (target=80 con 8000bps y funded=0),
+    /// luego depósito de 100 CSPR (target=80 == bond=80). El depósito
+    /// NO excede el bono → procede y el lote llega a FUNDED.
+    #[test]
+    fn funding_lock_bond_then_deposit_within_limit_reaches_funded() {
+        let mut f = setup_integration(0, 8000);
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+
+        f.env.set_caller(f.admin);
+        f.vault.open_lote(lote_id, producer);
+
+        // Bond=80 primero (funded=0 → target=0 → post_bond pasa).
+        f.env.set_caller(producer);
+        f.vault
+            .with_tokens(U512::from(80 * ONE_CSPR))
+            .post_bond(lote_id);
+        assert_eq!(f.vault.lote_bond(lote_id), U512::from(80 * ONE_CSPR));
+
+        // Depósito de 100 CSPR → target=100*8000/10000=80 == bond → procede.
+        f.env.set_caller(buyer);
+        f.vault
+            .with_tokens(U512::from(100 * ONE_CSPR))
+            .deposit_to_lote(lote_id);
+
+        // Llega a FUNDED (bono ≥ target).
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
+        assert_eq!(f.vault.lote_funded(lote_id), U512::from(100 * ONE_CSPR));
+        assert_eq!(f.vault.lote_bond(lote_id), U512::from(80 * ONE_CSPR));
+    }
+
+    /// Griefable: depósito que empuja target > bond → revierte
+    /// FundingExceedsBond. El lote no queda atascado en OPEN.
+    #[test]
+    fn funding_lock_one_mote_pushes_target_past_bond_reverts() {
+        let mut f = setup_integration(0, 8000);
+        let producer = f.env.get_account(7);
+
+        // ── Lote 1: bond=80, depósito=100 → target=80 == bond → FUNDED ──
+        let lote_id1 = 1u64;
+        f.env.set_caller(f.admin);
+        f.vault.open_lote(lote_id1, producer);
+
+        f.env.set_caller(producer);
+        f.vault
+            .with_tokens(U512::from(80 * ONE_CSPR))
+            .post_bond(lote_id1);
+
+        let buyer1 = f.env.get_account(8);
+        f.env.set_caller(buyer1);
+        f.vault
+            .with_tokens(U512::from(100 * ONE_CSPR))
+            .deposit_to_lote(lote_id1);
+        assert_eq!(f.vault.lote_state(lote_id1), LOTE_STATE_FUNDED);
+
+        // ── Lote 2: bond=80, depósito=126 → target=100 > bond=80 → revierte ──
+        let lote_id2 = 2u64;
+        let buyer2 = f.env.get_account(9);
+        f.env.set_caller(f.admin);
+        f.vault.open_lote(lote_id2, producer);
+
+        f.env.set_caller(producer);
+        f.vault
+            .with_tokens(U512::from(80 * ONE_CSPR))
+            .post_bond(lote_id2);
+
+        f.env.set_caller(buyer2);
+        let result = f
+            .vault
+            .with_tokens(U512::from(126 * ONE_CSPR))
+            .try_deposit_to_lote(lote_id2);
+        assert_eq!(result.unwrap_err(), Error::FundingExceedsBond.into());
+        assert_eq!(f.vault.lote_state(lote_id2), LOTE_STATE_OPEN);
+        assert_eq!(f.vault.lote_funded(lote_id2), U512::zero());
+    }
+
+    /// Depósito sin bono (bond=0) → sin tope. El productor postea bono
+    /// suficiente después y el lote llega a FUNDED.
+    #[test]
+    fn funding_lock_bond_after_deposit_reaches_funded() {
+        let mut f = setup_integration(0, 8000);
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+
+        f.env.set_caller(f.admin);
+        f.vault.open_lote(lote_id, producer);
+
+        // Depósito primero (sin bono → sin tope).
+        f.env.set_caller(buyer);
+        f.vault
+            .with_tokens(U512::from(100 * ONE_CSPR))
+            .deposit_to_lote(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_OPEN);
+
+        // Bono suficiente → FUNDED.
+        f.env.set_caller(producer);
+        f.vault
+            .with_tokens(U512::from(80 * ONE_CSPR))
+            .post_bond(lote_id);
+
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
+    }
+
+    // ── Ronda 2 audit: snapshot (lote_target) ────────────────────────
+
+    /// Fondea un lote con indemnity_target_bps=50 (target=1 CSPR con
+    /// funded=200). Admin sube bps a 8000 post-FUNDED. settle_failure
+    /// usa el target VIEJO (snapshot=1 CSPR) → tail=0, indemnity=1 CSPR,
+    /// el pool NO paga nada.
+    #[test]
+    fn snapshot_governance_raises_bps_post_funded_uses_old_target() {
+        let mut f = setup_integration(0, 50); // target=0.5% funded
+        let pool_funder = f.env.get_account(5);
+
+        // Capitalizar pool con 50 CSPR para demostrar que NO se toca.
+        f.env.set_caller(pool_funder);
+        f.pool
+            .with_tokens(U512::from(50 * ONE_CSPR))
+            .collect_premium();
+        let pool_before = f.pool.reserve();
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+
+        // funded=200 CSPR, bond=5 CSPR.
+        // Con bps=50: target = 200*50/10000 = 1 CSPR. bond=5 ≥ 1 → FUNDED.
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(120 * ONE_CSPR), U512::from(80 * ONE_CSPR),
+            U512::from(5 * ONE_CSPR),
+        );
+
+        // Lote llega a FUNDED. lote_target snapshot = 1 CSPR.
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
+        assert_eq!(f.vault.lote_target(lote_id), U512::from(ONE_CSPR));
+
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        // Admin SUBE indemnity_target_bps a 8000 (80%) POST-FUNDED.
+        f.env.set_caller(f.admin);
+        f.vault.set_indemnity_target_bps(8000);
+        assert_eq!(f.vault.indemnity_target_bps(), 8000);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
+
+        let reserved_before = f.vault.reserved_lote_balance();
+
+        // settle_failure usa lote_target OLD (1 CSPR), no el nuevo (160 CSPR).
+        f.vault.settle_failure(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
+
+        // Indemnity = min(bond=5, lote_target=1) = 1 CSPR (no 160).
+        assert_eq!(
+            f.vault.lote_indemnity_pool(lote_id),
+            U512::from(ONE_CSPR)
+        );
+        // Tail = 0 por construcción (bond=5 >= lote_target=1).
+        assert_eq!(f.vault.lote_tail(lote_id), U512::zero());
+        // Excess = bond - indemnity = 5 - 1 = 4 CSPR liberado.
+        assert_eq!(
+            f.vault.reserved_lote_balance(),
+            reserved_before - U512::from(4 * ONE_CSPR)
+        );
+
+        // Pool NO se tocó (tail=0 → sin cross-call).
+        assert_eq!(f.pool.reserve(), pool_before);
+
+        // Withdraw buyer A: refund=120 + indemnity(1 CSPR)*120/200=0.6 CSPR.
+        // Total = 120.6 CSPR.
+        let a_before = f.env.balance_of(&signer_a);
+        f.env.set_caller(signer_a);
+        f.vault.withdraw_settlement(lote_id);
+        // indemnity = 1 CSPR * 120 / 200 = 600_000_000 motes
+        let expected_indemnity = U512::from(600_000_000u64);
+        assert_eq!(
+            f.env.balance_of(&signer_a),
+            a_before + U512::from(120 * ONE_CSPR) + expected_indemnity
+        );
+        assert_eq!(f.pool.reserve(), pool_before);
+    }
+
+    // ── Ronda 2 audit: bps=0 → indemnity=0 ──────────────────────────
+
+    /// Con indemnity_target_bps=0 al FUNDED, lote_target=0.
+    /// settle_failure: indemnity=0, excess=bond (surplus vault).
+    /// Compradores reciben SOLO refund, sin indemnización.
+    #[test]
+    fn bps_zero_target_zero_indemnity_zero() {
+        let mut f = setup_integration(0, 0); // sin target
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+        let bond = U512::from(50 * ONE_CSPR);
+
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+
+        // lote_target snapshot = 0 (bps=0 al FUNDED).
+        assert_eq!(f.vault.lote_target(lote_id), U512::zero());
+
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_EVAL_FAIL);
+
+        let reserved_before = f.vault.reserved_lote_balance();
+
+        f.vault.settle_failure(lote_id);
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
+
+        // C-2: indemnity = min(bond=50, lote_target=0) = 0.
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), U512::zero());
+        // Tail = 0.
+        assert_eq!(f.vault.lote_tail(lote_id), U512::zero());
+        // Excess = bond - 0 = 50 CSPR liberado.
+        assert_eq!(
+            f.vault.reserved_lote_balance(),
+            reserved_before - U512::from(50 * ONE_CSPR)
+        );
+
+        // Buyer A: refund=60, indemnity=0 → recibe 60 CSPR.
+        let a_before = f.env.balance_of(&signer_a);
+        f.env.set_caller(signer_a);
+        f.vault.withdraw_settlement(lote_id);
+        assert_eq!(
+            f.env.balance_of(&signer_a),
+            a_before + U512::from(60 * ONE_CSPR)
+        );
+
+        // Buyer B: refund=40, indemnity=0 → recibe 40 CSPR.
+        let b_before = f.env.balance_of(&buyer_b);
+        f.env.set_caller(buyer_b);
+        f.vault.withdraw_settlement(lote_id);
+        assert_eq!(
+            f.env.balance_of(&buyer_b),
+            b_before + U512::from(40 * ONE_CSPR)
+        );
+    }
+
+    // ── Ronda 2 audit: conservación en bps=0 ─────────────────────────
+
+    /// Σ(refund + indemnity) + excess liberado == funded + bond (bps=0).
+    #[test]
+    fn conservation_bps_zero_after_fail() {
+        let mut f = setup_integration(0, 0);
+
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let (vc_addr, chain_id) = vault_domain_integration(&f);
+        let (_sk, pk, sig, signer_a) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, u64::MAX);
+        let buyer_b = f.env.get_account(9);
+        let funded = U512::from(100 * ONE_CSPR);
+        let bond = U512::from(50 * ONE_CSPR);
+
+        setup_eval_fail_integration(
+            &mut f, lote_id, producer,
+            signer_a, buyer_b,
+            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            bond,
+        );
+
+        f.env.set_caller(f.operator);
+        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+        f.env.set_caller(f.admin);
+        f.vault.evaluate_lote(lote_id);
+
+        let reserved_before_settle = f.vault.reserved_lote_balance();
+        f.vault.settle_failure(lote_id);
+
+        // Indemnity=0, excess=bond=50.
+        let excess = U512::from(50 * ONE_CSPR);
+        assert_eq!(
+            f.vault.reserved_lote_balance(),
+            reserved_before_settle - excess
+        );
+
+        // Conservación: Σ(refund=100) + Σ(indemnity=0) + excess(50) == funded(100)+bond(50)=150
+        let refund_total = funded;
+        let indemnity_total = U512::zero();
+        let total_accounted = refund_total
+            .checked_add(indemnity_total)
+            .unwrap()
+            .checked_add(excess)
+            .unwrap();
+        assert_eq!(
+            total_accounted,
+            funded.checked_add(bond).unwrap()
+        );
+
+        // Withdraw ambos
+        f.env.set_caller(signer_a);
+        f.vault.withdraw_settlement(lote_id);
+        f.env.set_caller(buyer_b);
+        f.vault.withdraw_settlement(lote_id);
+
+        // INV: self_balance >= reserved
+        let vault_balance = f.env.balance_of(&f.vault);
+        let reserved = f.vault.reserved_lote_balance();
+        assert!(
+            vault_balance >= reserved,
+            "self_balance({}) < reserved({})",
+            vault_balance,
+            reserved
+        );
+    }
+
+    // ── Ronda 2 audit: getter lote_target ────────────────────────────
+
+    #[test]
+    fn lote_target_defaults_to_zero() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let _funded = U512::from(ONE_CSPR);
+        let _bond = U512::from(ONE_CSPR);
+
+        // Sin fundear: lote_target defaults to zero.
+        open_lote(&mut f, 1, producer);
+        assert_eq!(f.contract.lote_target(1), U512::zero());
+
+        // Fundea el lote con bps=0 (default).
+        let buyer = f.env.get_account(8);
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .post_bond(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        // Con bps=0: lote_target = 0.
+        assert_eq!(f.contract.lote_target(1), U512::zero());
     }
 
     // ── Helpers for integration tests ───────────────────────────────
