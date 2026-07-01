@@ -3,8 +3,9 @@
 //! Corre el ciclo completo de un lote que falla, con atestación negativa firmada
 //! Ed25519 off-chain por el comprador y relayada por el admin:
 //!   open_lote(admin) -> deposit_to_lote(buyer,$) -> post_bond(producer,$)
-//!   -> lock_lote(admin) [FUNDED] -> sleep(attestation_window)
-//!   -> firma negativa Ed25519 off-chain -> verify_attestation(admin relay)
+//!   -> lock_lote(admin) [FUNDED] -> firma negativa Ed25519 off-chain
+//!   -> verify_attestation(admin relay, DENTRO de la ventana)
+//!   -> sleep(attestation_window) [cerrar la ventana]
 //!   -> evaluate_lote(admin) [EVAL_FAIL] -> settle_failure(admin) [SETTLED_FAIL]
 //!   -> withdraw_settlement(buyer) [refund + indemnity]
 //!
@@ -109,16 +110,13 @@ fn main() {
     println!("   lote_state = {} (FUNDED)", vault.lote_state(LOTE_ID));
     println!("   lote_funded_at = {}", vault.lote_funded_at(LOTE_ID));
 
-    // 5. ESPERAR la ventana de atestacion.
-    //    Sleep on the client side (std::thread::sleep) so that the next
-    //    block time on-chain exceeds funded_at + attestation_window_ms.
-    let sleep_ms = attestation_window_ms + 10_000; // window + 10s buffer
-    println!("\nWaiting {} ms for attestation window to close...", sleep_ms);
-    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-    println!("Done waiting.");
-
-    // 6. ATESTACION NEGATIVA (gasless): el comprador firma off-chain;
-    //    el admin relaya pagando el gas.
+    // 5. ATESTACION NEGATIVA (gasless), DENTRO de la ventana (now < deadline).
+    //    ORDEN CRITICO (gate del pase holistico W2-4): verify_attestation exige
+    //    state==FUNDED && now < funded_at+window. Por eso se atesta AQUI (justo
+    //    tras lock, aun dentro de la ventana); RECIEN DESPUES se duerme para
+    //    cerrar la ventana y poder evaluar. Atestar tras dormir revertiria
+    //    AttestationWindowClosed.
+    //    El comprador firma off-chain; el admin relaya pagando el gas.
     println!("\n-- Atestacion negativa off-chain --");
 
     // Load buyer's Ed25519 secret key from file.
@@ -180,6 +178,14 @@ fn main() {
     );
     println!("   verify_attestation returned: {ok}");
     println!("   tally_negative = {}", vault.lote_tally_negative(LOTE_ID));
+
+    // 6. ESPERAR a que la ventana CIERRE (now >= funded_at + window) para poder
+    //    evaluar. evaluate_lote exige now >= deadline; verify_attestation exigia
+    //    now < deadline — por eso el sleep va DESPUES de atestar.
+    let sleep_ms = attestation_window_ms + 10_000; // window + 10s buffer
+    println!("\nWaiting {} ms for attestation window to close...", sleep_ms);
+    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+    println!("Done waiting.");
 
     // 7. evaluate_lote — parametric trigger (negative tally >= quorum).
     step(&env, admin, "evaluate_lote -> EVAL_FAIL");
