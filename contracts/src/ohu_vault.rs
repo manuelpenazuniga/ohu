@@ -1050,8 +1050,9 @@ impl OhuVault {
     ///   (= funded * indemnity_target_bps / 10000). Feedback inmediato si
     ///   el bono no cubre la máxima exposición (C-1, §4.1).
     ///
-    /// Transición a FUNDED si además `lote_funded[lote_id] > 0` y
-    /// `bond >= target(funded_final)`.
+    /// NO transiciona a FUNDED: el estado queda OPEN. La transición
+    /// OPEN→FUNDED la dispara el operador/admin vía `lock_lote` (W2-3 ronda 3,
+    /// cierra el griefing de FUNDED-ansiosa).
     #[odra(payable)]
     pub fn post_bond(&mut self, lote_id: u64) {
         let caller = self.env().caller();
@@ -3529,7 +3530,7 @@ mod tests {
     }
 
     #[test]
-    fn post_bond_transitions_to_funded_when_funded_gt_zero() {
+    fn post_bond_then_lock_lote_transitions_to_funded() {
         let mut f = simple_setup();
         let producer = f.env.get_account(7);
         let buyer = f.env.get_account(8);
