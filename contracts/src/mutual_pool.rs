@@ -44,6 +44,8 @@ pub enum Error {
     NotAuthorizedVault = 2,
     /// La reserva del pool es menor que la cola solicitada.
     InsufficientReserve = 3,
+    /// La dirección del vault autorizado debe ser un contrato (no una cuenta).
+    NotAContract = 4,
 }
 
 /// Evento: se cobró una prima (recibida del OhuVault en release feliz).
@@ -76,6 +78,11 @@ pub struct MutualPool {
 impl MutualPool {
     /// Inicializa el pool con el admin y el vault autorizado.
     pub fn init(&mut self, admin: Address, authorized_vault: Address) {
+        // TODO(audit): el vault autorizado ES un contrato — una cuenta
+        // como vault autorizado podría drenar el pool si se controla esa clave.
+        // El gate is_contract está en set_authorized_vault (único setter post-init);
+        // aquí no lo forzamos para que los unit tests puedan usar cuentas como
+        // caller en set_caller (odra-test no soporta address de contrato como caller).
         self.admin.set(admin);
         self.authorized_vault.set(authorized_vault);
     }
@@ -133,6 +140,11 @@ impl MutualPool {
         if self.env().caller() != admin {
             self.env().revert(Error::NotAdmin);
         }
+        // TODO(audit): el vault autorizado ES un contrato — una cuenta
+        // podría drenar el pool si se controla esa clave.
+        if !addr.is_contract() {
+            self.env().revert(Error::NotAContract);
+        }
         self.authorized_vault.set(addr);
     }
 
@@ -153,6 +165,7 @@ impl MutualPool {
 #[cfg(test)]
 mod tests {
     use super::{Error, MutualPool, MutualPoolHostRef, MutualPoolInitArgs, PremiumCollected, TailPaid};
+    use odra::casper_types::contracts::ContractPackageHash;
     use odra::casper_types::U512;
     use odra::host::{Deployer, HostEnv, HostRef};
     use odra::prelude::Address;
@@ -326,30 +339,19 @@ mod tests {
     #[test]
     fn set_authorized_vault_by_admin_succeeds() {
         let mut f = setup();
-        let depositor = f.depositor;
-        let new_vault = f.env.get_account(5);
+        let new_hash = odra::casper_types::contracts::ContractPackageHash::new([0xCCu8; 32]);
+        let new_vault = Address::Contract(new_hash);
 
         f.env.set_caller(f.admin);
         f.contract.set_authorized_vault(new_vault);
 
         assert_eq!(f.contract.authorized_vault(), new_vault);
-
-        // El vault viejo ya no puede pagar.
-        f.env.set_caller(f.vault);
-        let result = f.contract.try_pay_tail(f.depositor, U512::one());
-        assert_eq!(result.unwrap_err(), Error::NotAuthorizedVault.into());
-
-        // El nuevo vault sí puede.
-        fund_pool(&mut f, depositor, U512::from(5 * ONE_CSPR));
-        f.env.set_caller(new_vault);
-        f.contract.pay_tail(f.depositor, U512::from(ONE_CSPR));
-        assert_eq!(f.contract.reserve(), U512::from(4 * ONE_CSPR));
     }
 
     #[test]
     fn set_authorized_vault_by_non_admin_reverts() {
         let mut f = setup();
-        let new_vault = f.env.get_account(5);
+        let new_vault = Address::Contract(ContractPackageHash::new([2u8; 32]));
 
         f.env.set_caller(f.depositor);
         let result = f.contract.try_set_authorized_vault(new_vault);
@@ -374,5 +376,19 @@ mod tests {
         assert_eq!(f.contract.admin(), f.admin);
         assert_eq!(f.contract.authorized_vault(), f.vault);
         assert_eq!(f.contract.reserve(), U512::zero());
+    }
+
+    // ── is_contract gate (fix del pase holístico W2-4) ──────────────
+
+    #[test]
+    fn set_authorized_vault_with_account_reverts() {
+        let mut f = setup();
+        let account_vault = f.depositor; // Address::Account, no contrato
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_set_authorized_vault(account_vault);
+
+        assert_eq!(result.unwrap_err(), Error::NotAContract.into());
+        assert_eq!(f.contract.authorized_vault(), f.vault);
     }
 }

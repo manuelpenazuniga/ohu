@@ -177,6 +177,11 @@ pub enum Error {
     /// El lote no está listo para transicionar a FUNDED: `funded == 0` o
     /// `bond == 0`. El lote necesita al menos un depósito y un bono.
     LoteNotReadyToFund = 63,
+    /// La ventana de atestación ya cerró (`now >= lote_funded_at + window`):
+    /// no se aceptan más atestaciones (fix del pase holístico W2-4).
+    AttestationWindowClosed = 64,
+    /// La dirección debe ser un contrato (no una cuenta).
+    NotAContract = 65,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -844,6 +849,26 @@ impl OhuVault {
         // W2-0: valid_before va DENTRO del mensaje firmado (binding).
         if self.env().get_block_time() >= valid_before {
             self.env().revert(Error::AttestationExpired);
+        }
+
+        // Gate 2b (fix del pase holístico): solo se atesta con el lote FUNDED y
+        // DENTRO de la ventana de atestación. Sin esto, un comprador podía atestar
+        // estando OPEN (share NO final aún) y el tally registraba un peso incorrecto
+        // e inmutable (anti-replay lo congela) → evaluate_lote resolvía mal. También
+        // rechaza atestaciones tardías (tras el deadline) que compiten con evaluate.
+        let state = self.lote_state.get_or_default(&lote_id);
+        if state != LOTE_STATE_FUNDED {
+            self.env().revert(Error::LoteNotFunded);
+        }
+        let funded_at = self.lote_funded_at.get_or_default(&lote_id);
+        let window = self
+            .attestation_window_ms
+            .get_or_revert_with(Error::NotInitialized);
+        let deadline = funded_at
+            .checked_add(window)
+            .unwrap_or_else(|| self.env().revert(Error::Overflow));
+        if self.env().get_block_time() >= deadline {
+            self.env().revert(Error::AttestationWindowClosed);
         }
 
         // Gate 3: autorización (S3 #1) — el firmante debe ser comprador del lote.
@@ -1796,6 +1821,10 @@ impl OhuVault {
         let admin = self.admin.get_or_revert_with(Error::NotInitialized);
         if self.env().caller() != admin {
             self.env().revert(Error::NotAdmin);
+        }
+        // TODO(audit): el pool ES un contrato — setear una cuenta bloquearía releases.
+        if !addr.is_contract() {
+            self.env().revert(Error::NotAContract);
         }
         self.mutual_pool.set(addr);
     }
@@ -2880,6 +2909,24 @@ mod tests {
         }
     }
 
+    /// Fondea y cierra el lote: el producer (account(7)) postea un bono
+    /// y el admin ejecuta lock_lote, dejando el lote en estado FUNDED.
+    /// El bono es >= funded (cubre cualquier indemnity_target_bps ≤ 10000).
+    fn fund_and_lock(f: &mut Fixture, lote_id: u64) {
+        let producer = f.env.get_account(7);
+        let funded = f.contract.lote_funded(lote_id);
+        let bond = if funded > U512::zero() {
+            funded
+        } else {
+            U512::from(ONE_CSPR)
+        };
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(lote_id);
+        f.env.set_caller(f.admin);
+        f.contract.lock_lote(lote_id);
+        assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_FUNDED);
+    }
+
     // ── Positivos ────────────────────────────────────────────────────
 
     #[test]
@@ -2894,6 +2941,7 @@ mod tests {
             sign_attestation(lote_id, nonce, received, vc_addr, chain_id, u64::MAX);
 
         ensure_buyer(&mut f, lote_id, signer, 10);
+        fund_and_lock(&mut f, lote_id);
         f.env.set_caller(f.operator);
         let result = f
             .contract
@@ -2920,6 +2968,7 @@ mod tests {
             sign_attestation(2, 1, false, vc_addr, chain_id, u64::MAX);
 
         ensure_buyer(&mut f, 2, signer, 10);
+        fund_and_lock(&mut f, 2);
         f.env.set_caller(f.operator);
         let ok = f
             .contract
@@ -2951,6 +3000,7 @@ mod tests {
             sign_attestation(lote_id, 1, true, vc_addr, chain_id, u64::MAX);
 
         ensure_buyer(&mut f, lote_id, signer2, 10);
+        fund_and_lock(&mut f, lote_id);
         f.env.set_caller(f.operator);
         assert!(f.contract.verify_attestation(lote_id, 1, true, u64::MAX, pk1, sig1));
         assert!(f.contract.verify_attestation(lote_id, 1, true, u64::MAX, pk2, sig2));
@@ -2969,6 +3019,8 @@ mod tests {
 
         ensure_buyer(&mut f, 1, signer, 10);
         ensure_buyer(&mut f, 2, signer, 10);
+        fund_and_lock(&mut f, 1);
+        fund_and_lock(&mut f, 2);
         // Firma ambos lotes.
         let sig_a = sign_second(&sk, 1, 1, true, vc_addr, chain_id, u64::MAX);
         let sig_b = sign_second(&sk, 2, 2, true, vc_addr, chain_id, u64::MAX);
@@ -2993,6 +3045,8 @@ mod tests {
 
         ensure_buyer(&mut f, 1, signer, 10);
         ensure_buyer(&mut f, 2, signer, 10);
+        fund_and_lock(&mut f, 1);
+        fund_and_lock(&mut f, 2);
         let sig1 = sign_second(&sk, 1, 1, true, vc_addr, chain_id, u64::MAX);
         let sig2 = sign_second(&sk, 2, 100, true, vc_addr, chain_id, u64::MAX);
 
@@ -3012,6 +3066,7 @@ mod tests {
             sign_attestation(1, 3, true, vc_addr, chain_id, u64::MAX);
 
         ensure_buyer(&mut f, 1, s2, 10);
+        fund_and_lock(&mut f, 1);
         f.env.set_caller(f.operator);
         assert!(f.contract.verify_attestation(1, 3, true, u64::MAX, pk1, sig1));
         assert!(f.contract.verify_attestation(1, 3, true, u64::MAX, pk2, sig2));
@@ -3101,6 +3156,7 @@ mod tests {
         let (sk, pk, _, signer) =
             sign_attestation(1, 5, true, vc_addr, chain_id, u64::MAX);
         ensure_buyer(&mut f, 1, signer, 10);
+        fund_and_lock(&mut f, 1);
         let sig = sign_second(&sk, 1, 5, true, vc_addr, chain_id, u64::MAX);
 
         f.env.set_caller(f.operator);
@@ -3181,6 +3237,11 @@ mod tests {
         let (_sk, pk_bytes, sig_bytes, _signer) =
             sign_attestation(lote_id, 1, true, vc_addr, chain_id, valid_before);
 
+        // El lote debe estar FUNDED (gate 2b) pero el firmante NO es comprador.
+        let other_buyer = f.env.get_account(10);
+        ensure_buyer(&mut f, lote_id, other_buyer, 5);
+        fund_and_lock(&mut f, lote_id);
+
         f.env.set_caller(f.operator);
         let result = f
             .contract
@@ -3202,6 +3263,7 @@ mod tests {
             sign_attestation(lote_id, 1, true, vc_addr, chain_id, valid_before);
 
         ensure_buyer(&mut f, lote_id, signer, 10);
+        fund_and_lock(&mut f, lote_id);
 
         // Avanzar el reloj para que now >= valid_before.
         f.env.advance_block_time(valid_before);
@@ -3238,6 +3300,7 @@ mod tests {
         let (_sk_c, pk_c, sig_c, signer_c) =
             sign_attestation(lote_id, 3, true, vc_addr, chain_id, valid_before);
         ensure_buyer(&mut f, lote_id, signer_c, 5);
+        fund_and_lock(&mut f, lote_id);
 
         f.env.set_caller(f.operator);
 
@@ -3271,6 +3334,7 @@ mod tests {
         let (_sk, pk_bytes, sig_bytes, signer) =
             sign_attestation(lote_id, 1, false, vc_addr, chain_id, valid_before);
         ensure_buyer(&mut f, lote_id, signer, 4);
+        fund_and_lock(&mut f, lote_id);
 
         f.env.set_caller(f.operator);
         let result = f
@@ -3287,6 +3351,92 @@ mod tests {
             f.contract.lote_tally_positive(lote_id),
             U512::zero()
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Tests nuevos del pase holístico (W2-4): gate de estado/ventana
+    // ════════════════════════════════════════════════════════════════
+
+    /// Atestar con el lote OPEN (sin lock) → LoteNotFunded.
+    #[test]
+    fn attestation_lote_open_reverts_lote_not_funded() {
+        let mut f = setup();
+        let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let valid_before = u64::MAX;
+
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id, valid_before);
+        ensure_buyer(&mut f, lote_id, signer, 10);
+        // Lote queda OPEN: sin fund_and_lock.
+
+        f.env.set_caller(f.operator);
+        let result = f
+            .contract
+            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+
+        assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
+    }
+
+    /// Atestar tras cerrar la ventana → AttestationWindowClosed.
+    #[test]
+    fn attestation_window_closed_reverts() {
+        let mut f = setup(); // attestation_window_ms = 86_400_000
+        let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let valid_before = u64::MAX;
+
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(lote_id, 1, true, vc_addr, chain_id, valid_before);
+        ensure_buyer(&mut f, lote_id, signer, 10);
+        fund_and_lock(&mut f, lote_id);
+
+        // Avanzar más allá de la ventana
+        f.env.advance_block_time(f.attestation_window_ms + 1);
+
+        f.env.set_caller(f.operator);
+        let result = f
+            .contract
+            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+
+        assert_eq!(result.unwrap_err(), Error::AttestationWindowClosed.into());
+    }
+
+    /// Regresión del bug de GPT: el peso se registra con la share FINAL.
+    /// El comprador atesta DESPUÉS del lock: el tally = su share completa.
+    #[test]
+    fn attestation_weight_uses_final_share_after_lock() {
+        let mut f = setup();
+        let lote_id = 1u64;
+        let (vc_addr, chain_id) = vault_domain(&f);
+        let valid_before = u64::MAX;
+
+        let (_sk, pk_bytes, sig_bytes, signer) =
+            sign_attestation(lote_id, 1, false, vc_addr, chain_id, valid_before);
+        ensure_buyer(&mut f, lote_id, signer, 10);
+        fund_and_lock(&mut f, lote_id);
+
+        // Atestar DESPUÉS del lock (lote FUNDED, share final = 10 CSPR).
+        f.env.set_caller(f.operator);
+        assert!(f.contract.verify_attestation(
+            lote_id, 1, false, valid_before, pk_bytes, sig_bytes
+        ));
+
+        // El tally registra la share FINAL (10 CSPR), no el peso parcial.
+        assert_eq!(
+            f.contract.lote_tally_negative(lote_id),
+            U512::from(10 * ONE_CSPR)
+        );
+    }
+
+    /// set_mutual_pool con una cuenta (no contrato) → NotAContract.
+    #[test]
+    fn set_mutual_pool_with_account_reverts() {
+        let mut f = setup();
+        let an_account = f.recipient; // Address::Account
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_set_mutual_pool(an_account);
+        assert_eq!(result.unwrap_err(), Error::NotAContract.into());
     }
 
     // ===============================================================
