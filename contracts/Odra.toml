@@ -1,2 +1,5 @@
 [[contracts]]
+fqn = "mutual_pool::MutualPool"
+
+[[contracts]]
 fqn = "ohu_vault::OhuVault"
