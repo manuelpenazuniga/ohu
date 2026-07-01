@@ -174,6 +174,9 @@ pub enum Error {
     /// El depósito haría que el target de indemnización supere el bono ya
     /// posteado (funding lock). Reducir el depósito o aumentar el bono.
     FundingExceedsBond = 62,
+    /// El lote no está listo para transicionar a FUNDED: `funded == 0` o
+    /// `bond == 0`. El lote necesita al menos un depósito y un bono.
+    LoteNotReadyToFund = 63,
 }
 
 /// Evento: fondos depositados en el vault.
@@ -1031,9 +1034,6 @@ impl OhuVault {
             buyer,
             amount,
         });
-
-        // Transición a FUNDED si el bono ya fue depositado.
-        self.try_transition_to_funded(lote_id);
     }
 
     /// El productor del lote deposita su bono de cumplimiento.
@@ -1114,57 +1114,57 @@ impl OhuVault {
             producer: caller,
             amount,
         });
-
-        // Transición a FUNDED si ya hay fondeo.
-        self.try_transition_to_funded(lote_id);
     }
 
-    /// Intenta la transición OPEN → FUNDED cuando tanto el bono como el
-    /// fondeo del lote son > 0 Y `bond >= target(funded_final)`.
+    /// El operador o admin cierra el lote explícitamente (fix Ronda 3:
+    /// cierra griefing de "FUNDED ansiosa"). La transición OPEN→FUNDED
+    /// YA NO es automática: solo el operador/admin, que conoce el roster
+    /// legítimo, la dispara. Así un depósito-polvo no fuerza FUNDED y
+    /// el griefer queda como minoría irrelevante.
     ///
-    /// C-1 (audit, garantía dura): la transición a FUNDED exige que el
-    /// bono cubra la indemnización máxima (target = funded * bps / 10000).
-    /// Funded puede crecer con depósitos mientras OPEN, por eso el target
-    /// se calcula con el funded FINAL (al momento de la transición).
+    /// Gates:
+    /// - caller ∈ {admin, operator} (NotAdminNorOperator).
+    /// - lote en estado OPEN (LoteNotOpen).
+    /// - bond > 0 && funded > 0 (LoteNotFunded).
+    /// - bond >= target(funded) (BondBelowMinimum, C-1).
     ///
-    /// Fix 3b (snapshot): guarda `lote_target[lote]` = target al momento
-    /// de FUNDED. Esto inmuniza lotes fondeados contra cambios de
-    /// `indemnity_target_bps` por governance (settle_failure usa el snapshot,
-    /// no el bps actual).
+    /// Calcula target = funded * indemnity_target_bps / 10000 y guarda el
+    /// snapshot en lote_target. Transiciona a FUNDED y emite LoteFunded.
     ///
     /// INV-7: solo opera sobre el lote indicado; no cruza contabilidad
     /// entre lotes.
-    fn try_transition_to_funded(&mut self, lote_id: u64) {
+    pub fn lock_lote(&mut self, lote_id: u64) {
+        let caller = self.env().caller();
+        let admin = self.admin.get_or_revert_with(Error::NotInitialized);
+        let operator = self.operator.get_or_revert_with(Error::NotInitialized);
+        if caller != admin && caller != operator {
+            self.env().revert(Error::NotAdminNorOperator);
+        }
+
         let state = self.lote_state.get_or_default(&lote_id);
         if state != LOTE_STATE_OPEN {
-            return;
+            self.env().revert(Error::LoteNotOpen);
         }
+
         let bond = self.lote_bond.get_or_default(&lote_id);
         let funded = self.lote_funded.get_or_default(&lote_id);
         if bond == U512::zero() || funded == U512::zero() {
-            return;
+            self.env().revert(Error::LoteNotReadyToFund);
         }
 
-        // C-1 (audit): garantía dura — el bono debe cubrir el target de
-        // indemnización con el funded FINAL.
         let indemnity_bps = self.indemnity_target_bps.get_or_default();
-        // target se computa siempre (incluyendo bps=0 → target=0)
-        // para el snapshot y para que el gate duro funcione consistentemente.
         let target = funded
             .checked_mul(U512::from(indemnity_bps))
             .unwrap_or_else(|| self.env().revert(Error::Overflow))
             .checked_div(U512::from(10000u64))
             .unwrap_or_else(|| self.env().revert(Error::Overflow));
-        if indemnity_bps > 0 && bond < target {
-            // C-1: bono insuficiente, el lote NO transiciona (queda OPEN).
-            return;
+        if bond < target {
+            self.env().revert(Error::BondBelowMinimum);
         }
 
         self.lote_state.set(&lote_id, LOTE_STATE_FUNDED);
         self.lote_funded_at
             .set(&lote_id, self.env().get_block_time());
-        // Fix 3b: snapshot del target al FUNDED para inmunidad contra
-        // cambios de governance post-FUNDED.
         self.lote_target.set(&lote_id, target);
         self.env().emit_event(LoteFunded { lote_id });
     }
@@ -3492,6 +3492,8 @@ mod tests {
         f.contract
             .with_tokens(U512::from(5 * ONE_CSPR))
             .post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         // Ahora depositar a un lote FUNDED revierte.
@@ -3545,6 +3547,8 @@ mod tests {
         f.contract
             .with_tokens(U512::from(5 * ONE_CSPR))
             .post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
 
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
         assert!(f.env.emitted_event(&f.contract, LoteFunded { lote_id: 1 }));
@@ -3570,6 +3574,8 @@ mod tests {
         f.contract
             .with_tokens(U512::from(2 * ONE_CSPR))
             .deposit_to_lote(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
 
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
         assert!(f.env.emitted_event(&f.contract, LoteFunded { lote_id: 1 }));
@@ -3667,6 +3673,8 @@ mod tests {
         f.contract.with_tokens(amount).deposit_to_lote(1);
         f.env.set_caller(producer);
         f.contract.with_tokens(bond).post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
 
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
         assert_eq!(f.contract.lote_producer(1), producer);
@@ -3795,6 +3803,8 @@ mod tests {
         f.contract
             .with_tokens(U512::from(5 * ONE_CSPR))
             .post_bond(2);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(2);
         assert_eq!(f.contract.lote_state(2), LOTE_STATE_FUNDED);
 
         // Lote 1 NO fue arrastrado a FUNDED por el evento del lote 2
@@ -3854,6 +3864,12 @@ mod tests {
         for i in 0..3u64 {
             f.env.set_caller(p[i as usize]);
             f.contract.with_tokens(bonds[i as usize]).post_bond(i + 1);
+        }
+
+        // Lock all lotes
+        for i in 0..3u64 {
+            f.env.set_caller(f.operator);
+            f.contract.lock_lote(i + 1);
         }
 
         // Verifica aislamiento total
@@ -3940,6 +3956,8 @@ mod tests {
         f.contract.with_tokens(funded_amount).deposit_to_lote(lote_id);
         f.env.set_caller(producer);
         f.contract.with_tokens(bond_amount).post_bond(lote_id);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(lote_id);
         assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_FUNDED);
     }
 
@@ -4088,6 +4106,8 @@ mod tests {
         f.contract.with_tokens(funded).deposit_to_lote(1);
         f.env.set_caller(producer);
         f.contract.with_tokens(bond).post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         // Sin atestaciones → silencio=recibido → evaluate_lote da EVAL_OK.
@@ -4764,6 +4784,8 @@ mod tests {
 
         f.env.set_caller(producer);
         f.contract.with_tokens(bond).post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         f.env.set_caller(f.operator);
@@ -4803,6 +4825,8 @@ mod tests {
 
         f.env.set_caller(producer);
         f.contract.with_tokens(bond).post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         f.env.set_caller(f.operator);
@@ -4987,6 +5011,8 @@ mod tests {
 
         f.env.set_caller(producer);
         f.contract.with_tokens(bond).post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         f.env.set_caller(f.operator);
@@ -5021,6 +5047,8 @@ mod tests {
         f.contract
             .with_tokens(U512::from(ONE_CSPR))
             .post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
 
         let funded_at = f.contract.lote_funded_at(1);
         assert!(funded_at >= 2_000, "funded_at should be at least 2000, got {}", funded_at);
@@ -5135,6 +5163,8 @@ mod tests {
 
         f.env.set_caller(producer);
         f.contract.with_tokens(bond).post_bond(lote_id);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(lote_id);
         assert_eq!(f.contract.lote_state(lote_id), LOTE_STATE_FUNDED);
 
         // Submit atestación negativa de A (60% → ≥ quorum 60%)
@@ -5332,6 +5362,8 @@ mod tests {
 
         f.env.set_caller(producer);
         f.contract.with_tokens(bond).post_bond(lote_id);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(lote_id);
 
         // Ambas atestaciones on-chain (la positiva de C NO reduce el tally negativo).
         f.env.set_caller(f.operator);
@@ -5646,6 +5678,8 @@ mod tests {
         f.vault.with_tokens(funded_amount).deposit_to_lote(lote_id);
         f.env.set_caller(producer);
         f.vault.with_tokens(bond_amount).post_bond(lote_id);
+        f.env.set_caller(f.admin);
+        f.vault.lock_lote(lote_id);
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
     }
 
@@ -5743,6 +5777,8 @@ mod tests {
         // Producer bond
         f.env.set_caller(producer);
         f.vault.with_tokens(bond).post_bond(lote_id);
+        f.env.set_caller(f.admin);
+        f.vault.lock_lote(lote_id);
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
 
         let funded = share_a.checked_add(share_b).unwrap();
@@ -6396,6 +6432,8 @@ mod tests {
         // Bond (>= target) → FUNDED
         f.env.set_caller(producer);
         f.vault.with_tokens(bond).post_bond(lote_id);
+        f.env.set_caller(f.admin);
+        f.vault.lock_lote(lote_id);
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
 
         // Negative attestation (60% → EVAL_FAIL)
@@ -6480,6 +6518,8 @@ mod tests {
         f.vault
             .with_tokens(U512::from(100 * ONE_CSPR))
             .deposit_to_lote(lote_id);
+        f.env.set_caller(f.admin);
+        f.vault.lock_lote(lote_id);
 
         // Llega a FUNDED (bono ≥ target).
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
@@ -6509,6 +6549,8 @@ mod tests {
         f.vault
             .with_tokens(U512::from(100 * ONE_CSPR))
             .deposit_to_lote(lote_id1);
+        f.env.set_caller(f.admin);
+        f.vault.lock_lote(lote_id1);
         assert_eq!(f.vault.lote_state(lote_id1), LOTE_STATE_FUNDED);
 
         // ── Lote 2: bond=80, depósito=126 → target=100 > bond=80 → revierte ──
@@ -6556,6 +6598,8 @@ mod tests {
         f.vault
             .with_tokens(U512::from(80 * ONE_CSPR))
             .post_bond(lote_id);
+        f.env.set_caller(f.admin);
+        f.vault.lock_lote(lote_id);
 
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_FUNDED);
     }
@@ -6809,10 +6853,250 @@ mod tests {
         f.contract
             .with_tokens(U512::from(ONE_CSPR))
             .post_bond(1);
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
 
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
         // Con bps=0: lote_target = 0.
         assert_eq!(f.contract.lote_target(1), U512::zero());
+    }
+
+    // ── Ronda 3: tests de lock_lote ──────────────────────────────────
+
+    #[test]
+    fn lock_lote_by_admin_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(funded).deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+
+        f.env.set_caller(f.admin);
+        f.contract.lock_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        assert_eq!(f.contract.lote_target(1), U512::zero());
+        assert!(f.env.emitted_event(&f.contract, LoteFunded { lote_id: 1 }));
+    }
+
+    #[test]
+    fn lock_lote_by_operator_succeeds() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(funded).deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+    }
+
+    #[test]
+    fn lock_lote_by_non_privileged_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(3 * ONE_CSPR))
+            .deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        // Random caller
+        f.env.set_caller(f.env.get_account(9));
+        let result = f.contract.try_lock_lote(1);
+        assert_eq!(result.unwrap_err(), Error::NotAdminNorOperator.into());
+    }
+
+    #[test]
+    fn lock_lote_bond_below_target_reverts() {
+        let mut f = setup_integration(0, 0); // bps=0 inicial
+        let lote_id = 1u64;
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+
+        f.env.set_caller(f.admin);
+        f.vault.open_lote(lote_id, producer);
+
+        f.env.set_caller(buyer);
+        f.vault
+            .with_tokens(U512::from(100 * ONE_CSPR))
+            .deposit_to_lote(lote_id);
+        f.env.set_caller(producer);
+        f.vault
+            .with_tokens(U512::from(30 * ONE_CSPR))
+            .post_bond(lote_id);
+
+        // Admin sube bps a 5000 post-funding. lock_lote verá target=50 > bond=30.
+        f.env.set_caller(f.admin);
+        f.vault.set_indemnity_target_bps(5000);
+
+        let result = f.vault.try_lock_lote(lote_id);
+        assert_eq!(result.unwrap_err(), Error::BondBelowMinimum.into());
+        assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_OPEN);
+    }
+
+    #[test]
+    fn lock_lote_with_zero_funded_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        // Solo bond, sin fundeo
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_lock_lote(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotReadyToFund.into());
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+    }
+
+    #[test]
+    fn lock_lote_with_zero_bond_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        // Solo fundeo, sin bono
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(3 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_lock_lote(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotReadyToFund.into());
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+    }
+
+    #[test]
+    fn lock_lote_on_already_funded_reverts() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        let funded = U512::from(3 * ONE_CSPR);
+        let bond = U512::from(5 * ONE_CSPR);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract.with_tokens(funded).deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract.with_tokens(bond).post_bond(1);
+        f.env.set_caller(f.admin);
+        f.contract.lock_lote(1);
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+
+        let result = f.contract.try_lock_lote(1);
+        assert_eq!(result.unwrap_err(), Error::LoteNotOpen.into());
+    }
+
+    #[test]
+    fn lock_lote_on_nonexistent_lote_reverts() {
+        let mut f = simple_setup();
+        f.env.set_caller(f.admin);
+        let result = f.contract.try_lock_lote(99);
+        assert_eq!(result.unwrap_err(), Error::LoteNotOpen.into());
+    }
+
+    #[test]
+    fn deposit_does_not_auto_transition_to_funded() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(ONE_CSPR))
+            .deposit_to_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_funded(1), U512::from(ONE_CSPR));
+    }
+
+    #[test]
+    fn post_bond_does_not_auto_transition_to_funded() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        let buyer = f.env.get_account(8);
+        open_lote(&mut f, 1, producer);
+
+        f.env.set_caller(buyer);
+        f.contract
+            .with_tokens(U512::from(2 * ONE_CSPR))
+            .deposit_to_lote(1);
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_funded(1), U512::from(2 * ONE_CSPR));
+        assert_eq!(f.contract.lote_bond(1), U512::from(5 * ONE_CSPR));
+    }
+
+    #[test]
+    fn deposit_of_one_mote_does_not_force_funded() {
+        let mut f = simple_setup();
+        let producer = f.env.get_account(7);
+        open_lote(&mut f, 1, producer);
+
+        // Griefer deposits 1 mote
+        let griefer = f.env.get_account(10);
+        f.env.set_caller(griefer);
+        f.contract
+            .with_tokens(U512::one())
+            .deposit_to_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
+        assert_eq!(f.contract.lote_funded(1), U512::one());
+
+        // Operator can still close with real roster later
+        let real_buyer = f.env.get_account(8);
+        f.env.set_caller(real_buyer);
+        f.contract
+            .with_tokens(U512::from(100 * ONE_CSPR))
+            .deposit_to_lote(1);
+
+        f.env.set_caller(producer);
+        f.contract
+            .with_tokens(U512::from(5 * ONE_CSPR))
+            .post_bond(1);
+
+        f.env.set_caller(f.operator);
+        f.contract.lock_lote(1);
+
+        assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
+        // Griefer's 1 mote is ~1% → cannot reach 60% quorum alone
+        let griefer_share = f.contract.lote_share(1, griefer);
+        let total_funded = f.contract.lote_funded(1);
+        assert!(griefer_share < total_funded);
+        assert!(griefer_share == U512::one());
     }
 
     // ── Helpers for integration tests ───────────────────────────────
