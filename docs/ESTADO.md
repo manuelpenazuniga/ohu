@@ -4,17 +4,21 @@
 > Ohu**, **qué está construido hoy**, **cómo trabajamos**, y **el roadmap**. Léelo primero; luego
 > profundiza en los documentos enlazados.
 >
-> **Última actualización:** 2026-06-30 · rama `main` @ `90b7521` (pusheado) ·
+> **Última actualización:** 2026-07-01 · rama `main` @ `031a7ec` (pusheado) ·
 > **Fase 0 CERRADA · Semana 1 CERRADA.** W1-0/W1-1/W1-2 + fix crítico de escrow-isolation (120 tests
 > verdes) **+ W1-3: OhuVault DESPLEGADO en Casper Testnet y un lote feliz LIQUIDADO E2E on-chain**
 > (deploy `b595b892…`, contrato `contract-833696c8…`; 5 cuentas nativas firmando el settlement M-de-N;
 > ver `infra/deployments/testnet.md`). La **auditoría de cierre GPT-5.5** había hallado un CRÍTICO
 > (purse compartido drenaba escrow earmarked) → **corregido y re-auditado en triple = PASA** (§7).
-> **Semana 2 EN CURSO (3/5):** **W2-0** atestación ponderada autorizada (cierra S3 #1/#2), **W2-1**
-> disparador paramétrico — **INV-2 activada** (el tally de atestaciones, no M-de-N, autoriza el release),
-> **W2-2** camino `SETTLED_FAIL` (refund + slash + indemnización, pull) — los 3 con **dual audit
-> Claude+Gemini = PASA** (GPT-5.5 sin cuota → cierre triple diferido). Falta W2-3 (`MutualPool`) + W2-4
-> (deploy + E2E fallido). **Pendiente menor:** multisig nativo admin (Parte B, no bloquea).
+> **Semana 2 EN CURSO (4/5):** **W2-0** atestación ponderada (S3 #1/#2), **W2-1** disparador paramétrico
+> — **INV-2 activada** (el tally, no M-de-N, autoriza el release), **W2-2** `SETTLED_FAIL` (refund+slash+
+> indemnización pull), **W2-3** `MutualPool` (prima + cola). **W2-3 con TRIPLE audit Claude+Gemini+GPT-5.5
+> = PASA tras 3 rondas de fix:** GPT (framing adversarial) halló un CRÍTICO económico —anillo con bono
+> de 1 mote drenaba el pool— que 176 tests verdes + la conservación NO vieron; el fix cerró el drenaje
+> pero introdujo un lock de fondos (ronda 2) y dejó vivo un griefing de FUNDED-ansiosa (ronda 3, cerrado
+> con `lock_lote`: solo el operador cierra la ventana). Falta **W2-4** (deploy + E2E del lote fallido) —
+> ⚠️ requiere **actualizar el tooling livenet** (`livenet_e2e.rs` debe llamar `lock_lote`; `livenet_deploy.rs`
+> tiene init args viejos). **Pendiente menor:** multisig nativo admin (Parte B, no bloquea).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
@@ -233,7 +237,7 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 | ~~`chain_id==0` no validado en `init`~~ | ✅ **CERRADO** | **W1-0** (`30e51c1`) |
 | ~~**CRÍTICO** — purse compartido: outflows genéricos (`route_micropayment`/`execute`) drenaban escrow earmarked (INV-1/INV-7)~~ | ✅ **CERRADO** (`reserved_lote_balance`, triple audit) | **fix `7e194fd`** |
 | ~~**W1-1** — audit de cierre con **GPT-5.5**~~ | ✅ **HECHO** (halló el crítico ↑) | `codex exec` |
-| **W1-1** — transición a FUNDED **demasiado ansiosa** + griefing 1-mote (3º deposita y excluye compradores) | 🔵 diseño, **inerte hoy** | **Sem 2** (umbral/roster/deadline) |
+| ~~**W1-1** — transición a FUNDED **demasiado ansiosa** + griefing 1-mote~~ | ✅ **CERRADO** — `lock_lote`: la ventana la cierra solo admin/operator, no un depósito (triple audit) | **W2-3 ronda 3** |
 | **Fondos atrapados** — refund de lote fallido | ✅ **CERRADO** vía `SETTLED_FAIL` + `withdraw_settlement` (pull). Falta refund de lote OPEN abandonado / FUNDED sin evaluar (timeout) | **W2-2** (resto Sem 2+) |
 | Operator puede crear lotes basura (ID squatting, no mueve fondos) | 🔵 bajo | Sem 2+ |
 | Rotación/recuperación de approvers (inmutables; pérdida de clave congela M) | 🟠 gobierno | Sem 2+ |
