@@ -18,15 +18,13 @@
 > (deploy `b595b892…`, contrato `contract-833696c8…`; 5 cuentas nativas firmando el settlement M-de-N;
 > ver `infra/deployments/testnet.md`). La **auditoría de cierre GPT-5.5** había hallado un CRÍTICO
 > (purse compartido drenaba escrow earmarked) → **corregido y re-auditado en triple = PASA** (§7).
-> **Semana 2 EN CURSO (4/5):** **W2-0** atestación ponderada (S3 #1/#2), **W2-1** disparador paramétrico
+> **Semana 2 CERRADA (5/5):** **W2-0** atestación ponderada (S3 #1/#2), **W2-1** disparador paramétrico
 > — **INV-2 activada** (el tally, no M-de-N, autoriza el release), **W2-2** `SETTLED_FAIL` (refund+slash+
-> indemnización pull), **W2-3** `MutualPool` (prima + cola). **W2-3 con TRIPLE audit Claude+Gemini+GPT-5.5
-> = PASA tras 3 rondas de fix:** GPT (framing adversarial) halló un CRÍTICO económico —anillo con bono
-> de 1 mote drenaba el pool— que 176 tests verdes + la conservación NO vieron; el fix cerró el drenaje
-> pero introdujo un lock de fondos (ronda 2) y dejó vivo un griefing de FUNDED-ansiosa (ronda 3, cerrado
-> con `lock_lote`: solo el operador cierra la ventana). Falta **W2-4** (deploy + E2E del lote fallido) —
-> ⚠️ requiere **actualizar el tooling livenet** (`livenet_e2e.rs` debe llamar `lock_lote`; `livenet_deploy.rs`
-> tiene init args viejos). **Pendiente menor:** multisig nativo admin (Parte B, no bloquea).
+> indemnización pull), **W2-3** `MutualPool` (prima + cola; **TRIPLE audit tras 3 rondas de fix** — GPT
+> adversarial halló un crítico económico que 176 tests verdes no vieron), **W2-4** deploy v2 + ambos E2E
+> on-chain (ver arriba). **Próximo: plan de victoria** (`docs/plan/auditoria-y-plan-de-victoria.md`):
+> P0-2 README EN, P0-5 relabel EIP-712, P1 capa agéntica + dashboard. **Pendiente menor:** multisig
+> nativo admin (Parte B, no bloquea).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
