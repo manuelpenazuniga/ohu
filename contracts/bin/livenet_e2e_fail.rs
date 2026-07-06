@@ -45,9 +45,14 @@ fn step(env: &HostEnv, caller: Address, label: &str) {
 fn main() {
     let env = odra_casper_livenet_env::env();
 
-    let buyer = env.get_account(0);
+    // Índices de ODRA_CASPER_LIVENET_KEY_*: 0=deployer(secp256k1), 1=admin,
+    // 2=approver0, 3=approver1, 4=producer.
+    // buyer = approver0 (Ed25519, para poder FIRMAR la atestación; el deployer es
+    // secp256k1 y no sirve). producer = get_account(4) (no privilegiado; approver0
+    // seria rechazado por open_lote con ProducerIsPrivileged).
+    let buyer = env.get_account(2);
     let admin = env.get_account(1);
-    let producer = env.get_account(2);
+    let producer = env.get_account(4);
 
     let vault_pkg = std::env::var("OHUVAULT_PACKAGE_HASH")
         .expect("Missing OHUVAULT_PACKAGE_HASH");

@@ -30,7 +30,12 @@ command -v wasm-opt >/dev/null || { echo "ERROR: falta binaryen (wasm-opt). brew
 [ -f "$REPO_ROOT/.env" ] || { echo "ERROR: falta .env en la raíz (ver .env.example)"; exit 1; }
 
 echo "==> [1/3] cargo odra build (OhuVault + MutualPool)"
-( cd "$CONTRACTS" && cargo odra build )
+# cargo odra build sale con exit != 0 si falta wasm-strip (paso OPCIONAL de cargo-odra),
+# aunque los WASMs SÍ se generan. Por eso: borrar los wasm previos (garantiza frescura),
+# correr el build tolerando su exit, y dejar que la verificación de existencia + el
+# lowering de abajo sean el gate real (si el build fallara de verdad, los wasm no existirían).
+rm -f "$CONTRACTS"/wasm/*.wasm
+( cd "$CONTRACTS" && cargo odra build ) || echo "  (cargo odra build exit != 0 — probablemente wasm-strip ausente; continuando)"
 
 echo "==> [2/3] wasm-opt: lowering bulk-memory + sign-ext a MVP (ambos WASMs)"
 for WASM in "${WASMS[@]}"; do

@@ -3,6 +3,45 @@
 Registro de despliegues reales de Ohu. Valores públicos (account-hashes, contract
 hashes, tx). Las claves privadas viven fuera del repo (`~/.casper-keys/`).
 
+## v2 (W2-4, 2026-07-06) — Semana 2 completa on-chain ✅
+
+Lo mejor del código (tally paramétrico W2-1 + `MutualPool` W2-3 + `lock_lote`) desplegado
+y ejercitado con un **lote fallido E2E que indemniza por regla**. Nodo:
+`https://node.testnet.casper.network/rpc`.
+
+| Contrato | Package hash | Deploy tx |
+|---|---|---|
+| **OhuVault v2** | `hash-94c4d7b466a035e0aac9bb60daeaa179432ad2df93de3dfe2759812676bf3b6c` | `ba99bb14f2c91ff38baa6bb8e1406e6c739a27b864798de71400ceb7a4f9c5d9` |
+| **MutualPool** | `hash-2cbbd92b6b3b6ef3629da0330e7b63213a8a04c03b3721b0dbc2a2d73f685cb0` | `92b7578a42725f7fb23d7f9f3426788c444ea2a7b58a39c6f3a736ac1c68e26c` |
+
+Config post-deploy (setters, firmados por admin): `set_mutual_pool` `23abe835…`,
+`set_premium_bps(50)` `98a969d3…`, `set_indemnity_target_bps(8000)` `ff79613b…`.
+
+### E2E del LOTE FALLIDO (hito Semana 2: "un lote que falla indemniza por regla")
+
+Comprador = approver0 (Ed25519, atesta gasless). Producer = cuenta no-privilegiada.
+`quorum_fail_bps=6000`, `attestation_window_ms=60000`, `indemnity_target_bps=8000`.
+
+| # | Paso | Firmante / relayer | Tx |
+|---|---|---|---|
+| 1 | `open_lote(1, producer)` | admin | `74ca3193a018ebce629eeb4becc88040a974179e5c99004af8bb85f2beca8672` |
+| 2 | `deposit_to_lote(1)` +10 CSPR | buyer (approver0) | `b413125a006818b8d6f9d5ba9d8215cb9b87f157d3989d25327b62db477ed320` |
+| 3 | `post_bond(1)` +10 CSPR | producer | `cbbb0acb92f8940f3c1f391d018a06bdd3d962a3715d8f7b52161c8505cc42f3` |
+| 4 | `lock_lote(1)` → FUNDED | admin | `296bd5513b793630a035ca4f69c618970b7cb9ba024356602a3f0c3f7573be94` |
+| 5 | `verify_attestation(1, recibido=false)` — Ed25519 gasless, tally 100% | buyer firma / admin relaya | `a4d537e920951709e786f7d1f9f018f228b4dd34e1f7b8296a37d72dca5f9d2b` |
+| 6 | `evaluate_lote(1)` → EVAL_FAIL (tally ≥ quórum) | admin | `12a1bb123f1a35804a69b46f2173b86da812ac65fa8ced2574fb45c906e7c9e5` |
+| 7 | `settle_failure(1)` → SETTLED_FAIL (slash bono, indemnity=min(10,8)=8) | admin | `723d0e39a35df617ae96e572c74e9c055bf8b3ab0cfd8c6df75222c4be9be414` |
+| 8 | `withdraw_settlement(1)` → refund 10 + indemnización 8 | buyer (approver0) | `12eb086fbd0d65d30a386ca0e32440246cd7f398e12220b4f65cef06456e8e2b` |
+
+El settlement lo autorizó el **tally de atestaciones** (INV-2), no un humano ni M-de-N. La
+indemnización salió del **bono slasheado** (§4.1, el que falla paga primero); el pool cobró la
+prima y quedó como backstop (`tail=0` con `bond≥target`).
+
+**Pendiente de P0-1:** re-correr el E2E FELIZ contra v2 (vía tally/silencio=recibido → EVAL_OK →
+release) — el binario `livenet_e2e.rs` necesita actualizarse a `lock_lote` + `evaluate_lote`.
+
+---
+
 ## OhuVault — v1 (W1-3, 2026-06-30)
 
 | Campo | Valor |
