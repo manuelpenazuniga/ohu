@@ -28,9 +28,9 @@ use std::str::FromStr;
 
 use ohu_contracts::ohu_vault::{OhuVault, OhuVaultHostRef};
 
-const LOTE_ID: u64 = 1;
+const LOTE_ID: u64 = 2; // el lote 1 quedó SETTLED_FAIL en el E2E del fallo
 const SHARE_MOTES: u64 = 10_000_000_000; // 10 CSPR — share del comprador
-const BOND_MOTES: u64 = 5_000_000_000; //  5 CSPR — bono del productor
+const BOND_MOTES: u64 = 10_000_000_000; // 10 CSPR — bono >= target (8 CSPR con indemnity_bps=8000)
 const CALL_GAS: u64 = 10_000_000_000; // 10 CSPR techo de gas por llamada
 
 fn step(env: &HostEnv, caller: Address, label: &str) {
@@ -42,10 +42,9 @@ fn step(env: &HostEnv, caller: Address, label: &str) {
 fn main() {
     let env = odra_casper_livenet_env::env();
 
+    // Camino feliz vía tally (W2-4): NO usa approvers (el M-de-N quedó vestigial).
     let buyer = env.get_account(0);
     let admin = env.get_account(1);
-    let approver0 = env.get_account(2);
-    let approver1 = env.get_account(3);
     let producer = env.get_account(4);
 
     let pkg = std::env::var("OHUVAULT_PACKAGE_HASH").expect("Missing OHUVAULT_PACKAGE_HASH");
@@ -64,27 +63,38 @@ fn main() {
     step(&env, buyer, "deposit_to_lote (share)");
     contract.with_tokens(U512::from(SHARE_MOTES)).deposit_to_lote(LOTE_ID);
 
-    // 3. post_bond — el productor deposita el bono (payable) -> transición a FUNDED.
-    step(&env, producer, "post_bond (bono) -> FUNDED");
+    // 3. post_bond — el productor deposita el bono (payable). Sigue en OPEN.
+    step(&env, producer, "post_bond (bono) -> sigue OPEN");
     contract.with_tokens(U512::from(BOND_MOTES)).post_bond(LOTE_ID);
 
-    // 4. propose_release — un approver propone la liberación (lote en FUNDED).
-    step(&env, approver0, "propose_release");
-    contract.propose_release(LOTE_ID);
+    // 4. lock_lote — admin cierra la ventana de fondeo -> FUNDED (W2-4).
+    step(&env, admin, "lock_lote -> FUNDED");
+    contract.lock_lote(LOTE_ID);
+    println!("   lote_state = {} (FUNDED)", contract.lote_state(LOTE_ID));
 
-    // 5. approve_release ×2 — M-de-N on-chain (required_approvals = 2).
-    step(&env, approver0, "approve_release #1");
-    contract.approve_release(LOTE_ID);
-    step(&env, approver1, "approve_release #2");
-    contract.approve_release(LOTE_ID);
+    // 5. Esperar el cierre de la ventana de atestación. CAMINO FELIZ: NADIE atesta
+    //    negativo -> silencio = recibido -> tally negativo = 0 -> EVAL_OK.
+    let window_ms: u64 = std::env::var("OHUVAULT_ATTESTATION_WINDOW_MS")
+        .expect("Missing OHUVAULT_ATTESTATION_WINDOW_MS")
+        .parse()
+        .expect("OHUVAULT_ATTESTATION_WINDOW_MS must be u64");
+    let sleep_ms = window_ms + 10_000;
+    println!("\nSin atestaciones negativas (silencio=recibido). Esperando {sleep_ms} ms a que cierre la ventana...");
+    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
 
-    // 6. release_to_producer — admin ejecuta (caller==admin ∧ approvals>=2) -> SETTLED_OK.
+    // 6. evaluate_lote — disparador PARAMÉTRICO: silencio -> EVAL_OK (INV-2: lo autoriza
+    //    el tally, no un humano ni M-de-N).
+    step(&env, admin, "evaluate_lote -> EVAL_OK");
+    contract.evaluate_lote(LOTE_ID);
+    println!("   lote_state = {} (esperado 4 = EVAL_OK)", contract.lote_state(LOTE_ID));
+
+    // 7. release_to_producer — admin ejecuta (state==EVAL_OK) -> SETTLED_OK (+ prima al pool).
     step(&env, admin, "release_to_producer -> SETTLED_OK");
     contract.release_to_producer(LOTE_ID);
 
     let bal_after = env.balance_of(&producer);
-    let expected = U512::from(SHARE_MOTES + BOND_MOTES);
     println!("\nproducer balance final: {bal_after}");
-    println!("delta esperado (share+bond): {expected}");
-    println!("\n✅ E2E COMPLETO: lote {LOTE_ID} liquidado (SETTLED_OK), escrow liberado al producer.");
+    println!("delta bruto esperado: share+bond - prima = {} - {} (premium_bps) motes",
+        SHARE_MOTES + BOND_MOTES, "0.5%·funded");
+    println!("\n✅ E2E FELIZ (vía tally) COMPLETO: lote {LOTE_ID} liquidado (SETTLED_OK), escrow al producer, prima al MutualPool.");
 }

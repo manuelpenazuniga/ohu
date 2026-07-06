@@ -37,8 +37,24 @@ El settlement lo autorizó el **tally de atestaciones** (INV-2), no un humano ni
 indemnización salió del **bono slasheado** (§4.1, el que falla paga primero); el pool cobró la
 prima y quedó como backstop (`tail=0` con `bond≥target`).
 
-**Pendiente de P0-1:** re-correr el E2E FELIZ contra v2 (vía tally/silencio=recibido → EVAL_OK →
-release) — el binario `livenet_e2e.rs` necesita actualizarse a `lock_lote` + `evaluate_lote`.
+### E2E FELIZ vía tally (lote 2, contra v2) ✅
+
+Camino feliz **sin M-de-N**: silencio = recibido → tally negativo 0 → EVAL_OK → release.
+
+| # | Paso | Firmante | Tx |
+|---|---|---|---|
+| 1 | `open_lote(2, producer)` | admin | `6a46ace92900f0a28b1022f2389be3945be763c9ed67bb34aa9f4a7f69f1146f` |
+| 2 | `deposit_to_lote(2)` +10 CSPR | buyer (deployer) | `75e5de2e3c20657902b9d58b6df4fb0433c337c69d4ed1e99a15b7613cc5dbe4` |
+| 3 | `post_bond(2)` +10 CSPR | producer | `22d674efba5ea5fef945b13cea9f65d4b51b819bf28fec377d5489799d57658b` |
+| 4 | `lock_lote(2)` → FUNDED | admin | `60f191c86cb86432edde9cc05d1421eef4b4bfbd97c3497666c6c514390cb537` |
+| 5 | `evaluate_lote(2)` → EVAL_OK (silencio) | admin | `244bebd8d3f79da735730dcbec9821ce082c3b372d2f07b8e33b8fa5777ad2f8` |
+| 6 | `release_to_producer(2)` → SETTLED_OK (+ prima al pool) | admin | `f6fff1bc275aba51f7ceee9cb5f5d01a24c807a97c75dca3b4d61e61f3578abe` |
+
+Producer: 89.9 → 96.5 CSPR (recibió `funded+bond−prima`). **P0-1 CERRADO: ambos caminos vivos en v2.**
+
+> **Nota de robustez (tooling, no contrato):** los binarios livenet cortan la conexión RPC en la
+> primera tx tras el `sleep` de la ventana (conexión HTTP stale). Se remató por `casper-client`
+> (conexión fresca). TODO: reconectar el env livenet tras el sleep.
 
 ---
 

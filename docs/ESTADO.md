@@ -11,7 +11,7 @@
 > indemnización del bono slasheado). **El settlement lo autorizó el tally (INV-2), no un humano.** 8 tx
 > en `infra/deployments/testnet.md §v2`. Antes del deploy: **pase holístico GPT-5.5** cazó un bug de
 > integración (peso de atestación no-final) → fixeado con gate `state==FUNDED`+ventana, triple-audit
-> PASA. **Pendiente P0-1:** re-correr el E2E FELIZ contra v2. Plan de cierre: `docs/plan/auditoria-y-plan-de-victoria.md`.
+> PASA. **P0-1 CERRADO:** E2E feliz (vía tally) + fallido, ambos on-chain contra v2. Plan de cierre: `docs/plan/auditoria-y-plan-de-victoria.md`.
 >
 > **Fase 0 CERRADA · Semana 1 CERRADA.** W1-0/W1-1/W1-2 + fix crítico de escrow-isolation (120 tests
 > verdes) **+ W1-3: OhuVault DESPLEGADO en Casper Testnet y un lote feliz LIQUIDADO E2E on-chain**
