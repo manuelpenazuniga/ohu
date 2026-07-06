@@ -1,13 +1,19 @@
 # Ohu
 
 ### Procura cooperativa agéntica + mutual paramétrica sobre Casper
-**Casper Agentic Buildathon 2026 · desarrollo en profundidad · v2 · 2026-06-25**
+**Casper Agentic Buildathon 2026 · desarrollo en profundidad · v2.1 · 2026-07-06**
 
 > ***Ohu*** *— en māori, la cuadrilla de trabajo comunal que se junta a levantar la casa de reunión y a cosechar el kūmara: fuerza colectiva por reciprocidad, no por dinero ni por mandato. Ohu es ese gesto vuelto protocolo — muchos compradores y productores chicos que, juntando su demanda, consiguen lo que solos no alcanzan, y se respaldan entre sí.*
 
 > *"El poder de compra de una gran cadena, para el restaurante de barrio y el productor chico — operado por un enjambre de agentes, garantizado por una mutual que se paga sola, y donde ni la IA puede tocar el capital de nadie."*
 
-> **v2 (2026-06-25):** corregido tras la due diligence técnica de `techs-specs.md`. Cambios de fondo: (1) **custodia sin Addressable Entity** — contrato con bóveda (`purse`) + multisig nativo a nivel cuenta + M-de-N en contrato (el modelo "contrato-cuenta" de Casper 2.0 **no está activado ni en mainnet ni en testnet**); (2) **dos rieles de valor** — settlement de escrow (contrato + EIP-712) vs. comercio de servicios x402 (genuino); (3) **atestaciones/onboarding *gasless*** con casper-eip-712; (4) **RFQ simple** en el MVP (subasta sellada a v2). Todo el stack es construible **hoy en testnet** (la red del hackathon) sin walk-back hacia mainnet.
+> **v2.1 (2026-07-06) — barrido de etiquetado honesto (P0-5):** las atestaciones IMPLEMENTADAS son
+> **Ed25519 + domain separation** (`verifying_contract` + `chain_id` + `valid_before`), verificadas
+> on-chain — el fallback pre-acordado de `techs-specs.md §8.3`. **"EIP-712 typed-data" es roadmap, NO
+> lo implementado hoy**; donde este doc dice "EIP-712" para la atestación, léase "firma Ed25519 gasless
+> (EIP-712 typed-data en roadmap)". (El riel x402 SÍ usa EIP-712 real para sus pagos — eso es aparte.)
+>
+> **v2 (2026-06-25):** corregido tras la due diligence técnica de `techs-specs.md`. Cambios de fondo: (1) **custodia sin Addressable Entity** — contrato con bóveda (`purse`) + multisig nativo a nivel cuenta + M-de-N en contrato (el modelo "contrato-cuenta" de Casper 2.0 **no está activado ni en mainnet ni en testnet**); (2) **dos rieles de valor** — settlement de escrow (contrato + firma Ed25519 gasless) vs. comercio de servicios x402 (genuino); (3) **atestaciones/onboarding *gasless*** (Ed25519 + domain separation; EIP-712 typed-data en roadmap); (4) **RFQ simple** en el MVP (subasta sellada a v2). Todo el stack es construible **hoy en testnet** (la red del hackathon) sin walk-back hacia mainnet.
 
 Continúa la idea #1 de `docs/brainstorming/ahora-hare-el-trabajo-bien.md`. Respeta las 6 reglas de calidad: datos de circuito cerrado, liquidación paramétrica (nunca peritaje), valor ≥ complejidad, el agente solo hace lo que hace bien, exprimir la tech de Casper, beneficiario humano votable.
 
@@ -32,7 +38,7 @@ La pérdida de margen en el medio **no es un problema de información** (no hace
    COMPRADORES (8-30 PyMEs)                          PRODUCTORES (2-5 por lote)
    cargan demanda semanal                            ofertan en RFQ (oferta abierta, MVP)
    (ítem, cantidad, spec, tope)                      + depositan BONO de cumplimiento
-   firman commits GASLESS (EIP-712)                              │
+   firman commits GASLESS (Ed25519)                              │
             │                                                     │
             ▼                                                     ▼
    ┌──────────────────────────  Agente AGREGADOR ──────────────────────────┐
@@ -75,18 +81,18 @@ Cada "ronda" de compra es una máquina de estados determinista. El agente *orque
 
 | Estado | Qué pasa | Quién dispara | Tx on-chain |
 |:--|:--|:--|:--|
-| `OPEN` | Compradores cargan demanda. Firman el commit **gasless** (EIP-712); el agente lo retransmite. | Compradores (firma) | commit de demanda |
+| `OPEN` | Compradores cargan demanda. Firman el commit **gasless** (Ed25519 + domain separation); el agente lo retransmite. | Compradores (firma) | commit de demanda |
 | `SOURCING` | Agregador forma lotes y abre **RFQ** a productores *(MVP: oferta abierta; subasta sellada commit-reveal = v2)*. | Agente Agregador | apertura de lote |
 | `BIDDING` | Productores ofertan precio + compromiso de entrega + **depositan bono**. | Productores | bid + bond deposit |
 | `AWARDED` | Clearing determinista: gana precio que cumple spec, ponderado por reputación. | Contrato (regla) | award |
 | `FUNDED` | Cada comprador deposita su parte en **escrow** del vault (su propio dinero, retenido). | Compradores | depósito en escrow |
 | `FULFILLING` | Productor entrega; ventana de entrega + ventana de atestación abiertas. | Productor (físico) | — (off-chain) |
-| `ATTESTING` | Cada comprador atesta recepción con firma **EIP-712 gasless**. **Silencio = recibido** (ack por defecto). | Compradores (firma) | atestación verificada on-chain |
+| `ATTESTING` | Cada comprador atesta recepción con firma **Ed25519 gasless** (domain separation). **Silencio = recibido** (ack por defecto). | Compradores (firma) | atestación verificada on-chain |
 | `SETTLED_OK` | Cuota de recepción ≥ umbral → **settlement del vault al productor (~segundos)**, devuelve bono, reputación +. | Contrato + Tesorería | transfer del vault · bond return · rep update |
 | `SETTLED_FAIL` | Cuota de **no-recepción** ≥ umbral → refund a compradores, **slash del bono**, **indemnización paramétrica** (desde bono + cola del pool). | Contrato + Mutual | refund · slash · indemnización |
 | `DISPUTED` | Reclamo *aislado* (1 comprador contra la mayoría) → micro-disputa con su micro-bono, NO dispara slash del productor. | Contrato | dispute resolve |
 
-> **Clave de diseño (R2 — paramétrico, no peritaje):** el sistema nunca "evalúa un siniestro". Solo cuenta atestaciones ponderadas por la *share* de cada comprador en el lote y compara contra umbrales. Es aritmética sobre evidencia multiparte, no juicio. Las atestaciones son **mensajes EIP-712 firmados off-chain y verificados on-chain**, así el comprador no necesita tener CSPR ni manejar gas.
+> **Clave de diseño (R2 — paramétrico, no peritaje):** el sistema nunca "evalúa un siniestro". Solo cuenta atestaciones ponderadas por la *share* de cada comprador en el lote y compara contra umbrales. Es aritmética sobre evidencia multiparte, no juicio. Las atestaciones son **mensajes firmados Ed25519 con domain separation, off-chain y verificados on-chain** (EIP-712 typed-data en roadmap), así el comprador no necesita tener CSPR ni manejar gas.
 
 ---
 
@@ -168,9 +174,9 @@ Crítico para R4 y para el pitch de seguridad: **la lógica que mueve dinero es 
 
 x402 es un **protocolo de pago por servicio/recurso HTTP**, no un riel universal de transferencias. Liberar fondos que **ya están en escrow** no es x402: es una transferencia del contrato. Ohu usa **dos rieles**, cada uno en su lugar.
 
-**Riel A — Liquidación de escrow (contrato `OhuVault` + EIP-712).** Custodia y settlement de los fondos del lote:
+**Riel A — Liquidación de escrow (contrato `OhuVault` + firma Ed25519 gasless).** Custodia y settlement de los fondos del lote:
 - Depósito en escrow del comprador y bono del productor → entran al purse del vault.
-- `release_to_producer` / `settle_failure` / refund / slash / indemnización → **transferencias del contrato**, gateadas por el tally paramétrico + autorizaciones **EIP-712** firmadas por las partes (gasless).
+- `release_to_producer` / `settle_failure` / refund / slash / indemnización → **transferencias del contrato**, gateadas por el tally paramétrico + autorizaciones **Ed25519 con domain separation** firmadas por las partes (gasless; EIP-712 typed-data en roadmap).
 - Finalidad rápida de Casper → el productor ve la plata en **segundos**. *(En el demo se muestra como "settlement instantáneo", no como x402.)*
 
 **Riel B — Comercio de servicios x402 (genuino, central, alineado con los $100k).** x402 para lo que es:
@@ -233,7 +239,7 @@ Rica y repetible por diseño — esto es decisivo para pasar la puerta y para el
 
 **Semana 1 — Núcleo de liquidación.** `OhuVault` + escrow por lote + cuenta admin multisig + un settlement al productor funcionando en Testnet. *Hito: un lote feliz liquida end-to-end.*
 
-**Semana 2 — Atestación gasless + mutual.** Atestación EIP-712 ponderada + camino `SETTLED_FAIL` (refund + slash + indemnización) + `MutualPool` con prima automática. *Hito: un lote que falla indemniza por regla.*
+**Semana 2 — Atestación gasless + mutual.** Atestación Ed25519 ponderada (gasless; EIP-712 typed-data en roadmap) + camino `SETTLED_FAIL` (refund + slash + indemnización) + `MutualPool` con prima automática. *Hito: un lote que falla indemniza por regla.*
 
 **Semana 3 — Agentes + RFQ + oráculo x402.** Los 3 agentes orquestando; RFQ simple; `Reputation` expuesto como **API x402**. Dashboard con CSPR.cloud. *Hito: ronda completa autónoma + una consulta x402 real al oráculo.*
 
@@ -243,7 +249,7 @@ Rica y repetible por diseño — esto es decisivo para pasar la puerta y para el
 
 ## 12. Alcance del MVP — qué es real y qué se simula (con honestidad)
 
-- **100% real en el demo:** los contratos, el multisig nativo, las atestaciones EIP-712 verificadas on-chain, los pagos x402 al oráculo en Testnet, y **la liquidación paramétrica ejecutándose en vivo** (feliz y fallida).
+- **100% real en el demo:** los contratos, el multisig nativo, las atestaciones Ed25519 (domain separation) verificadas on-chain, los pagos x402 al oráculo en Testnet, y **la liquidación paramétrica ejecutándose en vivo** (feliz y fallida).
 - **Honestamente acotado:** un panel chico de compradores/productores (sembrados, o reales si los anclas). **La entrega física se representa por atestaciones firmadas — que es el mecanismo real de todos modos, no un atajo.** No se inventa telemetría ni precios.
 - El mensaje al jurado: *"la lógica de liquidación es 100% real y corre en Testnet hoy; lo único chico es la cantidad de participantes del mundo real, y eso se resuelve con go-to-market, no con código."*
 

@@ -23,8 +23,9 @@
 > indemnización pull), **W2-3** `MutualPool` (prima + cola; **TRIPLE audit tras 3 rondas de fix** — GPT
 > adversarial halló un crítico económico que 176 tests verdes no vieron), **W2-4** deploy v2 + ambos E2E
 > on-chain (ver arriba). **Próximo: plan de victoria** (`docs/plan/auditoria-y-plan-de-victoria.md`):
-> P0-2 README EN, P0-5 relabel EIP-712, P1 capa agéntica + dashboard. **Pendiente menor:** multisig
-> nativo admin (Parte B, no bloquea).
+> **P0-1 ✅ · P0-2 ✅ (README EN juror-facing) · P0-5 ✅ (barrido honestidad EIP-712→Ed25519 en
+> README/ohu.md/docs-x402/attestation.rs; ohu.md v2→v2.1)**. **Ahora: P1 capa agéntica + dashboard.**
+> **Pendiente menor:** multisig nativo admin (Parte B, no bloquea); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---

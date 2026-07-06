@@ -3,7 +3,8 @@
 > **INV-4:** x402 es un protocolo de pago por request HTTP. **No** es el rail de
 > settlement de escrow. El settlement de escrow (rail A) es una transferencia
 > del contrato `OhuVault` autorizada por condiciones on-chain (tally de
-> atestaciones ponderadas) + firmas EIP-712 gasless — nunca un flujo x402.
+> atestaciones ponderadas) + firmas Ed25519 gasless (domain separation;
+> EIP-712 typed-data en roadmap) — nunca un flujo x402.
 
 Este directorio (`agents/src/x402/`) implementa el **S4 (Fase 0)**: un cobro
 x402 real sobre Casper Testnet usando [`make-software/casper-x402`](https://github.com/make-software/casper-x402)
