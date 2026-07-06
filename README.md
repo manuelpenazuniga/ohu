@@ -1,154 +1,206 @@
-# Ohu — Fase 0 (S0 + S1 + S2)
+# Ohu — agentic cooperative procurement + a parametric mutual, on Casper
 
-> Ohu = agentic cooperative procurement + parametric mutual en Casper Testnet.
-> Este repositorio es la **Fase 0 (de-risk)**. S0 entregó el esqueleto
-> reproducible; S1 añadió `OhuVault`, el ladrillo base de custodia en `purse`;
-> **S2 añade el modelo de seguridad "el agente no drena" (INV-1)**: cuenta
-> admin (multisig nativo) + cuenta operator con entrypoint capado + releases
-> grandes gateados por `caller==admin` + aprobación M-de-N on-chain.
+> Small buyers pool weekly demand; small producers bid and post a performance bond; delivery is
+> confirmed by **gasless multi-party attestations**; settlement and indemnification are **arithmetic
+> over weighted attestations, never human claims adjustment**. An LLM swarm orchestrates — **the
+> contract authorizes. No capital ever moves on a model's judgment.**
 
-## Layout
+![Odra tests](https://img.shields.io/badge/odra%20tests-206%20passing-brightgreen)
+![Agent tests](https://img.shields.io/badge/agent%20tests-24%20passing-brightgreen)
+![Network](https://img.shields.io/badge/live-Casper%20Testnet-blue)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
+Built for the **Casper Agentic Buildathon 2026**. Everything below is built on what is **live on
+Casper Testnet today** — no dependency on unreleased tech.
+
+---
+
+## The problem
+
+Small restaurants and producers who pool purchasing already exist (buying clubs, WhatsApp groups) and
+die at the same three points — exactly the three Ohu puts on-chain, and *only* those:
+
+1. **Who holds the money?** A human coordinator with the group's bank account is counterparty risk no
+   small business accepts at scale. → escrow in a contract `purse`, **earmarked per batch**.
+2. **What happens when the order doesn't arrive?** On a $4,000 batch, a claims adjuster or a lawsuit
+   costs more than the batch. Nobody insures this — so it doesn't exist. → **parametric** settlement
+   over weighted multi-party attestations: arithmetic, not adjudication.
+3. **Why does the producer get paid in 30–60 days?** Because nobody guarantees instant payment against
+   verified delivery. → vault settlement in seconds once the on-chain threshold is crossed.
+
+Everything else (batch formation, RFQ, communication) stays **off-chain**, where it's cheap. The cannon
+points only at the fly that is actually a tank: **enforcement between distrusting small parties who
+can't afford traditional enforcement.**
+
+---
+
+## How it works
 
 ```
-ohu/
-├── contracts/       # Odra (Rust) — OhuVault (S1)
-├── agents/          # TypeScript — Agregador, Tesorería, Mutual
-├── web/             # TypeScript — dashboard (Fase 3)
-├── infra/           # deploy scripts, .env.example, justfile/Makefile
-├── docs/plan/       # plan de implementación
-└── .github/workflows/  # CI
+   buyers                producer            operator (agent)         admin (native multisig)
+     │ deposit (share)     │ post_bond           │ evaluate_lote          │ release / settle
+     ▼                     ▼                     ▼                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────────┐
+ │  OhuVault (Odra contract, purse escrow, earmarked per batch — INV-7)             │
+ │    open_lote → deposit_to_lote → post_bond → lock_lote ─────────────┐            │
+ │                                                                      ▼            │
+ │  attestation window: buyers sign gasless (Ed25519), operator relays │            │
+ │    verify_attestation  →  weighted tally (by share)                 │            │
+ │                                                                      ▼            │
+ │  evaluate_lote  →  EVAL_OK (silence = received)  or  EVAL_FAIL (≥ quorum negative)│
+ │       │                                              │                            │
+ │       ▼ release_to_producer                          ▼ settle_failure             │
+ │   SETTLED_OK (producer paid − premium)      SETTLED_FAIL (refund + bond slashed)  │
+ │       │ premium 0.5%                                  │ tail (deficit)             │
+ │       ▼                                               ▼                            │
+ │                         MutualPool (premiums in, tail-of-loss backstop)           │
+ └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Toolchain pineada
+**Batch state machine:**
 
-| Componente | Versión fijada |
-|:-----------|:---------------|
-| Rust toolchain | `nightly-2026-01-01` (requerido por Odra 2.8.2) |
-| cargo-odra | `0.1.7` |
-| odra / odra-test / odra-build | `2.8.2` |
-| Node.js | `>= 20` (CI usa 22) |
-| pnpm | `11.8.0` |
-| casper-js-sdk | `5.0.12` |
-| TypeScript | `6.0.3` |
-| vitest | `4.1.9` |
-| just | `1.40.0` |
+```
+OPEN ──lock_lote(operator/admin)──▶ FUNDED ──evaluate_lote(after window)──┬─▶ EVAL_OK ──release──▶ SETTLED_OK
+                                                                          └─▶ EVAL_FAIL ─settle──▶ SETTLED_FAIL ──withdraw──▶ buyers
+```
 
-## Setup
+- **Attestations are gasless.** A buyer signs off-chain (Ed25519 + domain separation over
+  `verifying_contract` + `chain_id` + `valid_before`) and the operator relays it on-chain, paying gas.
+  The buyer never needs CSPR. *(This is the pre-agreed, on-chain-verified signature scheme;* ***EIP-712
+  typed-data is on the roadmap***, *not yet implemented — see Honest scope.)*
+- **Silence = received.** Not attesting counts as "delivered fine." Only an active, weighted negative
+  attestation opens the claim path. This reflects reality and eliminates griefing-by-inaction.
+- **The producer's bond is the primary payer of a failure.** It must cover the indemnity target
+  (`bond ≥ target`, enforced at `lock_lote`). The mutual is a tail backstop — the one who failed pays
+  first.
+
+---
+
+## Why an agent can't rug you
+
+The whole point of an *agentic* system that moves money: a jailbroken LLM must not be able to touch
+capital. Ohu enforces this on-chain, not by trust. The invariants:
+
+| # | Invariant | How it's enforced |
+|---|---|---|
+| **INV-1** | The agent never moves relevant capital | The agent's account can only call **capped** entrypoints (bounded micropayments). Every real release requires `caller == admin` + native account multisig |
+| **INV-2** | No capital release depends on the LLM's output | Settlement is authorized by an **on-chain condition** — the weighted attestation tally, not a human, not the M-of-N of a person |
+| **INV-3** | No Casper Addressable Entity | Custody = contract `purse` + **native account associated-keys/thresholds** + in-contract M-of-N. All live on Testnet today |
+| **INV-4** | x402 is only for HTTP services | Escrow settlement is a **contract transfer**, never an x402 flow |
+| **INV-5** | Attestations are signed off-chain, verified on-chain (gasless) | Ed25519 + domain separation, anti-replay per `(lote, signer)`, expiry |
+| **INV-6** | Closed-circuit data; settlement is arithmetic | No external price/oracle as truth; tally over weighted attestations |
+| **INV-7** | Escrow is earmarked per batch | `reserved_lote_balance` — a batch's funds go only to its producer or back to its buyers, never across batches |
+
+> **The LLM orchestrates; the contract authorizes.** This is the answer to the buildathon's core
+> question: *how do you let autonomous agents operate real money without a jailbreak ruining anyone?*
+
+---
+
+## Live on Casper Testnet
+
+Deployed v2 (RPC: `https://node.testnet.casper.network`, chain `casper-test`):
+
+| Contract | Package hash |
+|---|---|
+| **OhuVault v2** | [`hash-94c4d7b466a035e0aac9bb60daeaa179432ad2df93de3dfe2759812676bf3b6c`](https://testnet.cspr.live/contract-package/hash-94c4d7b466a035e0aac9bb60daeaa179432ad2df93de3dfe2759812676bf3b6c) |
+| **MutualPool** | [`hash-2cbbd92b6b3b6ef3629da0330e7b63213a8a04c03b3721b0dbc2a2d73f685cb0`](https://testnet.cspr.live/contract-package/hash-2cbbd92b6b3b6ef3629da0330e7b63213a8a04c03b3721b0dbc2a2d73f685cb0) |
+
+Two full batch lifecycles were executed end-to-end on-chain:
+
+- **Happy path (via tally):** `open → deposit → post_bond → lock_lote → [window, silence=received] →
+  evaluate_lote = EVAL_OK → release_to_producer`. Producer paid `funded + bond − premium`; premium to
+  the pool. Settlement authorized by the **tally**, not M-of-N.
+- **Failure path (indemnifies by rule):** a buyer signs a **negative** attestation (Ed25519, gasless) →
+  tally crosses quorum → `evaluate_lote = EVAL_FAIL → settle_failure` (bond slashed) →
+  `withdraw_settlement` (buyer refunded + indemnified from the slashed bond). **No human evaluated a
+  claim.**
+
+All 14 transaction hashes are in [`infra/deployments/testnet.md`](infra/deployments/testnet.md).
+
+---
+
+## The agent swarm
+
+Three agents, each with its own Casper account (on-chain identity). The split is deliberate:
+
+| Agent | LLM does (well) | Deterministic / on-chain (authoritative) |
+|---|---|---|
+| **Agregador** | normalize fuzzy demand → structured spec; form batches; run RFQ dialogue; explain | RFQ clearing; spec validation |
+| **Tesorería** | monitor windows; handle exceptions; narrate decisions | triggers `evaluate_lote` / `release_to_producer` / `settle_failure` — **all gated on-chain; if the agent lies, they revert** |
+| **Mutual/Riesgo** | draft solvency reports; propose premium changes to governance | collect premium; slash bond; watch reserve |
+
+> **Honest status:** the three agents are on the **roadmap** (next milestone). What exists today is the
+> **contract layer** (fully deployed + exercised on Testnet) and the **x402 rail**. The security
+> guarantee they rely on (INV-1/INV-2) is *already enforced on-chain*, independent of any agent.
+
+---
+
+## x402: the reputation oracle (Rail B)
+
+A genuine [x402](https://www.casper.network/ai) pay-per-request service: producers' reputation sold
+per HTTP request, using `@make-software/casper-x402` with a failover facilitator (hosted → local).
+The server declares its **non-escrow semantics** at `/health` (INV-4): x402 charges for an HTTP
+service, it *never* settles escrow. 24 tests cover the 402-shape, failover, idempotent settle, and the
+non-escrow invariant. *(Today the oracle derives scores from a seed; wiring it to the real on-chain
+settlement history is the next step — see roadmap.)*
+
+---
+
+## Quickstart
 
 ```bash
-# 1. Rust + wasm32 target + cargo-odra
-rustup target add wasm32-unknown-unknown
-cargo install cargo-odra --version 0.1.7 --locked
-
-# 2. Node / pnpm (asegúrate de usar Node 20+)
-corepack enable   # expone pnpm si tu Node lo soporta
-pnpm install
-
-# 3. Configuración de despliegue (solo para `just deploy`)
-cp infra/.env.example .env
-# Edita .env con tus claves y endpoints de Testnet.
+just setup     # Rust + wasm32 + cargo-odra, Node/pnpm
+just build     # build contracts + agents
+just test      # 206 Odra tests + 24 agent tests + 1 web
+just lint      # clippy (-D warnings) + typecheck
 ```
 
-## Build & test
+Deploy + run the on-chain batch lifecycle (requires `casper-client`, `binaryen`/`wasm-opt`, a funded
+Testnet account, and a `.env` — see `infra/.env.example`):
 
 ```bash
-just build      # compila contratos (host) + TS
-just test       # cargo odra test + tests TS
-just lint       # clippy + type-check
+bash infra/scripts/deploy_testnet.sh                       # deploy OhuVault v2 + MutualPool (MVP-lowered wasm)
+cargo run --bin ohu_livenet_e2e --features livenet         # happy path E2E
+cargo run --bin ohu_livenet_e2e_fail --features livenet    # failure path E2E (indemnifies by rule)
 ```
 
-Para generar los artefactos WASM optimizados (requiere `wasm-opt` de
-Binaryen):
+**Repo layout:** `contracts/` (Odra/Rust — `OhuVault`, `MutualPool`, `attestation`) ·
+`agents/` (TypeScript — x402 rail) · `web/` (dashboard, roadmap) · `infra/` (deploy, deployment
+records) · `docs/` (product spec `ohu.md`, tech due-diligence `techs-specs.md`, state `docs/ESTADO.md`).
 
-```bash
-just build-wasm
-```
+---
 
-El Makefile es un fallback si `just` no está instalado.
+## Honest scope
 
-## Contratos
+What is **100% real** (deployed + exercised on Testnet): the contracts, the earmarked purse escrow, the
+weighted-attestation parametric settlement (both happy and failure paths), the native account multisig
+model, and the x402 oracle rail.
 
-### `OhuVault` (`contracts/src/ohu_vault.rs`)
+**Honestly bounded / on the roadmap:**
 
-Custodia en `purse` del contrato (sin Addressable Entity, INV-3) con el modelo
-de seguridad de S2 (INV-1). Tres roles on-chain, todos **cuentas**:
+- **Attestations are Ed25519 + domain separation** (gasless, verified on-chain) — the pre-agreed scheme
+  from the tech due-diligence. **EIP-712 typed-data is on the roadmap**, not yet implemented. (The x402
+  rail *does* use real EIP-712 for its payment authorizations — that's a separate, correct thing.)
+- **The 3 agents and the dashboard are on the roadmap.** The contract layer that makes them safe is
+  already live.
+- **`Reputation` and `CoopRegistry` contracts are on the roadmap.** Governance params currently live in
+  `OhuVault::init`.
+- The demo runs a small seeded panel of buyers/producers; delivery is represented by signed
+  attestations — which is the *real* mechanism, not a shortcut.
 
-- **`admin`** — ejecuta los releases grandes (`execute`; `caller == admin`).
-  En Testnet es además un multisig nativo (associated keys + deployment
-  threshold alto) → co-firma off-chain para siquiera submitir `execute`.
-- **`operator`** (agente/LLM) — solo puede llamar `route_micropayment`, con
-  **tope por llamada** (`micropayment_cap`). No puede proponer, aprobar ni
-  ejecutar.
-- **`approvers`** — firmantes M-de-N que `approve(id)` un release.
+---
 
-Entry points:
+## Roadmap
 
-- `init(admin, operator, approvers, required_approvals, micropayment_cap)` —
-  valida el setup (admin≠operator, approvers distintos y no contienen al
-  operator, `required_approvals ∈ [1, len(approvers)]`, cap>0).
-- `deposit()` — `#[odra(payable)]`; cualquiera puede fondear el vault.
-- `route_micropayment(recipient, amount)` — **capado**: solo `operator`,
-  `0 < amount ≤ micropayment_cap`. Emite `MicropaymentRouted`.
-- `propose_withdraw(recipient, amount) -> u64` — solo admin o approvers (no el
-  operator). No mueve capital. Emite `WithdrawProposed`.
-- `approve(request_id)` — solo approvers; un approver no aprueba dos veces la
-  misma solicitud (`AlreadyApproved`), garantizando aprobaciones **distintas**.
-  Emite `WithdrawApproved`.
-- `execute(request_id)` — **doble gate**: `caller == admin` **+**
-  `approval_count ≥ required_approvals`. Aplica checks-effects-interactions
-  (marca `request_executed` antes de la transferencia). Emite `WithdrawExecuted`.
-- Getters: `balance`, `admin`, `operator`, `micropayment_cap`,
-  `required_approvals`, `is_approver`, `approval_count`, `request_executed`,
-  `request_recipient`, `request_amount`.
+- **Now:** agent swarm (Agregador / Tesorería / Mutual) operating the deployed contracts autonomously.
+- **Next:** read-only "Swarm Control Room" dashboard (batch timeline + tx links, the `PROPOSE→AUTHORIZE`
+  feed, mutual solvency gauge); real reputation from on-chain history; QR gasless mobile attestation.
+- **Later:** EIP-712 typed-data attestations; `Reputation`/`CoopRegistry` contracts; Ohu as an **MCP
+  server** (a market for other agents).
 
-Eventos (`Deposit`, `MicropaymentRouted`, `WithdrawProposed`, `WithdrawApproved`,
-`WithdrawExecuted`) visibles en CSPR.cloud.
+<!-- TODO(human): demo video link · DoraHacks BUIDL page · X / Telegram -->
 
-> Defensa en profundidad: (1) multisig nativo del admin (off-chain) fuerza
-> co-firma para deployar; (2) el contrato exige M aprobaciones **distintas**
-> on-chain. Sobrevive aunque el admin sea una clave única.
-> Ver los `TODO(audit)` en el código para los próximos pasos (S3: atestaciones
-> EIP-712; purse secundario; indexación de eventos en CSPR.cloud).
+---
 
-## Deploy a Testnet
-
-```bash
-# 1. (Recomendado) configura la cuenta admin como multisig nativo
-#    (associated keys + weights + deployment threshold). Plan + recipe en:
-bash infra/scripts/setup_admin_account.sh
-
-# 2. Deploya OhuVault con los init args de S2
-just deploy
-```
-
-Requiere `.env` configurado. El deploy de `OhuVault` pasa los init args
-(`admin`, `operator`, `approvers`, `required_approvals`, `micropayment_cap`)
-definidos en `.env`; un setup inválido revierte on-chain con `Error::InvalidSetup`.
-
-## CI
-
-GitHub Actions corre:
-
-- `cargo fmt --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo odra test`
-- TypeScript type-check + tests
-
-## Notas de seguridad / auditoría
-
-- Ningún secreto se commitea: `.env` está en `.gitignore`.
-- S1/S2 mueven capital real en testnet: `OhuVault` custodia CSPR en su `purse`.
-- **S2 / INV-1**: el `operator` (agente) solo puede llamar `route_micropayment`
-  (tope por llamada); los releases grandes exigen `caller == admin` + M
-  aprobaciones **distintas** on-chain, y la cuenta `admin` es a su vez un
-  multisig nativo (co-firma off-chain). Tests negativos en
-  `contracts/src/ohu_vault.rs` prueban que el agente **no** puede drenar.
-- Los invariantes INV-1…INV-6 se aplican desde S1 en adelante.
-
-## S4 — Riel B (x402)
-
-`agents/src/x402/` monta un cobro **x402 real** sobre Testnet (oráculo de
-reputación pago-por-request) con `@make-software/casper-x402`. **x402 no es el
-rail de settlement de escrow** (INV-4); ese vive en el contrato `OhuVault` +
-atestaciones on-chain. Demo y detalles en [`agents/docs-x402.md`](agents/docs-x402.md);
-targets `just x402-facilitator`, `just x402-resource`, `just x402-pay`.
+Docs: [`ohu.md`](ohu.md) (product) · [`techs-specs.md`](techs-specs.md) (feasibility due-diligence) ·
+[`docs/ESTADO.md`](docs/ESTADO.md) (build state). License: MIT.
