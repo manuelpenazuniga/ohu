@@ -136,9 +136,23 @@ body {
 .seg { background: var(--accent); }
 .seg--empty { background: repeating-linear-gradient(45deg, var(--line), var(--line) 4px, transparent 4px, transparent 8px); }
 
+/* Red-team (F2): color semántico "bloqueado" (terracota), distinto del acento */
+.rt-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 8px; }
+.rt { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid #e0684f;
+  border-radius: 8px; padding: 12px 14px; }
+.rt__attack { font-size: 13.5px; font-weight: 560; }
+.rt__ep { display: block; font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+.rt__verdict { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rt__badge { font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+  color: #e0684f; background: color-mix(in srgb, #e0684f 15%, transparent); padding: 3px 8px; border-radius: 5px; }
+.rt__prot { font-size: 11.5px; color: var(--faint); }
+.rt__tx { text-decoration: line-through; opacity: .85; }
+
 @media (max-width: 640px) {
   .swarm__grid { grid-template-columns: 1fr; }
   .swarm__link { transform: rotate(90deg); justify-content: center; }
   .ag__grid { grid-template-columns: 1fr; }
   .mutual__stats { grid-template-columns: 1fr; }
+  .rt { flex-direction: column; align-items: flex-start; }
 }

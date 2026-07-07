@@ -40,8 +40,10 @@
 > P1-3 ✅ Agregador (Gemini):** 8 demandas en lenguaje natural → 1 llamada a Gemini normaliza → bin-packing
 > determinista → RFQ → clearing (el LLM NO elige; test adversarial) → `open_lote(#5)` on-chain
 > (tx `ad202f9d…`, error_message=None). **El enjambre de 4 agentes está vivo** (Agregador/Tesorería/
-> Autorizador/Mutual). **P1 esencialmente completo.** **Pendiente menor:** multisig admin (Parte B);
-> P0-3 vídeo + P0-4 BUIDL/redes (operador).
+> Autorizador/Mutual). **P1 esencialmente completo.** **P2 en curso:** **F2 ✅ red-team "Try to drain
+> the vault"** — 3 ataques REALES a Testnet rechazados on-chain (CapExceeded / NotAdmin / LoteNotFailable),
+> con sección en el dashboard y `pnpm --dir agents redteam` para correrlos en vivo. **Pendiente menor:**
+> multisig admin (Parte B); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
