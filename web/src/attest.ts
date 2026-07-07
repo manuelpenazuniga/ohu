@@ -9,6 +9,11 @@
  *   verifying_contract(32) + chain_id(8 BE) + valid_before(8 BE)
  */
 
+import "@fontsource-variable/fraunces";
+import "@fontsource/instrument-sans/400.css";
+import "@fontsource/instrument-sans/600.css";
+import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/silkscreen/400.css";
 import * as ed from "@noble/ed25519";
 
 const PREFIX = new TextEncoder().encode("OhuAttestation:");
@@ -83,8 +88,8 @@ function screenAsk(): string {
   return `
     <div class="q">¿Recibiste el pedido del <b>lote #${loteId}</b>?</div>
     <div class="btns">
-      <button class="b b--ok" data-r="1">✓ Sí, recibido</button>
-      <button class="b b--no" data-r="0">✗ No llegó</button>
+      <button class="b b--ok" data-r="1">Sí, recibido</button>
+      <button class="b b--no" data-r="0">No llegó</button>
     </div>
     <p class="foot">Firmas localmente. <b>Nunca tocas CSPR</b> — el agente retransmite y paga el gas.</p>`;
 }
@@ -92,7 +97,7 @@ function screenAsk(): string {
 function screenDone(a: SignedAttestation): string {
   const relay = (window as unknown as { RELAY_URL?: string }).RELAY_URL;
   return `
-    <div class="done ${a.received ? "done--ok" : "done--no"}">${a.received ? "✓ Recepción atestada" : "✗ Falta atestada"}</div>
+    <div class="done ${a.received ? "done--ok" : "done--no"}">${a.received ? "Recepción atestada" : "Falta atestada"}</div>
     <p class="sub">Firmado <b>Ed25519 en tu navegador</b> (la llave nunca salió).</p>
     <div class="payload">
       <div><span>lote</span><code>#${a.loteId}</code></div>

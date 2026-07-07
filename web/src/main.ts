@@ -1,3 +1,9 @@
+// "El Almanaque" — fuentes bundleadas (sin CDN).
+import "@fontsource-variable/fraunces";
+import "@fontsource/instrument-sans/400.css";
+import "@fontsource/instrument-sans/600.css";
+import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/silkscreen/400.css";
 import {
   LOTE,
   VAULT,
@@ -22,16 +28,24 @@ function txLink(tx: string): string {
   return `<a class="tx" href="${explorerUrl(tx)}" target="_blank" rel="noopener noreferrer" title="${tx}">${shortHash(tx)}</a>`;
 }
 
-/** Un paso del stepper. Los pasos de agente se resaltan. */
+/** Estado on-chain → etapa del ciclo de cultivo (El Almanaque). */
+const CROP: Record<string, string> = {
+  OPEN: "Semilla", FUNDED: "Brote", EVAL_OK: "Cosecha",
+  EVAL_FAIL: "Malogro", SETTLED_OK: "Granero", SETTLED_FAIL: "Merma",
+};
+
+/** Un paso del stepper (ciclo de cultivo). Los pasos de agente se resaltan. */
 function stepCard(s: LoteStep): string {
   const agent = s.kind === "agent";
+  const crop = CROP[s.state] ?? "";
   return `
     <li class="step ${agent ? "step--agent" : "step--setup"}">
-      <div class="step__dot" aria-hidden="true"></div>
+      <div class="step__dot" aria-hidden="true">${crop ? crop.charAt(0) : ""}</div>
       <div class="step__body">
         <div class="step__head">
           <span class="step__state">${s.state}</span>
-          ${agent ? `<span class="badge">AGENT · ${s.column}</span>` : ""}
+          ${crop ? `<span class="crop">${crop}</span>` : ""}
+          ${agent ? `<span class="badge">CUADRILLA · ${s.column}</span>` : ""}
         </div>
         <code class="step__ep">${s.entrypoint}()</code>
         <div class="step__meta"><span class="actor actor--${s.actor}">${s.actor}</span> ${txLink(s.tx)}</div>
@@ -144,7 +158,7 @@ function trustSection(): string {
       ${CASE_STUDIES.map((c) => `
         <div class="case">
           <div class="case__bug">${c.bug}</div>
-          <div class="case__meta"><span class="case__caught">✓ ${c.caughtBy}</span><span class="case__missed">✗ ${c.missedBy}</span></div>
+          <div class="case__meta"><span class="case__caught"><b class="case__tag">cazó</b> ${c.caughtBy}</span><span class="case__missed"><b class="case__tag">no vio</b> ${c.missedBy}</span></div>
           <div class="case__fix">→ ${c.fix}</div>
         </div>`).join("")}
     </div>
