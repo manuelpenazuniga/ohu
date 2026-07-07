@@ -24,3 +24,6 @@ node_modules/
 
 # OS
 .DS_Store
+
+# cubrir symlinks node_modules además de directorios
+node_modules

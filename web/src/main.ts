@@ -60,8 +60,8 @@ function agentCard(a: Agent): string {
   const acct = a.account
     ? `<code class="ag__acct" title="${a.account}">${shortHash(a.account.replace("account-hash-", ""), 8)}</code>`
     : `<code class="ag__acct ag__acct--none">— sin cuenta aún —</code>`;
-  const last = a.lastTx
-    ? `<div class="ag__last">${a.lastAction} ${txLink(a.lastTx)}</div>`
+  const last = a.lastAction
+    ? `<div class="ag__last">${a.lastAction}${a.lastTx ? ` ${txLink(a.lastTx)}` : ""}</div>`
     : "";
   return `
     <div class="ag ag--${a.status}">

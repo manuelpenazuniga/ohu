@@ -89,9 +89,10 @@ export const AGENTS: readonly Agent[] = [
     authority: "open_lote; el LLM narra, el clearing es determinista",
   },
   {
-    name: "Mutual / Riesgo", role: "—", status: "roadmap",
-    does: "informe de solvencia + propuesta de prima a gobernanza",
-    authority: "observa; no ejecuta (lo ejecuta el admin)",
+    name: "Mutual / Riesgo", role: "observador", status: "live",
+    does: "informe de solvencia + propuesta de prima a gobernanza (números on-chain reales)",
+    authority: "solo observa (read-only); no ejecuta — la prima la cambia el admin",
+    lastAction: "reserva 0.1 CSPR · ratio 10 · SOLVENTE",
   },
 ];
 

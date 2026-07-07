@@ -33,8 +33,11 @@
 > + gauge de la mutual; `pnpm --dir web dev`). **P1-1 ✅ oráculo de reputación REAL**: el endpoint x402
 > `/reputation/:producer` deriva el score del historial on-chain vía CSPR.cloud (open_lote→producer,
 > release=OK, settle_failure=FAIL); validado on-chain (producer `33518b62…` → 4 lotes, 2 OK, 1 FAIL,
-> score 73). Fallback seed marcado + 503 si la fuente cae. **Ahora: P1-3 Agregador LLM** (necesita
-> ANTHROPIC_API_KEY). **Pendiente menor:** multisig nativo admin (Parte B); P0-3 vídeo + P0-4.
+> score 73). Fallback seed marcado + 503 si la fuente cae. **P1-4 ✅ agente Mutual/Riesgo**: informe
+> de solvencia derivado del historial on-chain (CSPR.cloud) — reserva 0.1 CSPR, ratio 10, SOLVENTE,
+> prima recomendada 50 bps como PROPUESTA (no ejecuta). El enjambre de 3 (Tesorería/Autorizador/Mutual)
+> está vivo. **CI reparado** (symlink web/node_modules fuera de git + cargo fmt + clippy). **Ahora:
+> P1-3 Agregador LLM** (necesita ANTHROPIC_API_KEY). **Pendiente menor:** multisig admin (Parte B); P0-3/P0-4.
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
