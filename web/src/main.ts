@@ -7,6 +7,9 @@ import {
   AGENTS,
   MUTUAL,
   REDTEAM,
+  INVARIANTS,
+  AUDIT_LENSES,
+  CASE_STUDIES,
   shortHash,
   explorerUrl,
   type LoteStep,
@@ -127,6 +130,33 @@ function redteamSection(): string {
   </section>`;
 }
 
+/** F10 · sección Trust: el proceso multi-modelo + los casos reales cazados. */
+function trustSection(): string {
+  return `
+  <section class="card">
+    <div class="card__head"><h2>Trust · why an agent can't rug you</h2><span class="hint">the process is the product</span></div>
+    <div class="trust__lenses">
+      <span class="trust__lead">Cada cambio que toca fondos, tres lentes:</span>
+      ${AUDIT_LENSES.map((l) => `<span class="lens"><b>${l.model}</b> · ${l.lens}</span>`).join("")}
+    </div>
+    <div class="trust__caseshead">Bugs REALES que este proceso cazó — y que los tests verdes no vieron:</div>
+    <div class="trust__cases">
+      ${CASE_STUDIES.map((c) => `
+        <div class="case">
+          <div class="case__bug">${c.bug}</div>
+          <div class="case__meta"><span class="case__caught">✓ ${c.caughtBy}</span><span class="case__missed">✗ ${c.missedBy}</span></div>
+          <div class="case__fix">→ ${c.fix}</div>
+        </div>`).join("")}
+    </div>
+    <details class="trust__inv">
+      <summary>Los 7 invariantes enforced on-chain</summary>
+      <ul class="inv-list">
+        ${INVARIANTS.map((i) => `<li><code>${i.id}</code> ${i.text}</li>`).join("")}
+      </ul>
+    </details>
+  </section>`;
+}
+
 function render(): string {
   return `
   <header class="hero">
@@ -168,6 +198,8 @@ function render(): string {
   ${mutualSection()}
 
   ${redteamSection()}
+
+  ${trustSection()}
 
   <footer class="foot">
     Every hash is a real transaction on Casper Testnet · <code>error_message=None</code> · lote #${LOTE.id} settled hands-free by the agent swarm.
