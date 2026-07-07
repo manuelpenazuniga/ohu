@@ -141,8 +141,10 @@ A genuine [x402](https://www.casper.network/ai) pay-per-request service: produce
 per HTTP request, using `@make-software/casper-x402` with a failover facilitator (hosted → local).
 The server declares its **non-escrow semantics** at `/health` (INV-4): x402 charges for an HTTP
 service, it *never* settles escrow. 24 tests cover the 402-shape, failover, idempotent settle, and the
-non-escrow invariant. *(Today the oracle derives scores from a seed; wiring it to the real on-chain
-settlement history is the next step — see roadmap.)*
+non-escrow invariant. The oracle now derives each producer's score from **real on-chain settlement
+history** (via CSPR.cloud: `open_lote` → producer, `release_to_producer` = OK, `settle_failure` = FAIL),
+with a seed fallback only when no CSPR.cloud key is configured. Verified live: producer `33518b62…`
+returns `4 lotes · 2 OK · 1 FAIL · score 73` `asOfBlock 8425485`.
 
 ---
 
@@ -192,9 +194,11 @@ model, and the x402 oracle rail.
 
 ## Roadmap
 
-- **Now:** agent swarm (Agregador / Tesorería / Mutual) operating the deployed contracts autonomously.
-- **Next:** read-only "Swarm Control Room" dashboard (batch timeline + tx links, the `PROPOSE→AUTHORIZE`
-  feed, mutual solvency gauge); real reputation from on-chain history; QR gasless mobile attestation.
+- **Live now:** the contract layer + on-chain E2E, the **Tesorería/Autorizador agents** (a batch settled
+  hands-free on Testnet), the **Swarm Control Room dashboard**, and the **reputation oracle over real
+  on-chain history** (CSPR.cloud).
+- **Next:** the **Agregador** agent (natural-language demand → on-chain batch, LLM-normalized) and the
+  **Mutual/Riesgo** agent; QR gasless mobile attestation.
 - **Later:** EIP-712 typed-data attestations; `Reputation`/`CoopRegistry` contracts; Ohu as an **MCP
   server** (a market for other agents).
 

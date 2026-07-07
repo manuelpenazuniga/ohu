@@ -10,6 +10,12 @@ import {
   RAIL_B_NON_ESCROW_DECLARATION,
   SCHEME_EXACT,
 } from "./constants.js";
+import {
+  reputationHistory,
+  scoreFor,
+  normalizeProducer,
+  type CsprCloudConfig,
+} from "./reputation-source.js";
 
 /**
  * Recurso servido por el riel B: el futuro **oráculo de reputación** por
@@ -37,7 +43,9 @@ function fakeReputationFor(producer: string): ReputationRecord {
     deliveries: seed % 25,
     positiveAttestations: seed % 20,
     negativeAttestations: seed % 3,
-    disclaimer: "Rail B x402 — pago por request. No es settlement de escrow.",
+    disclaimer:
+      "Rail B x402 — valor SEED (fallback sin CSPR.cloud configurado). " +
+      "No es settlement de escrow.",
   };
 }
 
@@ -66,7 +74,11 @@ function assetAmountFor(cfg: X402Config): AssetAmount {
  * @param facilitator Cliente facilitator (puede ser un `FailoverFacilitatorClient`
  *   con primario hosteado + fallback local). En tests se inyecta un mock.
  */
-export function buildReputationApp(cfg: X402Config, facilitator: FacilitatorClient): Application {
+export function buildReputationApp(
+  cfg: X402Config,
+  facilitator: FacilitatorClient,
+  reputationSource?: CsprCloudConfig,
+): Application {
   const chainID = cfg.chainID as Network;
   const asset = assetAmountFor(cfg);
 
@@ -113,13 +125,56 @@ export function buildReputationApp(cfg: X402Config, facilitator: FacilitatorClie
     ) as unknown as express.RequestHandler,
   );
 
-  app.get("/reputation/:producer", (req, res) => {
+  app.get("/reputation/:producer", async (req, res) => {
     const producer = (req.params["producer"] ?? "").trim();
     if (!producer) {
       res.status(400).json({ error: "producer requerido" });
       return;
     }
-    res.json(fakeReputationFor(producer));
+
+    // Sin fuente configurada (CSPR.cloud) → fallback seed, marcado como tal.
+    if (!reputationSource) {
+      res.json(fakeReputationFor(producer));
+      return;
+    }
+
+    try {
+      const hist = await reputationHistory(reputationSource, Date.now());
+      const h = hist.get(normalizeProducer(producer));
+      const asOfBlock = [...hist.values()][0]?.asOfBlock;
+      const disclaimer =
+        "Rail B x402 — historial on-chain REAL derivado vía CSPR.cloud (open_lote / " +
+        "release_to_producer / settle_failure). No es settlement de escrow.";
+      if (!h) {
+        // Productor sin lotes adjudicados: reputación neutral real (no inventada).
+        res.json({
+          producer,
+          score: 50,
+          deliveries: 0,
+          positiveAttestations: 0,
+          negativeAttestations: 0,
+          ...(asOfBlock !== undefined ? { asOfBlock } : {}),
+          disclaimer,
+        });
+        return;
+      }
+      const record: ReputationRecord = {
+        producer,
+        score: scoreFor(h),
+        deliveries: h.lotesAwarded,
+        positiveAttestations: h.settledOk,
+        negativeAttestations: h.settledFail,
+        asOfBlock: h.asOfBlock,
+        disclaimer,
+      };
+      res.json(record);
+    } catch (err) {
+      // Fuente caída → 503. NO se miente con datos fake sobre dinero/reputación.
+      res.status(503).json({
+        error: "fuente de reputación no disponible",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 
   // Endpoint de sanity que documenta INV-4 en el propio servicio.
