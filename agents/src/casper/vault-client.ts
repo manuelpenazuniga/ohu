@@ -115,7 +115,10 @@ export async function callVaultEntrypoint(
   const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
-      const info = await rpc.getTransactionByTransactionHash(txHash);
+      // `buildFor1_5` emite un Deploy legacy: su hash es un DEPLOY hash, hay que
+      // consultarlo por deploy hash (no por transaction hash, que devolvería
+      // -32014 aunque el deploy sí exista y haya ejecutado).
+      const info = await rpc.getTransactionByDeployHash(txHash);
       if (info.executionInfo) {
         // La tx ya ejecutó: errorMessage vacío = éxito; poblado = revert Odra.
         const errorMessage =
