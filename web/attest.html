@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Ohu · Atestar recepción</title>
+    <style>
+      :root {
+        --bg: #0b0e13; --panel: #141a24; --line: #26313f; --text: #e6ebf2;
+        --muted: #8a97a8; --accent: #2dd4bf; --green: #34d399; --red: #e0684f;
+        --mono: ui-monospace, "SF Mono", Menlo, monospace;
+        --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      @media (prefers-color-scheme: light) {
+        :root { --bg: #f6f8fb; --panel: #fff; --line: #dde3ec; --text: #0f141c; --muted: #566374; --accent: #0d9488; --green: #059669; --red: #c4553c; }
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans);
+        -webkit-font-smoothing: antialiased; min-height: 100dvh; display: flex; align-items: center; justify-content: center; }
+      .wrap { width: 100%; max-width: 420px; padding: 24px 20px; }
+      .brand { text-align: center; font-weight: 700; letter-spacing: .06em; color: var(--accent); text-transform: uppercase; font-size: 14px; margin-bottom: 16px; }
+      .card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 26px 22px; }
+      .q { font-size: 21px; font-weight: 620; text-align: center; line-height: 1.35; text-wrap: balance; }
+      .btns { display: grid; gap: 12px; margin: 24px 0 8px; }
+      .b { font: inherit; font-size: 17px; font-weight: 600; padding: 18px; border-radius: 12px; border: 1px solid var(--line); cursor: pointer; transition: transform .06s ease; }
+      .b:active { transform: scale(.98); }
+      .b--ok { background: color-mix(in srgb, var(--green) 16%, transparent); border-color: color-mix(in srgb, var(--green) 40%, transparent); color: var(--green); }
+      .b--no { background: color-mix(in srgb, var(--red) 14%, transparent); border-color: color-mix(in srgb, var(--red) 38%, transparent); color: var(--red); }
+      .b--again { background: transparent; color: var(--muted); width: 100%; margin-top: 18px; font-size: 15px; padding: 14px; }
+      .foot { color: var(--muted); font-size: 13px; text-align: center; margin: 14px 2px 0; line-height: 1.5; }
+      .foot code { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+      .done { text-align: center; font-size: 22px; font-weight: 650; }
+      .done--ok { color: var(--green); } .done--no { color: var(--red); }
+      .sub { text-align: center; color: var(--muted); font-size: 14px; margin: 8px 0 18px; }
+      .payload { display: grid; gap: 8px; background: color-mix(in srgb, var(--muted) 8%, transparent); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+      .payload > div { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+      .payload span { color: var(--muted); font-size: 12.5px; }
+      .payload code { font-family: var(--mono); font-size: 12.5px; color: var(--text); }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <div class="brand">Ohu</div>
+      <div id="app" class="card" aria-busy="false"></div>
+    </main>
+    <script type="module" src="/src/attest.ts"></script>
+  </body>
+</html>
