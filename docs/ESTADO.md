@@ -30,9 +30,11 @@
 > fuga de separación de llaves) + **6 fixes de integración TS↔Casper que solo el E2E real destapa**
 > (ver `infra/deployments/testnet.md §P1-2`). **P1-5 ✅ dashboard "Sala de Control" (a+b+c)** (`web/`,
 > SPA vanilla+Vite: timeline del lote 4 con tx clickeables + tarjetas de los 3 agentes (LIVE/ROADMAP)
-> + gauge de la mutual; `pnpm --dir web dev`). **Ahora: P1-1 reputación real** (CSPR.cloud key ya en
-> `.env`; el oráculo x402 vende historial on-chain real en vez de seed). **Luego: P1-3 Agregador LLM**
-> (necesita ANTHROPIC_API_KEY). **Pendiente menor:** multisig nativo admin (Parte B); P0-3 vídeo + P0-4.
+> + gauge de la mutual; `pnpm --dir web dev`). **P1-1 ✅ oráculo de reputación REAL**: el endpoint x402
+> `/reputation/:producer` deriva el score del historial on-chain vía CSPR.cloud (open_lote→producer,
+> release=OK, settle_failure=FAIL); validado on-chain (producer `33518b62…` → 4 lotes, 2 OK, 1 FAIL,
+> score 73). Fallback seed marcado + 503 si la fuente cae. **Ahora: P1-3 Agregador LLM** (necesita
+> ANTHROPIC_API_KEY). **Pendiente menor:** multisig nativo admin (Parte B); P0-3 vídeo + P0-4.
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
