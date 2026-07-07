@@ -1,5 +1,10 @@
 import { readFileSync } from "node:fs";
-import { PrivateKey, KeyAlgorithm } from "casper-js-sdk";
+// casper-js-sdk es CJS: bajo node-ESM sus named exports no se sintetizan
+// (todo queda en el default). Se importan los VALORES vía el default y los
+// TIPOS vía `import type`. Ver vault-client.ts para la misma razón.
+import sdk from "casper-js-sdk";
+import type { PrivateKey } from "casper-js-sdk";
+const { KeyAlgorithm } = sdk;
 
 /**
  * Carga la llave operator (Ed25519) desde el PEM definido en
@@ -14,7 +19,7 @@ export function loadOperatorKey(pemPath: string): PrivateKey {
     throw new Error("tesoreria: OPERATOR_SECRET_KEY_PATH no configurado");
   }
   const pem = readFileSync(pemPath, "utf8");
-  return PrivateKey.fromPem(pem, KeyAlgorithm.ED25519);
+  return sdk.PrivateKey.fromPem(pem, KeyAlgorithm.ED25519);
 }
 
 /**
@@ -30,5 +35,5 @@ export function loadAdminKey(pemPath: string): PrivateKey {
     throw new Error("autorizador: ADMIN_SECRET_KEY_PATH no configurado");
   }
   const pem = readFileSync(pemPath, "utf8");
-  return PrivateKey.fromPem(pem, KeyAlgorithm.ED25519);
+  return sdk.PrivateKey.fromPem(pem, KeyAlgorithm.ED25519);
 }

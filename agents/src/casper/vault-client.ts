@@ -1,11 +1,9 @@
-import {
-  PrivateKey,
-  HttpHandler,
-  RpcClient,
-  ContractCallBuilder,
-  Args,
-  CLValue,
-} from "casper-js-sdk";
+// casper-js-sdk es CJS: bajo node-ESM (tsx) sus named exports quedan `undefined`
+// (todo vive en el default export). Se importan los VALORES vía el default y el
+// TIPO `PrivateKey` vía `import type`. vitest interopera solo; node/tsx no.
+import sdk from "casper-js-sdk";
+import type { PrivateKey } from "casper-js-sdk";
+const { HttpHandler, RpcClient, ContractCallBuilder, Args, CLValue } = sdk;
 import { parseUserError } from "./errors.js";
 import type { SwarmConfig } from "./env.js";
 
@@ -75,7 +73,12 @@ export async function callVaultEntrypoint(
     .from(pub)
     .chainName(config.chainName)
     .payment(config.txPaymentMotes)
-    .build();
+    // Testnet NO tiene AddressableEntity activado (hard-constraint del proyecto):
+    // `.build()` produce una TransactionV1 nativa que el nodo rechaza con
+    // "no such addressable entity". `.buildFor1_5()` emite el Deploy legacy
+    // (modelo Contract/ContractPackage) que el testnet acepta — igual que los
+    // binarios Rust (odra-livenet).
+    .buildFor1_5();
 
   tx.sign(signer);
 
