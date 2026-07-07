@@ -53,8 +53,11 @@
 > (firma válida verificada). **F8 ✅ simulador de semana** (`infra/scripts/simulate-week.sh` + `SIM_LOTE_ID`):
 > siembra lotes a FUNDED y los liquida con los agentes TS — validado on-chain (lote 6: EVAL_OK `8a1fe443`
 > → SETTLED_OK `5216f412`); para el run completo (3-5 lotes) hay que refondear las cuentas de prueba.
-> **F5 diferido** (token CEP-18). **Próximo grande: rediseño del web a "El Almanaque"** (CLAUDE.md) —
-> incluye el panel 'lotes recientes' live. **Pendiente menor:**
+> **F5 diferido** (token CEP-18). **Rediseño del web a "El Almanaque" ✅** (CLAUDE.md): dashboard +
+> `attest.html` con paleta papel (verde/arcilla/trigo), bordes 2px + sombras duras, tipografía
+> Fraunces/Instrument Sans/IBM Plex Mono/Silkscreen (@fontsource self-hosted, sin CDN), stepper como
+> ciclo de cultivo (Semilla→Brote→Cosecha→Granero) y sin iconografía emoji. Typecheck limpio, 7 tests
+> web, build verde. **Pendiente menor:**
 > multisig admin (Parte B); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
