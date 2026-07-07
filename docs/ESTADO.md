@@ -42,7 +42,9 @@
 > (tx `ad202f9d…`, error_message=None). **El enjambre de 4 agentes está vivo** (Agregador/Tesorería/
 > Autorizador/Mutual). **P1 esencialmente completo.** **P2 en curso:** **F2 ✅ red-team "Try to drain
 > the vault"** — 3 ataques REALES a Testnet rechazados on-chain (CapExceeded / NotAdmin / LoteNotFailable),
-> con sección en el dashboard y `pnpm --dir agents redteam` para correrlos en vivo. **Pendiente menor:**
+> con sección en el dashboard y `pnpm --dir agents redteam` para correrlos en vivo. **F10 ✅ Trust**:
+> sección del dashboard con las 3 lentes de audit + los 3 bugs reales que el proceso cazó (drenaje
+> 1-mote, fuga de llaves, éxito-falso) + los 7 invariantes. **Pendiente menor:**
 > multisig admin (Parte B); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 

@@ -66,6 +66,29 @@ export const REDTEAM: readonly RedTeamAttempt[] = [
   { attack: "Liquidar un lote que no falló", by: "admin", entrypoint: "settle_failure(4)", error: "LoteNotFailable", protection: "state machine", tx: "979b6c3eda28f76e8f5a0cbc40667936e9a1c99d9443a3c6ce0a35d41e6fad9a" },
 ];
 
+/** F10 · Trust: invariantes, lentes de auditoría y casos reales cazados. */
+export const INVARIANTS: ReadonlyArray<{ id: string; text: string }> = [
+  { id: "INV-1", text: "El agente nunca mueve capital relevante — solo entrypoints capados" },
+  { id: "INV-2", text: "Ninguna liberación depende del LLM — la autoriza el tally on-chain" },
+  { id: "INV-3", text: "Sin Addressable Entity — purse + multisig nativo + M-de-N en contrato" },
+  { id: "INV-4", text: "x402 solo para servicios HTTP — el escrow es una transferencia del contrato" },
+  { id: "INV-5", text: "Atestaciones Ed25519 firmadas off-chain, verificadas on-chain (gasless)" },
+  { id: "INV-6", text: "Datos de circuito cerrado — settlement aritmético sobre atestaciones ponderadas" },
+  { id: "INV-7", text: "Escrow earmarked por lote — los fondos solo van a su productor o de vuelta" },
+];
+
+export const AUDIT_LENSES: ReadonlyArray<{ model: string; lens: string }> = [
+  { model: "Claude", lens: "conservación de fondos" },
+  { model: "Gemini 3.1 Pro", lens: "corrección algebraica" },
+  { model: "GPT-5.5", lens: "adversarial · teoría de juegos" },
+];
+
+export const CASE_STUDIES: ReadonlyArray<{ bug: string; caughtBy: string; missedBy: string; fix: string }> = [
+  { bug: "Un bono de 1 mote drena la mutual (anillo económico)", caughtBy: "GPT-5.5 (adversarial)", missedBy: "176 tests verdes", fix: "bond ≥ target exigido en lock_lote" },
+  { bug: "El config filtraba el path de la llave admin al proceso operator", caughtBy: "GPT-5.5 (adversarial)", missedBy: "el pase de corrección de Gemini", fix: "loadOperatorConfig / loadAdminConfig — separación estructural" },
+  { bug: "El agente reportó SETTLED_OK sobre una tx revertida (Out of gas)", caughtBy: "el E2E on-chain real", missedBy: "typecheck + tests con mocks", fix: "confirmación de doble-lectura (no acepta resultado prematuro)" },
+];
+
 export const shortHash = (h: string, n = 10): string =>
   h.length > n * 2 ? `${h.slice(0, n)}…${h.slice(-4)}` : h;
 
