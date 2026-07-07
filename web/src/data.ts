@@ -84,9 +84,11 @@ export const AGENTS: readonly Agent[] = [
     lastTx: "c1f374a2de8704391edb47de27681eef4c66ceb7b81f6a1965c9a4a065af4c95",
   },
   {
-    name: "Agregador", role: "—", status: "roadmap",
-    does: "demanda en lenguaje natural → spec → open_lote (LLM)",
-    authority: "open_lote; el LLM narra, el clearing es determinista",
+    name: "Agregador", role: "operator", account: OPERATOR, status: "live",
+    does: "demanda en lenguaje natural → spec (Gemini) → bin-packing → RFQ → open_lote",
+    authority: "open_lote; el LLM SOLO normaliza, el clearing es determinista (INV-2)",
+    lastAction: "8 demandas NL → lote #5 abierto",
+    lastTx: "ad202f9d9323cbe8be88f6ec92a202d23cfc1c95cd4b6f3c0d25ba5793add2f1",
   },
   {
     name: "Mutual / Riesgo", role: "observador", status: "live",

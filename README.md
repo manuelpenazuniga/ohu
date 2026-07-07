@@ -197,8 +197,10 @@ model, and the x402 oracle rail.
 - **Live now:** the contract layer + on-chain E2E, the **Tesorería/Autorizador agents** (a batch settled
   hands-free on Testnet), the **Swarm Control Room dashboard**, and the **reputation oracle over real
   on-chain history** (CSPR.cloud).
-- **Next:** the **Agregador** agent (natural-language demand → on-chain batch, LLM-normalized) and the
-  **Mutual/Riesgo** agent; QR gasless mobile attestation.
+- **Live now (cont.):** the **Agregador** agent — natural-language demand → 1 LLM call (Gemini) → batch
+  → RFQ → `open_lote` on-chain (the LLM only normalizes; a deterministic clearing picks the winner, proven
+  by an adversarial test) — and the **Mutual/Riesgo** solvency agent. The 4-agent swarm is live.
+- **Next:** QR gasless mobile attestation; native admin multisig (Part B).
 - **Later:** EIP-712 typed-data attestations; `Reputation`/`CoopRegistry` contracts; Ohu as an **MCP
   server** (a market for other agents).
 

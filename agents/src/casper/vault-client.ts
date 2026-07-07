@@ -3,7 +3,7 @@
 // TIPO `PrivateKey` vía `import type`. vitest interopera solo; node/tsx no.
 import sdk from "casper-js-sdk";
 import type { PrivateKey } from "casper-js-sdk";
-const { HttpHandler, RpcClient, ContractCallBuilder, Args, CLValue } = sdk;
+const { HttpHandler, RpcClient, ContractCallBuilder, Args, CLValue, Key } = sdk;
 import { parseUserError } from "./errors.js";
 import type { SwarmConfig } from "./env.js";
 
@@ -19,6 +19,7 @@ const ALLOWED_ENTRYPOINTS: readonly string[] = [
   "evaluate_lote",
   "release_to_producer",
   "settle_failure",
+  "open_lote",
 ];
 
 /** Resultado de una llamada al OhuVault. */
@@ -56,24 +57,17 @@ function isNoSuchTransaction(err: unknown): boolean {
 }
 
 /**
- * Construye, firma y despacha una llamada a un entrypoint del OhuVault.
+ * Construye, firma y despacha una llamada al OhuVault con args YA construidos.
  *
- * **Requisito de seguridad central:** `entryName` DEBE estar en el allowlist
- * `ALLOWED_ENTRYPOINTS`. El único argumento permitido es `lote_id: u64`.
- * Prohibido construir transfers nativos, deploys de sesión o entrypoints
- * dinámicos.
- *
- * @param signer Llave privada del rol que firma (operator o admin).
- * @param entryName Nombre del entrypoint (debe estar en el allowlist).
- * @param loteId ID del lote (u64).
- * @param config Configuración del enjambre.
- * @returns Resultado estructurado con txHash, éxito y código de error si lo hay.
- * @throws Si `entryName` no está en el allowlist.
+ * **Requisito de seguridad central:** `entryName` DEBE estar en `ALLOWED_ENTRYPOINTS`;
+ * los `args` solo los construyen las funciones públicas tipadas de abajo (cada una
+ * atada a su entrypoint), nunca un caller externo arbitrario. Prohibido transfers
+ * nativos, deploys de sesión o entrypoints dinámicos.
  */
-export async function callVaultEntrypoint(
+async function sendAndConfirm(
   signer: PrivateKey,
   entryName: string,
-  loteId: number,
+  args: ReturnType<typeof Args.fromMap>,
   config: SwarmConfig,
 ): Promise<VaultCallResult> {
   if (!ALLOWED_ENTRYPOINTS.includes(entryName)) {
@@ -85,10 +79,6 @@ export async function callVaultEntrypoint(
 
   const rpc = new RpcClient(new HttpHandler(config.nodeUrl, "fetch"));
   const pub = signer.publicKey;
-
-  const args = Args.fromMap({
-    lote_id: CLValue.newCLUint64(loteId),
-  });
 
   const tx = new ContractCallBuilder()
     .byPackageHash(config.vaultPackageHash)
@@ -156,6 +146,47 @@ export async function callVaultEntrypoint(
 
   // Enviada pero no confirmada en el timeout: pending. El caller NO re-envía.
   return { txHash, success: false, userError: null, pending: true };
+}
+
+/**
+ * Llama un entrypoint de lote de arg único `lote_id: u64` (evaluate/release/settle).
+ * La barrera de allowlist vive en `sendAndConfirm`.
+ */
+export async function callVaultEntrypoint(
+  signer: PrivateKey,
+  entryName: string,
+  loteId: number,
+  config: SwarmConfig,
+): Promise<VaultCallResult> {
+  return sendAndConfirm(
+    signer,
+    entryName,
+    Args.fromMap({ lote_id: CLValue.newCLUint64(loteId) }),
+    config,
+  );
+}
+
+/**
+ * Abre un lote (Agregador · operator). `open_lote(lote_id, producer)` — NO mueve
+ * capital: solo registra el lote y su productor adjudicado por el RFQ. El único
+ * arg extra es `producer`, una identidad (Key), no un monto. `producerAccountHash`
+ * lleva prefijo ("account-hash-<hex>").
+ */
+export async function openLote(
+  signer: PrivateKey,
+  loteId: number,
+  producerAccountHash: string,
+  config: SwarmConfig,
+): Promise<VaultCallResult> {
+  return sendAndConfirm(
+    signer,
+    "open_lote",
+    Args.fromMap({
+      lote_id: CLValue.newCLUint64(loteId),
+      producer: CLValue.newCLKey(Key.newKey(producerAccountHash)),
+    }),
+    config,
+  );
 }
 
 /**

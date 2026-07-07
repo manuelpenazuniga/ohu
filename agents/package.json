@@ -12,7 +12,8 @@
     "pay:get": "tsx --env-file=../../.env src/x402/pay.ts",
     "agent:tesoreria": "tsx --env-file=../.env src/tesoreria/index.ts",
     "agent:autorizador": "tsx --env-file=../.env src/autorizador/index.ts",
-    "agent:mutual": "tsx --env-file=../.env src/mutual/index.ts"
+    "agent:mutual": "tsx --env-file=../.env src/mutual/index.ts",
+    "agent:agregador": "tsx --env-file=../.env src/agregador/index.ts"
   },
   "dependencies": {
     "@make-software/casper-x402": "^1.0.0",
