@@ -28,7 +28,7 @@ use std::str::FromStr;
 
 use ohu_contracts::ohu_vault::{OhuVault, OhuVaultHostRef};
 
-const LOTE_ID: u64 = 2; // el lote 1 quedó SETTLED_FAIL en el E2E del fallo
+const LOTE_ID: u64 = 4; // lote 4 fresco para el E2E limpio de agentes P1-2 (bicolumna PROPONE→AUTORIZA)
 const SHARE_MOTES: u64 = 10_000_000_000; // 10 CSPR — share del comprador
 const BOND_MOTES: u64 = 10_000_000_000; // 10 CSPR — bono >= target (8 CSPR con indemnity_bps=8000)
 const CALL_GAS: u64 = 10_000_000_000; // 10 CSPR techo de gas por llamada

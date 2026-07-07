@@ -23,9 +23,14 @@
 > indemnización pull), **W2-3** `MutualPool` (prima + cola; **TRIPLE audit tras 3 rondas de fix** — GPT
 > adversarial halló un crítico económico que 176 tests verdes no vieron), **W2-4** deploy v2 + ambos E2E
 > on-chain (ver arriba). **Próximo: plan de victoria** (`docs/plan/auditoria-y-plan-de-victoria.md`):
-> **P0-1 ✅ · P0-2 ✅ (README EN juror-facing) · P0-5 ✅ (barrido honestidad EIP-712→Ed25519 en
-> README/ohu.md/docs-x402/attestation.rs; ohu.md v2→v2.1)**. **Ahora: P1 capa agéntica + dashboard.**
-> **Pendiente menor:** multisig nativo admin (Parte B, no bloquea); P0-3 vídeo + P0-4 BUIDL/redes (operador).
+> **P0-1 ✅ · P0-2 ✅ (README EN) · P0-5 ✅ (honestidad EIP-712→Ed25519; ohu.md v2.1) · P1-2 ✅
+> ENJAMBRE VIVO ON-CHAIN**: Tesorería (operator) + Autorizador (admin), dos identidades/autoridad
+> separadas, liquidaron el lote 4 **sin humano** (PROPONE `evaluate_lote`→EVAL_OK `58d9…` / AUTORIZA
+> `release_to_producer`→SETTLED_OK `c1f3…`, ambas `error_message=None`). Triple-audit (GPT-5.5 cazó
+> fuga de separación de llaves) + **6 fixes de integración TS↔Casper que solo el E2E real destapa**
+> (ver `infra/deployments/testnet.md §P1-2`). **Ahora: resto de P1** (P1-1 reputación real, P1-5
+> dashboard "Sala de Control", P1-3 Agregador). **Pendiente menor:** multisig nativo admin (Parte B);
+> P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---

@@ -3,6 +3,35 @@
 Registro de despliegues reales de Ohu. Valores públicos (account-hashes, contract
 hashes, tx). Las claves privadas viven fuera del repo (`~/.casper-keys/`).
 
+## P1-2 (2026-07-07) — El enjambre vivo: Tesorería + Autorizador on-chain ✅
+
+**Primer agente vivo.** Dos procesos TypeScript (casper-js-sdk 5.0.12) con identidades y
+autoridad **separadas** operan `OhuVault` v2 **sin intervención humana**. Lote 4 sembrado a
+FUNDED; los agentes lo liquidaron solos:
+
+| # | Columna / rol | Agente (cuenta) | Entrypoint | Resultado | Tx |
+|---|---|---|---|---|---|
+| 1 | **PROPONE** (operator) | `9c28ba3e…` | `evaluate_lote(4)` | EVAL_OK (tally, silencio=recibido) | `58d917305b1552dde941cab76c65ac7d635e55c288069ef6b4cc7ee9a7da21bc` |
+| 2 | **AUTORIZA** (admin) | `59d06759…` | `release_to_producer(4)` | SETTLED_OK (productor + prima) | `c1f374a2de8704391edb47de27681eef4c66ceb7b81f6a1965c9a4a065af4c95` |
+
+Ambas verificadas on-chain (`error_message=None`; bloques 8421043 / 8425485). El **operator
+solo puede evaluar** — autorizado por el *tally* on-chain (INV-2), no mueve capital; el
+**capital lo ejecuta el admin** (frontera INV-1; futura ruta a multisig nativo, Parte B). *"El
+LLM orquesta; el contrato autoriza"* hecho transacción.
+
+> **6 fixes de integración TS↔Casper destapados por el E2E real** (ni `tsc` ni los mocks de
+> vitest los ven): (1) named exports CJS `undefined` bajo node-ESM → default import; (2)
+> `.buildFor1_5()` — el testnet **no** tiene AddressableEntity, `.build()` da "no such
+> addressable entity"; (3) cuenta operator sin purse → fondeada; (4) confirmación robusta ante
+> finality lag `-32014` **sin re-enviar** (antes: ~24 tx en ráfaga); (5) consulta por **deploy
+> hash** (`getTransactionByDeployHash`); (6) confirmación que **no acepta resultado prematuro**
+> (evitaba un `SETTLED_OK` falso sobre una tx `Out of gas`) + gas de settlement 8 CSPR.
+
+Reproducir: sembrar un lote a FUNDED (`bin/livenet_e2e`, matar tras `lock_lote`), luego
+`pnpm --dir agents agent:tesoreria -- --lote N` y `agent:autorizador -- --lote N` (con `.env`).
+
+---
+
 ## v2 (W2-4, 2026-07-06) — Semana 2 completa on-chain ✅
 
 Lo mejor del código (tally paramétrico W2-1 + `MutualPool` W2-3 + `lock_lote`) desplegado
