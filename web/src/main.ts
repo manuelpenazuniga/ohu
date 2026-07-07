@@ -4,9 +4,12 @@ import {
   NETWORK,
   OPERATOR,
   ADMIN,
+  AGENTS,
+  MUTUAL,
   shortHash,
   explorerUrl,
   type LoteStep,
+  type Agent,
 } from "./data.js";
 
 /** Enlace monospace a una tx en el explorer (nueva pestaña). */
@@ -52,6 +55,48 @@ function swarmColumn(
     </div>`;
 }
 
+/** Tarjeta de un agente del enjambre (live o roadmap). */
+function agentCard(a: Agent): string {
+  const acct = a.account
+    ? `<code class="ag__acct" title="${a.account}">${shortHash(a.account.replace("account-hash-", ""), 8)}</code>`
+    : `<code class="ag__acct ag__acct--none">— sin cuenta aún —</code>`;
+  const last = a.lastTx
+    ? `<div class="ag__last">${a.lastAction} ${txLink(a.lastTx)}</div>`
+    : "";
+  return `
+    <div class="ag ag--${a.status}">
+      <div class="ag__top">
+        <span class="ag__name">${a.name}</span>
+        <span class="ag__status ag__status--${a.status}">${a.status === "live" ? "LIVE" : "ROADMAP"}</span>
+      </div>
+      <div class="ag__role">${a.role}</div>
+      ${acct}
+      <p class="ag__does">${a.does}</p>
+      <div class="ag__auth">${a.authority}</div>
+      ${last}
+    </div>`;
+}
+
+/** Sección de la mutual: reserva + primas + cola pagada. */
+function mutualSection(): string {
+  const { reserveCspr, premiumsCspr, tailPaidCspr, premiumEvents, note, pool } = MUTUAL;
+  return `
+  <section class="card">
+    <div class="card__head"><h2>The mutual</h2><span class="hint">parametric backstop</span></div>
+    <a class="vault" href="https://testnet.cspr.live/contract-package/${pool}" target="_blank" rel="noopener noreferrer">MutualPool · ${shortHash(pool.replace("hash-", ""), 8)}</a>
+    <div class="mutual__stats">
+      <div class="stat"><span class="stat__n">${reserveCspr}</span><span class="stat__l">reserve · CSPR</span></div>
+      <div class="stat"><span class="stat__n">${premiumsCspr}</span><span class="stat__l">premiums in</span></div>
+      <div class="stat"><span class="stat__n stat__n--good">${tailPaidCspr}</span><span class="stat__l">tail paid</span></div>
+    </div>
+    <div class="mutual__bar" role="img" aria-label="reserva alimentada por primas, cola pagada cero">
+      ${premiumEvents.map((e) => `<span class="seg" style="flex:${e.cspr}" title="lote #${e.lote}: +${e.cspr} CSPR de prima"></span>`).join("")}
+      <span class="seg seg--empty" style="flex:0.4" title="capacidad de cola sin usar (tail = 0)"></span>
+    </div>
+    <p class="note">${note}</p>
+  </section>`;
+}
+
 function render(): string {
   return `
   <header class="hero">
@@ -77,7 +122,11 @@ function render(): string {
   </section>
 
   <section class="card swarm">
-    <div class="card__head"><h2>The swarm</h2><span class="hint">two identities · separated authority</span></div>
+    <div class="card__head"><h2>The swarm</h2><span class="hint">3 agents · separated authority</span></div>
+    <div class="ag__grid">
+      ${AGENTS.map(agentCard).join("")}
+    </div>
+    <div class="swarm__sub">Last round · PROPONE → AUTORIZA</div>
     <div class="swarm__grid">
       ${swarmColumn("PROPONE", "Tesorería · operator", OPERATOR)}
       <div class="swarm__link" aria-hidden="true">→</div>
@@ -85,6 +134,8 @@ function render(): string {
     </div>
     <p class="note">The <strong>operator can only evaluate</strong> — authorized by the on-chain tally (INV-2), it cannot move capital. Capital is executed by the <strong>admin</strong> (INV-1). Even a jailbroken operator can't pay out: <code>release_to_producer</code> reverts with <code>NotAdmin</code> for anyone but the admin identity.</p>
   </section>
+
+  ${mutualSection()}
 
   <footer class="foot">
     Every hash is a real transaction on Casper Testnet · <code>error_message=None</code> · lote #${LOTE.id} settled hands-free by the agent swarm.

@@ -55,3 +55,57 @@ export const shortHash = (h: string, n = 10): string =>
   h.length > n * 2 ? `${h.slice(0, n)}…${h.slice(-4)}` : h;
 
 export const explorerUrl = (tx: string): string => `${EXPLORER}${tx}`;
+
+// ── Fase b: el enjambre (tarjetas de agente) ──────────────────────────────
+export type AgentStatus = "live" | "roadmap";
+export interface Agent {
+  readonly name: string;
+  readonly role: string;
+  readonly account?: string;
+  readonly status: AgentStatus;
+  readonly does: string; // qué hace (donde aporta)
+  readonly authority: string; // su límite on-chain
+  readonly lastAction?: string;
+  readonly lastTx?: string;
+}
+export const AGENTS: readonly Agent[] = [
+  {
+    name: "Tesorería", role: "operator", account: OPERATOR, status: "live",
+    does: "observa la ventana; dispara evaluate_lote",
+    authority: "solo evaluate_lote — no puede mover capital (INV-2)",
+    lastAction: "evaluate_lote(4) → EVAL_OK",
+    lastTx: "58d917305b1552dde941cab76c65ac7d635e55c288069ef6b4cc7ee9a7da21bc",
+  },
+  {
+    name: "Autorizador", role: "admin", account: ADMIN, status: "live",
+    does: "ejecuta el movimiento de capital tras la evaluación",
+    authority: "release / settle (admin; futuro multisig nativo, INV-1)",
+    lastAction: "release_to_producer(4) → SETTLED_OK",
+    lastTx: "c1f374a2de8704391edb47de27681eef4c66ceb7b81f6a1965c9a4a065af4c95",
+  },
+  {
+    name: "Agregador", role: "—", status: "roadmap",
+    does: "demanda en lenguaje natural → spec → open_lote (LLM)",
+    authority: "open_lote; el LLM narra, el clearing es determinista",
+  },
+  {
+    name: "Mutual / Riesgo", role: "—", status: "roadmap",
+    does: "informe de solvencia + propuesta de prima a gobernanza",
+    authority: "observa; no ejecuta (lo ejecuta el admin)",
+  },
+];
+
+// ── Fase c: la mutual (gauge) ── derivado del historial on-chain ──────────
+export const MUTUAL = {
+  pool: "hash-2cbbd92b6b3b6ef3629da0330e7b63213a8a04c03b3721b0dbc2a2d73f685cb0",
+  premiumsCspr: 0.1, // 0.5% de 2 releases (lotes 2 y 4, funded 10 CSPR c/u)
+  tailPaidCspr: 0, // bond ≥ target ⇒ el pool nunca paga cola
+  reserveCspr: 0.1, // primas acumuladas, sin pérdidas
+  premiumEvents: [
+    { lote: 2, cspr: 0.05 },
+    { lote: 4, cspr: 0.05 },
+  ],
+  note:
+    "bond ≥ target se exige en lock_lote → el que falla paga primero desde su bono; " +
+    "la mutual es un backstop de cola que hasta hoy no se ha tocado (tail = 0).",
+} as const;

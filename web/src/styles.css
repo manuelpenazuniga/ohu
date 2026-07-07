@@ -108,7 +108,37 @@ body {
 
 .foot { color: var(--faint); font-size: 12.5px; text-align: center; margin-top: 30px; }
 
+/* Agent cards (swarm phase b) */
+.ag__grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin: 6px 0 20px; }
+.ag { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 15px 16px; }
+.ag--roadmap { opacity: .62; border-style: dashed; }
+.ag--live { border-color: var(--accent-dim); }
+.ag__top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ag__name { font-weight: 600; font-size: 14px; }
+.ag__status { font-family: var(--mono); font-size: 9.5px; font-weight: 700; letter-spacing: .1em; padding: 2px 7px; border-radius: 5px; }
+.ag__status--live { color: var(--green); background: color-mix(in srgb, var(--green) 16%, transparent); }
+.ag__status--roadmap { color: var(--faint); background: var(--panel); border: 1px solid var(--line); }
+.ag__role { font-family: var(--mono); font-size: 11.5px; color: var(--accent); margin-top: 2px; }
+.ag__acct { display: block; font-family: var(--mono); font-size: 11px; color: var(--faint); margin: 6px 0 0; }
+.ag__acct--none { color: var(--faint); opacity: .7; }
+.ag__does { font-size: 12.5px; color: var(--muted); margin: 10px 0 8px; }
+.ag__auth { font-size: 11.5px; color: var(--faint); border-left: 2px solid var(--line); padding-left: 9px; }
+.ag__last { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.swarm__sub { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; color: var(--faint); text-transform: uppercase; margin-bottom: 10px; }
+
+/* Mutual gauge (phase c) */
+.mutual__stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 16px 0 14px; }
+.stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.stat__n { display: block; font-family: var(--mono); font-size: 24px; font-weight: 650; letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+.stat__n--good { color: var(--green); }
+.stat__l { font-size: 11.5px; color: var(--muted); }
+.mutual__bar { display: flex; gap: 3px; height: 12px; margin: 4px 0 14px; border-radius: 6px; overflow: hidden; background: var(--panel-2); }
+.seg { background: var(--accent); }
+.seg--empty { background: repeating-linear-gradient(45deg, var(--line), var(--line) 4px, transparent 4px, transparent 8px); }
+
 @media (max-width: 640px) {
   .swarm__grid { grid-template-columns: 1fr; }
   .swarm__link { transform: rotate(90deg); justify-content: center; }
+  .ag__grid { grid-template-columns: 1fr; }
+  .mutual__stats { grid-template-columns: 1fr; }
 }
