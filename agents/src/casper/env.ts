@@ -16,10 +16,6 @@ export interface SwarmConfig {
   readonly vaultPackageHash: string;
   /** Ventana de atestación en milisegundos. */
   readonly attestationWindowMs: number;
-  /** Path al PEM Ed25519 del operator (Tesorería). */
-  readonly operatorSecretKeyPath: string;
-  /** Path al PEM Ed25519 del admin (Autorizador). */
-  readonly adminSecretKeyPath: string;
   /** Cuenta-hash del operator para logging de identidad. */
   readonly operatorAccountHash: string;
   /** Cuenta-hash del admin para logging de identidad. */
@@ -58,8 +54,11 @@ export function normalizePackageHash(raw: string): string {
 }
 
 /**
- * Carga y valida la configuración compartida del enjambre (Tesorería + Autorizador).
+ * Carga y valida la configuración COMÚN del enjambre (Tesorería + Autorizador).
+ * NO carga llaves: cada proceso debe usar su loader de rol.
  * Lanza si faltan variables requeridas.
+ *
+ * @internal — usa `loadOperatorConfig()` o `loadAdminConfig()` en su lugar.
  */
 export function loadSwarmConfig(): SwarmConfig {
   const nodeUrl = required("NODE_URL");
@@ -70,8 +69,6 @@ export function loadSwarmConfig(): SwarmConfig {
     required("OHUVAULT_ATTESTATION_WINDOW_MS"),
     10,
   );
-  const operatorSecretKeyPath = required("OPERATOR_SECRET_KEY_PATH");
-  const adminSecretKeyPath = required("ADMIN_SECRET_KEY_PATH");
   const operatorAccountHash = required("OHUVAULT_OPERATOR_ACCOUNT_HASH");
   const adminAccountHash = required("OHUVAULT_ADMIN_ACCOUNT_HASH");
 
@@ -108,8 +105,6 @@ export function loadSwarmConfig(): SwarmConfig {
     chainName,
     vaultPackageHash,
     attestationWindowMs,
-    operatorSecretKeyPath,
-    adminSecretKeyPath,
     operatorAccountHash,
     adminAccountHash,
     pollIntervalMs,
@@ -117,5 +112,33 @@ export function loadSwarmConfig(): SwarmConfig {
     targetLotes,
     autorizadorStartDelayMs,
     txPaymentMotes,
+  };
+}
+
+/**
+ * Configuración del rol Operator (Tesorería).
+ * Carga la config común + el path de la llave operator. NO lee admin.
+ * @throws si falta OPERATOR_SECRET_KEY_PATH.
+ */
+export function loadOperatorConfig(): SwarmConfig & {
+  readonly operatorSecretKeyPath: string;
+} {
+  return {
+    ...loadSwarmConfig(),
+    operatorSecretKeyPath: required("OPERATOR_SECRET_KEY_PATH"),
+  };
+}
+
+/**
+ * Configuración del rol Admin (Autorizador).
+ * Carga la config común + el path de la llave admin. NO lee operator.
+ * @throws si falta ADMIN_SECRET_KEY_PATH.
+ */
+export function loadAdminConfig(): SwarmConfig & {
+  readonly adminSecretKeyPath: string;
+} {
+  return {
+    ...loadSwarmConfig(),
+    adminSecretKeyPath: required("ADMIN_SECRET_KEY_PATH"),
   };
 }

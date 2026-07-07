@@ -11,8 +11,6 @@ function makeTestConfig(overrides: Partial<SwarmConfig> = {}): SwarmConfig {
     chainName: "casper-test",
     vaultPackageHash: "a".repeat(64),
     attestationWindowMs: 300000,
-    operatorSecretKeyPath: "/tmp/op.pem",
-    adminSecretKeyPath: "/tmp/ad.pem",
     operatorAccountHash: "00" + "aa".repeat(32),
     adminAccountHash: "00" + "bb".repeat(32),
     pollIntervalMs: 15000,

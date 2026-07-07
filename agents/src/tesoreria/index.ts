@@ -14,7 +14,7 @@
  *   tsx --env-file=../../.env src/tesoreria/index.ts   # usa SWARM_TARGET_LOTES
  */
 import "dotenv/config";
-import { loadSwarmConfig } from "../casper/env.js";
+import { loadOperatorConfig } from "../casper/env.js";
 import { loadOperatorKey } from "../casper/keys.js";
 import { evaluateLote } from "../casper/vault-client.js";
 import { OHUVAULT_ERRORS, FATAL_AUTH_ERRORS } from "../casper/errors.js";
@@ -50,7 +50,7 @@ function parseTargetLotes(): number[] {
 }
 
 async function main(): Promise<void> {
-  const config = loadSwarmConfig();
+  const config = loadOperatorConfig();
   const key = loadOperatorKey(config.operatorSecretKeyPath);
   const logger: SwarmLogger = createSwarmLogger(config.logFile);
   const agentAccount = config.operatorAccountHash;

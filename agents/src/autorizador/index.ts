@@ -15,7 +15,7 @@
  *   tsx --env-file=../../.env src/autorizador/index.ts   # usa SWARM_TARGET_LOTES
  */
 import "dotenv/config";
-import { loadSwarmConfig } from "../casper/env.js";
+import { loadAdminConfig } from "../casper/env.js";
 import { loadAdminKey } from "../casper/keys.js";
 import { releaseToProducer, settleFailure } from "../casper/vault-client.js";
 import { OHUVAULT_ERRORS, FATAL_AUTH_ERRORS } from "../casper/errors.js";
@@ -51,7 +51,7 @@ function parseTargetLotes(): number[] {
 }
 
 async function main(): Promise<void> {
-  const config = loadSwarmConfig();
+  const config = loadAdminConfig();
   const key = loadAdminKey(config.adminSecretKeyPath);
   const logger: SwarmLogger = createSwarmLogger(config.logFile);
   const agentAccount = config.adminAccountHash;
