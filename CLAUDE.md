@@ -30,6 +30,36 @@ Ohu = **agentic cooperative procurement + a parametric mutual** on Casper. Small
 3. **Never put unreleased/immature tech on the critical path** — build only on what is live on testnet *today* (Odra 1.0+, casper-eip-712, native associated keys, x402 via `make-software/casper-x402` with a local-facilitator fallback, CSPR.cloud). Verify status before assuming.
 4. **Closed-circuit data only** (no external price/oracle as truth); **parametric settlement, never appraisal**; value ≥ operational complexity; agents only do what agents do well.
 
+## Design system — "El Almanaque" (web/)
+
+Identidad visual de todo lo web (landing, onboarding, dashboard): **almanaque agrícola + libro de cuentas de cooperativa**, con acentos de **pixel art de huerto**. Papel, tinta y sellos de goma — no SaaS oscuro. Estos tokens tienen prioridad sobre cualquier default.
+
+### Tokens
+
+- **Paleta día (papel):** fondo `#F6F1E3` (papel crema), panel `#FDFAF1`, tinta `#26221A` (negro cálido), líneas `#D8CDB4`, texto secundario `#6B5F49`.
+- **Colores vivos (máx. 3 en pantalla):** verde huerto `#3D6B35` (primario: marca, acciones, estados sanos), teja `#C65530` (sellos/attestations, alertas, CTA secundario), trigo `#E0A32E` (cosecha, éxito, recompensas).
+- **Paleta noche (campo de noche):** fondo `#171512`, panel `#201D18`, tinta `#EDE6D6`, líneas `#3A342A`; los vivos se aclaran: verde `#8FBF6B`, teja `#E07A50`, trigo `#E8B44A`.
+- **Tipografía:** display **Fraunces** (títulos, cifras hero — usar sus ejes ópticos/wonk); cuerpo **Instrument Sans**; datos on-chain (hashes, motes, direcciones) **IBM Plex Mono**; **Silkscreen** (píxel) solo en micro-etiquetas lúdicas ≤ 12px (badges, logros del onboarding) — nunca en párrafos ni datos.
+- **Formas:** bordes 2px sólidos (tinta o línea), radius 6px. Nada de sombras difusas: los elementos interactivos usan sombra dura desplazada (`3px 3px 0` color tinta), estética de imprenta/grabado. Espaciado en escala de 8px.
+
+### Motivos (usar el vocabulario del producto, no metáforas genéricas)
+
+- **Attestations = sellos de goma:** círculo de borde dentado, tinta teja, rotación sutil (−3°…3°), fecha dentro. Un batch liquidado lleva sus sellos estampados.
+- **Ciclo del batch = ciclo de cultivo:** Semilla (formación) → Brote (financiado) → Floración (en reparto) → Cosecha (entregado) → Granero (liquidado). Cada estado tiene sprite pixel art 24×24.
+- **Progreso = surco que se planta** (huecos que se van llenando de brotes), no barras de progreso genéricas. Cantidades/lotes como etiquetas de caja de cosecha.
+
+### Pixel art — reglas de uso
+
+- Solo como **acento**: sprites de 16/24/32px escalados ×2–×3 con `image-rendering: pixelated`, paleta limitada a los tokens (≤ 8 colores), sin anti-aliasing.
+- **Dónde sí:** hero de la landing (escena de huerto), onboarding (mascota + logros), iconos del ciclo del batch, estados vacíos.
+- **Dónde no:** jamás UI completa en píxel, jamás en datos financieros/on-chain (ahí mandan el mono y los sellos).
+
+### Prohibiciones
+
+Nada de: gradientes morado/teal, glassmorphism, Inter/system-ui como display, emojis como iconografía, cards flotantes con sombra suave, dark-mode-por-defecto. **La UI es en inglés** (audiencia del buildathon), con léxico cooperativo/agrícola: crew, harvest, barn, ledger, y "ohu" como nombre propio ("Join the ohu").
+
+Los prompts de generación de assets (Nano Banana / Stitch) viven en `docs/design/prompts-arte.md`.
+
 ## Conventions
 
 - Documents are in **Spanish**; keep new docs in Spanish to match.

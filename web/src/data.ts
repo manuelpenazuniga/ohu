@@ -1,6 +1,7 @@
 // Datos REALES del enjambre de Ohu en Casper Testnet (lote 4, liquidado por los
 // agentes sin intervención humana el 2026-07-07). Cada hash es una transacción
 // verificada on-chain (error_message=None). Ver infra/deployments/testnet.md §P1-2.
+// La UI es en inglés (audiencia del buildathon) — ver CLAUDE.md.
 
 export const NETWORK = "casper-test";
 export const EXPLORER = "https://testnet.cspr.live/deploy/";
@@ -13,7 +14,7 @@ export const ADMIN =
   "account-hash-59d06759666ef90a065d023c4c2b6a77708c38945380a0b36380f07e71bd70b4";
 
 export type StepKind = "setup" | "agent";
-export type Column = "PROPONE" | "AUTORIZA";
+export type Column = "PROPOSES" | "AUTHORIZES";
 
 export interface LoteStep {
   readonly n: number;
@@ -24,6 +25,8 @@ export interface LoteStep {
   readonly tx: string;
   readonly column?: Column;
   readonly result?: string;
+  /** Qué hace este paso, en cristiano — se muestra bajo el entrypoint. */
+  readonly explain: string;
 }
 
 export interface Lote {
@@ -42,12 +45,38 @@ export const LOTE: Lote = {
   premiumBps: 50,
   quorumFailBps: 6000,
   steps: [
-    { n: 1, state: "OPEN", entrypoint: "open_lote", actor: "admin", kind: "setup", tx: "66a2b8e5a945fb7c26628d203011528e409a8d743a16d67025524e37eaf9f03a" },
-    { n: 2, state: "OPEN", entrypoint: "deposit_to_lote", actor: "buyer", kind: "setup", tx: "fc46859a4e8dcc50dd5baff7bb8034c3b2988bd5ffb7c7a91da0ef80e3f2e139" },
-    { n: 3, state: "OPEN", entrypoint: "post_bond", actor: "producer", kind: "setup", tx: "700a14664c999789c0abbb2f0cfb9e0a3cf0f67a4da31b17abba9c3097bcd5bb" },
-    { n: 4, state: "FUNDED", entrypoint: "lock_lote", actor: "admin", kind: "setup", tx: "0e102eab8504785fa6b9cde31d9e3adc53b89f8cf5a1f12aacb5c5f4a88902f4" },
-    { n: 5, state: "EVAL_OK", entrypoint: "evaluate_lote", actor: "operator", kind: "agent", column: "PROPONE", result: "EVAL_OK", tx: "58d917305b1552dde941cab76c65ac7d635e55c288069ef6b4cc7ee9a7da21bc" },
-    { n: 6, state: "SETTLED_OK", entrypoint: "release_to_producer", actor: "admin", kind: "agent", column: "AUTORIZA", result: "SETTLED_OK", tx: "c1f374a2de8704391edb47de27681eef4c66ceb7b81f6a1965c9a4a065af4c95" },
+    {
+      n: 1, state: "OPEN", entrypoint: "open_lote", actor: "admin", kind: "setup",
+      tx: "66a2b8e5a945fb7c26628d203011528e409a8d743a16d67025524e37eaf9f03a",
+      explain: "A furrow is opened in the ledger: target amount, delivery window, premium and quorum are fixed on-chain. Nobody can quietly change the rules afterwards.",
+    },
+    {
+      n: 2, state: "OPEN", entrypoint: "deposit_to_lote", actor: "buyer", kind: "setup",
+      tx: "fc46859a4e8dcc50dd5baff7bb8034c3b2988bd5ffb7c7a91da0ef80e3f2e139",
+      explain: "Buyers sow their money: deposits are earmarked to THIS batch inside the vault's purse. They can only travel to its producer — or back home.",
+    },
+    {
+      n: 3, state: "OPEN", entrypoint: "post_bond", actor: "producer", kind: "setup",
+      tx: "700a14664c999789c0abbb2f0cfb9e0a3cf0f67a4da31b17abba9c3097bcd5bb",
+      explain: "The producer stakes a performance bond ≥ the batch target. If delivery fails, this bond pays first — skin in the game before a single crate moves.",
+    },
+    {
+      n: 4, state: "FUNDED", entrypoint: "lock_lote", actor: "admin", kind: "setup",
+      tx: "0e102eab8504785fa6b9cde31d9e3adc53b89f8cf5a1f12aacb5c5f4a88902f4",
+      explain: "The batch sprouts: funding target met and bond verified, so the state machine locks it. From here on, only attestations and arithmetic decide the outcome.",
+    },
+    {
+      n: 5, state: "EVAL_OK", entrypoint: "evaluate_lote", actor: "operator", kind: "agent",
+      column: "PROPOSES", result: "EVAL_OK",
+      tx: "58d917305b1552dde941cab76c65ac7d635e55c288069ef6b4cc7ee9a7da21bc",
+      explain: "The Treasury agent tallies the signed delivery attestations. It can only PROPOSE the verdict the numbers already say — it cannot touch a single mote.",
+    },
+    {
+      n: 6, state: "SETTLED_OK", entrypoint: "release_to_producer", actor: "admin", kind: "agent",
+      column: "AUTHORIZES", result: "SETTLED_OK",
+      tx: "c1f374a2de8704391edb47de27681eef4c66ceb7b81f6a1965c9a4a065af4c95",
+      explain: "A separate admin identity executes what the on-chain tally authorized: escrow → producer, bond back, premium → mutual. Harvest in the barn, hands-free.",
+    },
   ],
 };
 
@@ -61,32 +90,32 @@ export interface RedTeamAttempt {
   readonly tx: string;
 }
 export const REDTEAM: readonly RedTeamAttempt[] = [
-  { attack: "El agente gasta sobre su límite", by: "operator", entrypoint: "route_micropayment(5 CSPR)", error: "CapExceeded", protection: "spending cap (INV-1)", tx: "89354977b39d58c2b21403a7032e7ca10ef8a7e4c16105100e0d8d64c6e2b27f" },
-  { attack: "El agente ejecuta un retiro", by: "operator", entrypoint: "execute()", error: "NotAdmin", protection: "role separation", tx: "67dc7eb30beff8d0f633da2d5cdfeed9dc9040f93e912d4e5dc81ea94a8da0b9" },
-  { attack: "Liquidar un lote que no falló", by: "admin", entrypoint: "settle_failure(4)", error: "LoteNotFailable", protection: "state machine", tx: "979b6c3eda28f76e8f5a0cbc40667936e9a1c99d9443a3c6ce0a35d41e6fad9a" },
+  { attack: "Agent spends over its cap", by: "operator", entrypoint: "route_micropayment(5 CSPR)", error: "CapExceeded", protection: "spending cap (INV-1)", tx: "89354977b39d58c2b21403a7032e7ca10ef8a7e4c16105100e0d8d64c6e2b27f" },
+  { attack: "Agent tries to execute a withdrawal", by: "operator", entrypoint: "execute()", error: "NotAdmin", protection: "role separation", tx: "67dc7eb30beff8d0f633da2d5cdfeed9dc9040f93e912d4e5dc81ea94a8da0b9" },
+  { attack: "Settle a batch that didn't fail", by: "admin", entrypoint: "settle_failure(4)", error: "LoteNotFailable", protection: "state machine", tx: "979b6c3eda28f76e8f5a0cbc40667936e9a1c99d9443a3c6ce0a35d41e6fad9a" },
 ];
 
 /** F10 · Trust: invariantes, lentes de auditoría y casos reales cazados. */
 export const INVARIANTS: ReadonlyArray<{ id: string; text: string }> = [
-  { id: "INV-1", text: "El agente nunca mueve capital relevante — solo entrypoints capados" },
-  { id: "INV-2", text: "Ninguna liberación depende del LLM — la autoriza el tally on-chain" },
-  { id: "INV-3", text: "Sin Addressable Entity — purse + multisig nativo + M-de-N en contrato" },
-  { id: "INV-4", text: "x402 solo para servicios HTTP — el escrow es una transferencia del contrato" },
-  { id: "INV-5", text: "Atestaciones Ed25519 firmadas off-chain, verificadas on-chain (gasless)" },
-  { id: "INV-6", text: "Datos de circuito cerrado — settlement aritmético sobre atestaciones ponderadas" },
-  { id: "INV-7", text: "Escrow earmarked por lote — los fondos solo van a su productor o de vuelta" },
+  { id: "INV-1", text: "The agent never moves meaningful capital — capped entry points only" },
+  { id: "INV-2", text: "No release depends on the LLM — the on-chain tally authorizes it" },
+  { id: "INV-3", text: "No Addressable Entity — purse + native multisig + M-of-N in the contract" },
+  { id: "INV-4", text: "x402 only for HTTP services — escrow settles as a contract transfer" },
+  { id: "INV-5", text: "Ed25519 attestations signed off-chain, verified on-chain (gasless)" },
+  { id: "INV-6", text: "Closed-circuit data — arithmetic settlement over weighted attestations" },
+  { id: "INV-7", text: "Escrow earmarked per batch — funds go to its producer or back, nowhere else" },
 ];
 
 export const AUDIT_LENSES: ReadonlyArray<{ model: string; lens: string }> = [
-  { model: "Claude", lens: "conservación de fondos" },
-  { model: "Gemini 3.1 Pro", lens: "corrección algebraica" },
-  { model: "GPT-5.5", lens: "adversarial · teoría de juegos" },
+  { model: "Claude", lens: "conservation of funds" },
+  { model: "Gemini 3.1 Pro", lens: "algebraic correctness" },
+  { model: "GPT-5.5", lens: "adversarial · game theory" },
 ];
 
 export const CASE_STUDIES: ReadonlyArray<{ bug: string; caughtBy: string; missedBy: string; fix: string }> = [
-  { bug: "Un bono de 1 mote drena la mutual (anillo económico)", caughtBy: "GPT-5.5 (adversarial)", missedBy: "176 tests verdes", fix: "bond ≥ target exigido en lock_lote" },
-  { bug: "El config filtraba el path de la llave admin al proceso operator", caughtBy: "GPT-5.5 (adversarial)", missedBy: "el pase de corrección de Gemini", fix: "loadOperatorConfig / loadAdminConfig — separación estructural" },
-  { bug: "El agente reportó SETTLED_OK sobre una tx revertida (Out of gas)", caughtBy: "el E2E on-chain real", missedBy: "typecheck + tests con mocks", fix: "confirmación de doble-lectura (no acepta resultado prematuro)" },
+  { bug: "A 1-mote bond drains the mutual (economic ring)", caughtBy: "GPT-5.5 (adversarial)", missedBy: "176 green tests", fix: "bond ≥ target enforced in lock_lote" },
+  { bug: "Config leaked the admin key path to the operator process", caughtBy: "GPT-5.5 (adversarial)", missedBy: "Gemini's correction pass", fix: "loadOperatorConfig / loadAdminConfig — structural separation" },
+  { bug: "Agent reported SETTLED_OK on a reverted tx (Out of gas)", caughtBy: "the real on-chain E2E", missedBy: "typecheck + mocked tests", fix: "double-read confirmation (no premature success)" },
 ];
 
 export const shortHash = (h: string, n = 10): string =>
@@ -108,31 +137,31 @@ export interface Agent {
 }
 export const AGENTS: readonly Agent[] = [
   {
-    name: "Tesorería", role: "operator", account: OPERATOR, status: "live",
-    does: "observa la ventana; dispara evaluate_lote",
-    authority: "solo evaluate_lote — no puede mover capital (INV-2)",
+    name: "Treasury", role: "operator", account: OPERATOR, status: "live",
+    does: "watches the delivery window; fires evaluate_lote when it closes",
+    authority: "evaluate_lote only — it cannot move capital (INV-2)",
     lastAction: "evaluate_lote(4) → EVAL_OK",
     lastTx: "58d917305b1552dde941cab76c65ac7d635e55c288069ef6b4cc7ee9a7da21bc",
   },
   {
-    name: "Autorizador", role: "admin", account: ADMIN, status: "live",
-    does: "ejecuta el movimiento de capital tras la evaluación",
-    authority: "release / settle (admin; futuro multisig nativo, INV-1)",
+    name: "Authorizer", role: "admin", account: ADMIN, status: "live",
+    does: "executes the capital move after the on-chain tally",
+    authority: "release / settle (admin; native multisig next, INV-1)",
     lastAction: "release_to_producer(4) → SETTLED_OK",
     lastTx: "c1f374a2de8704391edb47de27681eef4c66ceb7b81f6a1965c9a4a065af4c95",
   },
   {
-    name: "Agregador", role: "operator", account: OPERATOR, status: "live",
-    does: "demanda en lenguaje natural → spec (Gemini) → bin-packing → RFQ → open_lote",
-    authority: "open_lote; el LLM SOLO normaliza, el clearing es determinista (INV-2)",
-    lastAction: "8 demandas NL → lote #5 abierto",
+    name: "Aggregator", role: "operator", account: OPERATOR, status: "live",
+    does: "natural-language demand → spec (Gemini) → bin-packing → RFQ → open_lote",
+    authority: "open_lote; the LLM ONLY normalizes — clearing is deterministic (INV-2)",
+    lastAction: "8 NL demands → batch #5 opened",
     lastTx: "ad202f9d9323cbe8be88f6ec92a202d23cfc1c95cd4b6f3c0d25ba5793add2f1",
   },
   {
-    name: "Mutual / Riesgo", role: "observador", status: "live",
-    does: "informe de solvencia + propuesta de prima a gobernanza (números on-chain reales)",
-    authority: "solo observa (read-only); no ejecuta — la prima la cambia el admin",
-    lastAction: "reserva 0.1 CSPR · ratio 10 · SOLVENTE",
+    name: "Mutual / Risk", role: "observer", status: "live",
+    does: "solvency report + premium proposal to governance (real on-chain numbers)",
+    authority: "read-only observer — the premium is changed by the admin, not the model",
+    lastAction: "reserve 0.1 CSPR · ratio 10 · SOLVENT",
   },
 ];
 
@@ -147,6 +176,6 @@ export const MUTUAL = {
     { lote: 4, cspr: 0.05 },
   ],
   note:
-    "bond ≥ target se exige en lock_lote → el que falla paga primero desde su bono; " +
-    "la mutual es un backstop de cola que hasta hoy no se ha tocado (tail = 0).",
+    "bond ≥ target is enforced in lock_lote → whoever fails pays first, from their own bond; " +
+    "the mutual is a tail-of-loss backstop that so far has never been touched (tail = 0).",
 } as const;

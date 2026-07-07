@@ -7,10 +7,14 @@ describe('swarm dashboard dataset (lote 4, real on-chain)', () => {
     expect(LOTE.steps).toHaveLength(6);
   });
 
-  it('has exactly 2 agent steps: PROPONE then AUTORIZA', () => {
+  it('has exactly 2 agent steps: PROPOSES then AUTHORIZES', () => {
     const agents = LOTE.steps.filter((s) => s.kind === 'agent');
     expect(agents).toHaveLength(2);
-    expect(agents.map((s) => s.column)).toEqual(['PROPONE', 'AUTORIZA']);
+    expect(agents.map((s) => s.column)).toEqual(['PROPOSES', 'AUTHORIZES']);
+  });
+
+  it('every step explains itself (English UI)', () => {
+    for (const s of LOTE.steps) expect(s.explain.length).toBeGreaterThan(40);
   });
 
   it('every step carries a 64-hex tx hash', () => {
