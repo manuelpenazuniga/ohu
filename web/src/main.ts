@@ -122,7 +122,7 @@ function render(): string {
   </section>
 
   <section class="card swarm">
-    <div class="card__head"><h2>The swarm</h2><span class="hint">3 agents · separated authority</span></div>
+    <div class="card__head"><h2>The swarm</h2><span class="hint">4 agents live · separated authority</span></div>
     <div class="ag__grid">
       ${AGENTS.map(agentCard).join("")}
     </div>

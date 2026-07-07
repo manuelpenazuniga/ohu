@@ -36,8 +36,12 @@
 > score 73). Fallback seed marcado + 503 si la fuente cae. **P1-4 ✅ agente Mutual/Riesgo**: informe
 > de solvencia derivado del historial on-chain (CSPR.cloud) — reserva 0.1 CSPR, ratio 10, SOLVENTE,
 > prima recomendada 50 bps como PROPUESTA (no ejecuta). El enjambre de 3 (Tesorería/Autorizador/Mutual)
-> está vivo. **CI reparado** (symlink web/node_modules fuera de git + cargo fmt + clippy). **Ahora:
-> P1-3 Agregador LLM** (necesita ANTHROPIC_API_KEY). **Pendiente menor:** multisig admin (Parte B); P0-3/P0-4.
+> está vivo. **CI reparado** (symlink web/node_modules fuera de git + cargo fmt + clippy). **P1-4 ✅ ·
+> P1-3 ✅ Agregador (Gemini):** 8 demandas en lenguaje natural → 1 llamada a Gemini normaliza → bin-packing
+> determinista → RFQ → clearing (el LLM NO elige; test adversarial) → `open_lote(#5)` on-chain
+> (tx `ad202f9d…`, error_message=None). **El enjambre de 4 agentes está vivo** (Agregador/Tesorería/
+> Autorizador/Mutual). **P1 esencialmente completo.** **Pendiente menor:** multisig admin (Parte B);
+> P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
