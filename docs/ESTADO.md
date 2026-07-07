@@ -28,9 +28,10 @@
 > separadas, liquidaron el lote 4 **sin humano** (PROPONE `evaluate_lote`→EVAL_OK `58d9…` / AUTORIZA
 > `release_to_producer`→SETTLED_OK `c1f3…`, ambas `error_message=None`). Triple-audit (GPT-5.5 cazó
 > fuga de separación de llaves) + **6 fixes de integración TS↔Casper que solo el E2E real destapa**
-> (ver `infra/deployments/testnet.md §P1-2`). **Ahora: resto de P1** (P1-1 reputación real, P1-5
-> dashboard "Sala de Control", P1-3 Agregador). **Pendiente menor:** multisig nativo admin (Parte B);
-> P0-3 vídeo + P0-4 BUIDL/redes (operador).
+> (ver `infra/deployments/testnet.md §P1-2`). **P1-5 ✅ dashboard "Sala de Control"** (`web/`, SPA
+> vanilla+Vite: timeline del lote 4 con tx clickeables + feed bicolumna PROPONE→AUTORIZA; `pnpm --dir
+> web dev`). **Ahora: resto de P1** (P1-1 reputación real, P1-3 Agregador LLM). **Pendiente menor:**
+> multisig nativo admin (Parte B); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
 ---
