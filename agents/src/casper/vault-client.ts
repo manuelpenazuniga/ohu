@@ -40,6 +40,8 @@ export interface VaultCallResult {
 const CONFIRM_TIMEOUT_MS = 150_000;
 /** Intervalo de sondeo de la confirmación. */
 const CONFIRM_POLL_MS = 4_000;
+/** Espera de asentamiento tras ver el resultado, para leer el error ya finalizado. */
+const CONFIRM_SETTLE_MS = 6_000;
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -120,10 +122,18 @@ export async function callVaultEntrypoint(
       // -32014 aunque el deploy sí exista y haya ejecutado).
       const info = await rpc.getTransactionByDeployHash(txHash);
       if (info.executionInfo) {
-        // La tx ya ejecutó: errorMessage vacío = éxito; poblado = revert Odra.
+        // El `errorMessage` (p.ej. "Out of gas error") puede poblarse un instante
+        // DESPUÉS de que aparece `executionInfo`: leer aquí a secas reportaría un
+        // éxito falso. Se re-lee tras un breve settle para tomar el resultado ya
+        // finalizado como autoritativo.
+        await sleep(CONFIRM_SETTLE_MS);
+        const finalInfo = await rpc.getTransactionByDeployHash(txHash);
         const errorMessage =
-          info.executionInfo.executionResult?.errorMessage ?? undefined;
+          finalInfo.executionInfo?.executionResult?.errorMessage ??
+          info.executionInfo.executionResult?.errorMessage ??
+          undefined;
         if (errorMessage) {
+          // Revert de Odra ("User error: N") o error de sistema (out of gas, etc.).
           return {
             txHash,
             success: false,
