@@ -1,5 +1,9 @@
 # Ideación / historial de brainstorming — no versionado
 docs/brainstorming/
+docs/description/
+docs/design/
+docs/plan/auditoria-y-plan-de-victoria.md
+docs/plan/auditoria-y-plan-de-victoria-v2.md
 
 # Secrets
 .env
