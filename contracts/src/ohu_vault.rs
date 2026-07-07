@@ -1414,9 +1414,7 @@ impl OhuVault {
 
         // El productor recibe (funded + bond - premium); la premium va al pool.
         // premium <= total garantizado: premium = funded * bps/10000 <= funded < total.
-        let producer_payout = total
-            .checked_sub(premium)
-            .unwrap_or(U512::zero());
+        let producer_payout = total.checked_sub(premium).unwrap_or(U512::zero());
 
         // CEI: effects antes que interactions.
         self.lote_state.set(&lote_id, LOTE_STATE_SETTLED_OK);
@@ -1433,8 +1431,7 @@ impl OhuVault {
 
         if premium > U512::zero() {
             if let Some(pool_addr) = pool_addr_opt {
-                let pool =
-                    crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
+                let pool = crate::mutual_pool::MutualPoolContractRef::new(self.env(), pool_addr);
                 pool.with_tokens(premium).collect_premium();
             }
         }
@@ -1503,9 +1500,7 @@ impl OhuVault {
             lote_target_val
         };
 
-        let excess = bond
-            .checked_sub(indemnity)
-            .unwrap_or(U512::zero());
+        let excess = bond.checked_sub(indemnity).unwrap_or(U512::zero());
 
         // C-2 (audit): liberar excedente del reserved (surplus slasheado).
         if excess > U512::zero() {
@@ -1810,7 +1805,8 @@ impl OhuVault {
 
     /// ¿El comprador ya reclamó su refund + indemnización de este lote fallido?
     pub fn lote_settlement_claimed(&self, lote_id: u64, buyer: Address) -> bool {
-        self.lote_settlement_claimed.get_or_default(&(lote_id, buyer))
+        self.lote_settlement_claimed
+            .get_or_default(&(lote_id, buyer))
     }
 
     // ── W2-3: MutualPool setters (admin-only) ───────────────────────
@@ -1897,13 +1893,12 @@ impl OhuVault {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttestationRecorded, BondPosted, DepositedToLote, Deposit, Error, LoteFunded, LoteOpened,
-        LOTE_STATE_EVAL_FAIL, LOTE_STATE_EVAL_OK,
-        LOTE_STATE_FUNDED, LOTE_STATE_OPEN, LOTE_STATE_SETTLED_FAIL, LOTE_STATE_SETTLED_OK,
-        LoteEvaluated, LoteSettledFail, SettlementWithdrawn,
-        MicropaymentRouted, OhuVault, OhuVaultHostRef, OhuVaultInitArgs,
-        ReleaseApproved, ReleasedToProducer, ReleaseProposed,
-        WithdrawApproved, WithdrawExecuted, WithdrawProposed,
+        AttestationRecorded, BondPosted, Deposit, DepositedToLote, Error, LoteEvaluated,
+        LoteFunded, LoteOpened, LoteSettledFail, MicropaymentRouted, OhuVault, OhuVaultHostRef,
+        OhuVaultInitArgs, ReleaseApproved, ReleaseProposed, ReleasedToProducer,
+        SettlementWithdrawn, WithdrawApproved, WithdrawExecuted, WithdrawProposed,
+        LOTE_STATE_EVAL_FAIL, LOTE_STATE_EVAL_OK, LOTE_STATE_FUNDED, LOTE_STATE_OPEN,
+        LOTE_STATE_SETTLED_FAIL, LOTE_STATE_SETTLED_OK,
     };
     use crate::mutual_pool::{MutualPool, MutualPoolHostRef, MutualPoolInitArgs};
     use odra::casper_types::crypto::{self, PublicKey, SecretKey};
@@ -1936,14 +1931,38 @@ mod tests {
     }
 
     fn setup() -> Fixture {
-        setup_with_chain(U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1, 6000, 86_400_000)
+        setup_with_chain(
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(5 * ONE_CSPR),
+            3_600_000,
+            1,
+            6000,
+            86_400_000,
+        )
     }
 
     fn setup_with(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64) -> Fixture {
-        setup_with_chain(cap, required, epoch_cap, epoch_window_ms, 1, 6000, 86_400_000)
+        setup_with_chain(
+            cap,
+            required,
+            epoch_cap,
+            epoch_window_ms,
+            1,
+            6000,
+            86_400_000,
+        )
     }
 
-    fn setup_with_chain(cap: U512, required: u8, epoch_cap: U512, epoch_window_ms: u64, chain_id: u64, quorum_fail_bps: u64, attestation_window_ms: u64) -> Fixture {
+    fn setup_with_chain(
+        cap: U512,
+        required: u8,
+        epoch_cap: U512,
+        epoch_window_ms: u64,
+        chain_id: u64,
+        quorum_fail_bps: u64,
+        attestation_window_ms: u64,
+    ) -> Fixture {
         let env = odra_test::env();
         let admin = env.get_account(0);
         let operator = env.get_account(1);
@@ -2845,14 +2864,19 @@ mod tests {
             c.set(i.wrapping_add(1));
             10u8 + (i % 10)
         });
-        let secret_key = SecretKey::ed25519_from_bytes([idx; 32])
-            .expect("ed25519 secret from [idx;32]");
+        let secret_key =
+            SecretKey::ed25519_from_bytes([idx; 32]).expect("ed25519 secret from [idx;32]");
         let public_key = PublicKey::from(&secret_key);
         let account_hash = public_key.to_account_hash();
         let signer = Address::Account(account_hash);
 
         let message = crate::attestation::build_attestation_message(
-            lote_id, nonce, received, verifying_contract, chain_id, valid_before,
+            lote_id,
+            nonce,
+            received,
+            verifying_contract,
+            chain_id,
+            valid_before,
         );
         let signature = crypto::sign(&message, &secret_key, &public_key);
 
@@ -2878,7 +2902,12 @@ mod tests {
     ) -> [u8; 64] {
         let pk = PublicKey::from(sk);
         let msg = crate::attestation::build_attestation_message(
-            lote_id, nonce, received, verifying_contract, chain_id, valid_before,
+            lote_id,
+            nonce,
+            received,
+            verifying_contract,
+            chain_id,
+            valid_before,
         );
         let sig = crypto::sign(&msg, sk, &pk);
         Into::<Vec<u8>>::into(&sig).try_into().unwrap()
@@ -2905,7 +2934,10 @@ mod tests {
             .try_deposit_to_lote(lote_id);
         // Si falla, mostramos el error para debug.
         if let Err(e) = result {
-            panic!("ensure_buyer: deposit_to_lote failed for lote {} buyer {:?}: {:?}", lote_id, buyer, e);
+            panic!(
+                "ensure_buyer: deposit_to_lote failed for lote {} buyer {:?}: {:?}",
+                lote_id, buyer, e
+            );
         }
     }
 
@@ -2943,9 +2975,9 @@ mod tests {
         ensure_buyer(&mut f, lote_id, signer, 10);
         fund_and_lock(&mut f, lote_id);
         f.env.set_caller(f.operator);
-        let result = f
-            .contract
-            .verify_attestation(lote_id, nonce, received, u64::MAX, pk_bytes, sig_bytes);
+        let result =
+            f.contract
+                .verify_attestation(lote_id, nonce, received, u64::MAX, pk_bytes, sig_bytes);
 
         assert!(result);
         assert!(f.contract.attestation_recorded(lote_id, signer));
@@ -3002,8 +3034,12 @@ mod tests {
         ensure_buyer(&mut f, lote_id, signer2, 10);
         fund_and_lock(&mut f, lote_id);
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(lote_id, 1, true, u64::MAX, pk1, sig1));
-        assert!(f.contract.verify_attestation(lote_id, 1, true, u64::MAX, pk2, sig2));
+        assert!(f
+            .contract
+            .verify_attestation(lote_id, 1, true, u64::MAX, pk1, sig1));
+        assert!(f
+            .contract
+            .verify_attestation(lote_id, 1, true, u64::MAX, pk2, sig2));
 
         assert!(f.contract.attestation_recorded(lote_id, signer1));
         assert!(f.contract.attestation_recorded(lote_id, signer2));
@@ -3014,8 +3050,7 @@ mod tests {
     fn attestation_submit_lote_b_before_lote_a_both_pass() {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
-        let (sk, pk, _, signer) =
-            sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
+        let (sk, pk, _, signer) = sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
 
         ensure_buyer(&mut f, 1, signer, 10);
         ensure_buyer(&mut f, 2, signer, 10);
@@ -3027,9 +3062,13 @@ mod tests {
 
         f.env.set_caller(f.operator);
         // Submit lote B (nonce=2) primero.
-        assert!(f.contract.verify_attestation(2, 2, true, u64::MAX, pk, sig_b));
+        assert!(f
+            .contract
+            .verify_attestation(2, 2, true, u64::MAX, pk, sig_b));
         // Luego lote A (nonce=1) — debe pasar porque el scope es (signer, lote_id).
-        assert!(f.contract.verify_attestation(1, 1, true, u64::MAX, pk, sig_a));
+        assert!(f
+            .contract
+            .verify_attestation(1, 1, true, u64::MAX, pk, sig_a));
 
         assert!(f.contract.attestation_recorded(1, signer));
         assert!(f.contract.attestation_recorded(2, signer));
@@ -3040,8 +3079,7 @@ mod tests {
     fn attestation_same_signer_different_lote_succeeds() {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
-        let (sk, pk, _, signer) =
-            sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
+        let (sk, pk, _, signer) = sign_attestation(1, 1, true, vc_addr, chain_id, u64::MAX);
 
         ensure_buyer(&mut f, 1, signer, 10);
         ensure_buyer(&mut f, 2, signer, 10);
@@ -3051,25 +3089,31 @@ mod tests {
         let sig2 = sign_second(&sk, 2, 100, true, vc_addr, chain_id, u64::MAX);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 1, true, u64::MAX, pk, sig1));
-        assert!(f.contract.verify_attestation(2, 100, true, u64::MAX, pk, sig2));
+        assert!(f
+            .contract
+            .verify_attestation(1, 1, true, u64::MAX, pk, sig1));
+        assert!(f
+            .contract
+            .verify_attestation(2, 100, true, u64::MAX, pk, sig2));
     }
 
     #[test]
     fn attestation_same_nonce_different_signer_succeeds() {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
-        let (_sk1, pk1, sig1, s1) =
-            sign_attestation(1, 3, true, vc_addr, chain_id, u64::MAX);
+        let (_sk1, pk1, sig1, s1) = sign_attestation(1, 3, true, vc_addr, chain_id, u64::MAX);
         ensure_buyer(&mut f, 1, s1, 10);
-        let (_sk2, pk2, sig2, s2) =
-            sign_attestation(1, 3, true, vc_addr, chain_id, u64::MAX);
+        let (_sk2, pk2, sig2, s2) = sign_attestation(1, 3, true, vc_addr, chain_id, u64::MAX);
 
         ensure_buyer(&mut f, 1, s2, 10);
         fund_and_lock(&mut f, 1);
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 3, true, u64::MAX, pk1, sig1));
-        assert!(f.contract.verify_attestation(1, 3, true, u64::MAX, pk2, sig2));
+        assert!(f
+            .contract
+            .verify_attestation(1, 3, true, u64::MAX, pk1, sig1));
+        assert!(f
+            .contract
+            .verify_attestation(1, 3, true, u64::MAX, pk2, sig2));
     }
 
     // ── Negativos ────────────────────────────────────────────────────
@@ -3153,8 +3197,7 @@ mod tests {
     fn attestation_replay_same_lote_same_signer_reverts() {
         let mut f = setup();
         let (vc_addr, chain_id) = vault_domain(&f);
-        let (sk, pk, _, signer) =
-            sign_attestation(1, 5, true, vc_addr, chain_id, u64::MAX);
+        let (sk, pk, _, signer) = sign_attestation(1, 5, true, vc_addr, chain_id, u64::MAX);
         ensure_buyer(&mut f, 1, signer, 10);
         fund_and_lock(&mut f, 1);
         let sig = sign_second(&sk, 1, 5, true, vc_addr, chain_id, u64::MAX);
@@ -3204,12 +3247,17 @@ mod tests {
     #[test]
     fn attestation_different_chain_id_reverts() {
         let mut f = setup_with_chain(
-            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 999, 6000, 86_400_000,
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(5 * ONE_CSPR),
+            3_600_000,
+            999,
+            6000,
+            86_400_000,
         );
         let (vc_addr, _) = vault_domain(&f);
         // Firma con chain_id=1 (incorrecto).
-        let (_, pk_bytes, sig_bytes, signer) =
-            sign_attestation(1, 1, true, vc_addr, 1, u64::MAX);
+        let (_, pk_bytes, sig_bytes, signer) = sign_attestation(1, 1, true, vc_addr, 1, u64::MAX);
 
         ensure_buyer(&mut f, 1, signer, 10);
         f.env.set_caller(f.operator);
@@ -3243,9 +3291,9 @@ mod tests {
         fund_and_lock(&mut f, lote_id);
 
         f.env.set_caller(f.operator);
-        let result = f
-            .contract
-            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+        let result =
+            f.contract
+                .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
 
         assert_eq!(result.unwrap_err(), Error::NotABuyer.into());
     }
@@ -3269,9 +3317,9 @@ mod tests {
         f.env.advance_block_time(valid_before);
 
         f.env.set_caller(f.operator);
-        let result = f
-            .contract
-            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+        let result =
+            f.contract
+                .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
 
         assert_eq!(result.unwrap_err(), Error::AttestationExpired.into());
     }
@@ -3305,11 +3353,17 @@ mod tests {
         f.env.set_caller(f.operator);
 
         // A atesta no-recibido.
-        assert!(f.contract.verify_attestation(lote_id, 1, false, valid_before, pk_a, sig_a));
+        assert!(f
+            .contract
+            .verify_attestation(lote_id, 1, false, valid_before, pk_a, sig_a));
         // B atesta no-recibido.
-        assert!(f.contract.verify_attestation(lote_id, 2, false, valid_before, pk_b, sig_b));
+        assert!(f
+            .contract
+            .verify_attestation(lote_id, 2, false, valid_before, pk_b, sig_b));
         // C atesta sí-recibido.
-        assert!(f.contract.verify_attestation(lote_id, 3, true, valid_before, pk_c, sig_c));
+        assert!(f
+            .contract
+            .verify_attestation(lote_id, 3, true, valid_before, pk_c, sig_c));
 
         // Verificar tally.
         assert_eq!(
@@ -3337,9 +3391,9 @@ mod tests {
         fund_and_lock(&mut f, lote_id);
 
         f.env.set_caller(f.operator);
-        let result = f
-            .contract
-            .verify_attestation(lote_id, 1, false, valid_before, pk_bytes, sig_bytes);
+        let result =
+            f.contract
+                .verify_attestation(lote_id, 1, false, valid_before, pk_bytes, sig_bytes);
 
         assert!(result);
         assert!(f.contract.attestation_recorded(lote_id, signer));
@@ -3347,10 +3401,7 @@ mod tests {
             f.contract.lote_tally_negative(lote_id),
             U512::from(4 * ONE_CSPR)
         );
-        assert_eq!(
-            f.contract.lote_tally_positive(lote_id),
-            U512::zero()
-        );
+        assert_eq!(f.contract.lote_tally_positive(lote_id), U512::zero());
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -3371,9 +3422,9 @@ mod tests {
         // Lote queda OPEN: sin fund_and_lock.
 
         f.env.set_caller(f.operator);
-        let result = f
-            .contract
-            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+        let result =
+            f.contract
+                .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
 
         assert_eq!(result.unwrap_err(), Error::LoteNotFunded.into());
     }
@@ -3395,9 +3446,9 @@ mod tests {
         f.env.advance_block_time(f.attestation_window_ms + 1);
 
         f.env.set_caller(f.operator);
-        let result = f
-            .contract
-            .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
+        let result =
+            f.contract
+                .try_verify_attestation(lote_id, 1, true, valid_before, pk_bytes, sig_bytes);
 
         assert_eq!(result.unwrap_err(), Error::AttestationWindowClosed.into());
     }
@@ -3419,7 +3470,12 @@ mod tests {
         // Atestar DESPUÉS del lock (lote FUNDED, share final = 10 CSPR).
         f.env.set_caller(f.operator);
         assert!(f.contract.verify_attestation(
-            lote_id, 1, false, valid_before, pk_bytes, sig_bytes
+            lote_id,
+            1,
+            false,
+            valid_before,
+            pk_bytes,
+            sig_bytes
         ));
 
         // El tally registra la share FINAL (10 CSPR), no el peso parcial.
@@ -3978,17 +4034,18 @@ mod tests {
             .deposit_to_lote(1);
 
         // Share en lote 2 del mismo comprador = 0 (INV-7: sin cruce)
-        assert_eq!(
-            f.contract.lote_share(1, buyer),
-            U512::from(3 * ONE_CSPR)
-        );
+        assert_eq!(f.contract.lote_share(1, buyer), U512::from(3 * ONE_CSPR));
         assert_eq!(f.contract.lote_share(2, buyer), U512::zero());
     }
 
     #[test]
     fn inv7_three_lotes_fully_isolated() {
         let mut f = simple_setup();
-        let p = [f.env.get_account(7), f.env.get_account(8), f.env.get_account(9)];
+        let p = [
+            f.env.get_account(7),
+            f.env.get_account(8),
+            f.env.get_account(9),
+        ];
         let buyers: Vec<Address> = (10..13).map(|i| f.env.get_account(i)).collect();
         let amounts = [
             U512::from(ONE_CSPR),
@@ -4008,7 +4065,9 @@ mod tests {
         // Depósitos cruzados: cada comprador deposita a su lote
         for i in 0..3u64 {
             f.env.set_caller(buyers[i as usize]);
-            f.contract.with_tokens(amounts[i as usize]).deposit_to_lote(i + 1);
+            f.contract
+                .with_tokens(amounts[i as usize])
+                .deposit_to_lote(i + 1);
         }
 
         // Bonos
@@ -4088,10 +4147,7 @@ mod tests {
         let global_balance = f.env.balance_of(&f.contract);
         assert!(global_balance > f.contract.lote_funded(1));
         // funded del lote = exactamente lo depositado al lote, no el balance global.
-        assert_eq!(
-            f.contract.lote_funded(1),
-            U512::from(3 * ONE_CSPR)
-        );
+        assert_eq!(f.contract.lote_funded(1), U512::from(3 * ONE_CSPR));
     }
 
     // ===============================================================
@@ -4100,11 +4156,19 @@ mod tests {
 
     /// Fundea un lote completo con comprador + bono y lo retorna en estado FUNDED.
     /// Usa el admin para abrir, un comprador (acct 8) para depositar, el producer para el bono.
-    fn fund_lote(f: &mut Fixture, lote_id: u64, producer: Address, funded_amount: U512, bond_amount: U512) {
+    fn fund_lote(
+        f: &mut Fixture,
+        lote_id: u64,
+        producer: Address,
+        funded_amount: U512,
+        bond_amount: U512,
+    ) {
         open_lote(f, lote_id, producer);
         let buyer = f.env.get_account(8);
         f.env.set_caller(buyer);
-        f.contract.with_tokens(funded_amount).deposit_to_lote(lote_id);
+        f.contract
+            .with_tokens(funded_amount)
+            .deposit_to_lote(lote_id);
         f.env.set_caller(producer);
         f.contract.with_tokens(bond_amount).post_bond(lote_id);
         f.env.set_caller(f.operator);
@@ -4141,7 +4205,10 @@ mod tests {
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
         // Productor recibe funded + bond
         assert_eq!(f.env.balance_of(&producer), producer_before + funded + bond);
-        assert_eq!(f.env.balance_of(&f.contract), vault_before - (funded + bond));
+        assert_eq!(
+            f.env.balance_of(&f.contract),
+            vault_before - (funded + bond)
+        );
         // Evento
         assert!(f.env.emitted_event(
             &f.contract,
@@ -4167,7 +4234,10 @@ mod tests {
         f.contract.propose_release(1);
         assert!(f.env.emitted_event(
             &f.contract,
-            ReleaseProposed { lote_id: 1, proposer: f.admin }
+            ReleaseProposed {
+                lote_id: 1,
+                proposer: f.admin
+            }
         ));
 
         // Aprobar
@@ -4175,13 +4245,21 @@ mod tests {
         f.contract.approve_release(1);
         assert!(f.env.emitted_event(
             &f.contract,
-            ReleaseApproved { lote_id: 1, approver: f.approver0, count: 1 }
+            ReleaseApproved {
+                lote_id: 1,
+                approver: f.approver0,
+                count: 1
+            }
         ));
         f.env.set_caller(f.approver1);
         f.contract.approve_release(1);
         assert!(f.env.emitted_event(
             &f.contract,
-            ReleaseApproved { lote_id: 1, approver: f.approver1, count: 2 }
+            ReleaseApproved {
+                lote_id: 1,
+                approver: f.approver1,
+                count: 2
+            }
         ));
     }
 
@@ -4217,7 +4295,10 @@ mod tests {
         f.contract.propose_release(1);
         assert!(f.env.emitted_event(
             &f.contract,
-            ReleaseProposed { lote_id: 1, proposer: f.approver0 }
+            ReleaseProposed {
+                lote_id: 1,
+                proposer: f.approver0
+            }
         ));
     }
 
@@ -4244,8 +4325,12 @@ mod tests {
     #[test]
     fn release_on_eval_fail_reverts() {
         let mut f = setup_with_chain(
-            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1,
-            6000,  // quorum_fail_bps = 60%
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(5 * ONE_CSPR),
+            3_600_000,
+            1,
+            6000,   // quorum_fail_bps = 60%
             60_000, // ventana = 60s
         );
         let producer = f.env.get_account(7);
@@ -4596,9 +4681,9 @@ mod tests {
     #[test]
     fn raid_route_micropayment_cannot_spend_lote_escrow() {
         let mut f = setup_with(
-            U512::from(ONE_CSPR),              // cap por llamada = 1 CSPR
+            U512::from(ONE_CSPR), // cap por llamada = 1 CSPR
             2,
-            U512::from(10 * ONE_CSPR),         // epoch_cap holgado
+            U512::from(10 * ONE_CSPR), // epoch_cap holgado
             3_600_000,
         );
         let producer = f.env.get_account(7);
@@ -4629,7 +4714,9 @@ mod tests {
         // Ahora drenamos el saldo libre completamente con execute genérico.
         // Pero antes: sin lote, execute también es genérico, puede consumir free.
         // Drena los ~99 CSPR libres que quedan via M-de-N.
-        let free_before = f.env.balance_of(&f.contract)
+        let free_before = f
+            .env
+            .balance_of(&f.contract)
             .checked_sub(f.contract.reserved_lote_balance())
             .unwrap();
         f.env.set_caller(f.admin);
@@ -4756,7 +4843,10 @@ mod tests {
         assert_eq!(result.unwrap_err(), Error::InsufficientBalance.into());
 
         // El escrow del lote sigue intacto.
-        assert_eq!(f.contract.reserved_lote_balance(), U512::from(10 * ONE_CSPR));
+        assert_eq!(
+            f.contract.reserved_lote_balance(),
+            U512::from(10 * ONE_CSPR)
+        );
         assert_eq!(f.contract.lote_funded(1), U512::from(10 * ONE_CSPR));
     }
 
@@ -4940,7 +5030,9 @@ mod tests {
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
+        assert!(f
+            .contract
+            .verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -4981,7 +5073,9 @@ mod tests {
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
+        assert!(f
+            .contract
+            .verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -5120,10 +5214,18 @@ mod tests {
 
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_SETTLED_OK);
         assert_eq!(f.env.balance_of(&producer), producer_before + funded + bond);
-        assert_eq!(f.env.balance_of(&f.contract), vault_before - (funded + bond));
+        assert_eq!(
+            f.env.balance_of(&f.contract),
+            vault_before - (funded + bond)
+        );
         assert!(f.env.emitted_event(
             &f.contract,
-            ReleasedToProducer { lote_id: 1, producer, funded, bond }
+            ReleasedToProducer {
+                lote_id: 1,
+                producer,
+                funded,
+                bond
+            }
         ));
     }
 
@@ -5167,7 +5269,9 @@ mod tests {
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
 
         f.env.set_caller(f.operator);
-        assert!(f.contract.verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
+        assert!(f
+            .contract
+            .verify_attestation(1, 1, false, u64::MAX, pk_bytes, sig_bytes));
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -5195,14 +5299,16 @@ mod tests {
             .deposit_to_lote(1);
         f.env.advance_block_time(2_000);
         f.env.set_caller(producer);
-        f.contract
-            .with_tokens(U512::from(ONE_CSPR))
-            .post_bond(1);
+        f.contract.with_tokens(U512::from(ONE_CSPR)).post_bond(1);
         f.env.set_caller(f.operator);
         f.contract.lock_lote(1);
 
         let funded_at = f.contract.lote_funded_at(1);
-        assert!(funded_at >= 2_000, "funded_at should be at least 2000, got {}", funded_at);
+        assert!(
+            funded_at >= 2_000,
+            "funded_at should be at least 2000, got {}",
+            funded_at
+        );
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_FUNDED);
     }
 
@@ -5276,8 +5382,13 @@ mod tests {
     #[test]
     fn getters_new_params() {
         let f = setup_with_chain(
-            U512::from(ONE_CSPR), 2, U512::from(5 * ONE_CSPR), 3_600_000, 1,
-            7000, 120_000,
+            U512::from(ONE_CSPR),
+            2,
+            U512::from(5 * ONE_CSPR),
+            3_600_000,
+            1,
+            7000,
+            120_000,
         );
         assert_eq!(f.contract.quorum_fail_bps(), 7000);
         assert_eq!(f.contract.attestation_window_ms(), 120_000);
@@ -5320,7 +5431,8 @@ mod tests {
 
         // Submit atestación negativa de A (60% → ≥ quorum 60%)
         f.env.set_caller(f.operator);
-        f.contract.verify_attestation(lote_id, 1, false, u64::MAX, pk_a, sig_a);
+        f.contract
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk_a, sig_a);
 
         // Cerrar ventana + evaluar → EVAL_FAIL
         f.env.advance_block_time(f.attestation_window_ms + 1);
@@ -5348,10 +5460,7 @@ mod tests {
         // bps=0 → lote_target=0 → indemnity=0, excess=bond freed from reserved.
         assert_eq!(f.contract.lote_indemnity_pool(1), U512::zero());
         assert_eq!(f.contract.lote_tail(1), U512::zero());
-        assert_eq!(
-            f.contract.reserved_lote_balance(),
-            reserved_before - bond
-        );
+        assert_eq!(f.contract.reserved_lote_balance(), reserved_before - bond);
         // Los fondos NO se movieron del vault (solo reserved bajó).
         assert_eq!(f.env.balance_of(&f.contract), vault_before);
         // Evento
@@ -5477,14 +5586,8 @@ mod tests {
         ));
 
         // Vault: paid funded=100. Reserved bajó por funded.
-        assert_eq!(
-            f.env.balance_of(&f.contract),
-            balance_before - funded
-        );
-        assert_eq!(
-            f.contract.reserved_lote_balance(),
-            reserved_before - funded
-        );
+        assert_eq!(f.env.balance_of(&f.contract), balance_before - funded);
+        assert_eq!(f.contract.reserved_lote_balance(), reserved_before - funded);
     }
 
     /// Propiedad semántica (observación audit Gemini W2-2): en un lote FALLIDO,
@@ -5746,10 +5849,7 @@ mod tests {
         attestation_window_ms: u64,
     }
 
-    fn setup_integration(
-        premium_bps: u64,
-        indemnity_target_bps: u64,
-    ) -> IntegrationFixture {
+    fn setup_integration(premium_bps: u64, indemnity_target_bps: u64) -> IntegrationFixture {
         let env = odra_test::env();
         let admin = env.get_account(0);
         let operator = env.get_account(1);
@@ -5863,7 +5963,11 @@ mod tests {
 
         // Premium = 100 * 50 / 10000 = 0.5 CSPR
         let premium = U512::from(500_000_000u64); // 0.5 CSPR
-        let expected_payout = funded.checked_add(bond).unwrap().checked_sub(premium).unwrap();
+        let expected_payout = funded
+            .checked_add(bond)
+            .unwrap()
+            .checked_sub(premium)
+            .unwrap();
         assert_eq!(
             f.env.balance_of(&producer),
             producer_before + expected_payout
@@ -5894,10 +5998,7 @@ mod tests {
 
         assert_eq!(f.vault.lote_state(1), LOTE_STATE_SETTLED_OK);
         assert_eq!(f.pool.reserve(), U512::zero());
-        assert_eq!(
-            f.env.balance_of(&producer),
-            producer_before + funded + bond
-        );
+        assert_eq!(f.env.balance_of(&producer), producer_before + funded + bond);
     }
 
     // ── W2-3b: cola en settle_failure (flujo EVAL_FAIL manual) ──────
@@ -5945,7 +6046,9 @@ mod tests {
         // Capitalizar el pool: 100 CSPR
         let funder = f.env.get_account(5);
         f.env.set_caller(funder);
-        f.pool.with_tokens(U512::from(100 * ONE_CSPR)).collect_premium();
+        f.pool
+            .with_tokens(U512::from(100 * ONE_CSPR))
+            .collect_premium();
         let pool_before = f.pool.reserve();
         assert_eq!(pool_before, U512::from(100 * ONE_CSPR));
 
@@ -5958,15 +6061,20 @@ mod tests {
         let bond = U512::from(100 * ONE_CSPR); // bond >= target=80
 
         setup_eval_fail_integration(
-            &mut f, lote_id, producer,
-            signer_a, buyer_b,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            lote_id,
+            producer,
+            signer_a,
+            buyer_b,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
 
         // Submit negative attestation (60% → EVAL_FAIL)
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6041,14 +6149,19 @@ mod tests {
         let bond = U512::from(10 * ONE_CSPR);
 
         setup_eval_fail_integration(
-            &mut f, lote_id, producer,
-            signer_a, buyer_b,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            lote_id,
+            producer,
+            signer_a,
+            buyer_b,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
 
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6098,10 +6211,7 @@ mod tests {
 
         // Bond=1 mote (< target=80 CSPR) → BondBelowMinimum
         f.env.set_caller(producer);
-        let result = f
-            .vault
-            .with_tokens(U512::one())
-            .try_post_bond(lote_id);
+        let result = f.vault.with_tokens(U512::one()).try_post_bond(lote_id);
         assert_eq!(result.unwrap_err(), Error::BondBelowMinimum.into());
         // El lote sigue OPEN.
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_OPEN);
@@ -6180,7 +6290,9 @@ mod tests {
 
         let funder = f.env.get_account(5);
         f.env.set_caller(funder);
-        f.pool.with_tokens(U512::from(10 * ONE_CSPR)).collect_premium();
+        f.pool
+            .with_tokens(U512::from(10 * ONE_CSPR))
+            .collect_premium();
 
         let random = f.env.get_account(9);
         f.env.set_caller(random);
@@ -6268,10 +6380,7 @@ mod tests {
         f.vault.release_to_producer(1);
 
         // Full payout (no premium deduction) = W2-2 behavior
-        assert_eq!(
-            f.env.balance_of(&producer),
-            producer_before + funded + bond
-        );
+        assert_eq!(f.env.balance_of(&producer), producer_before + funded + bond);
         // Pool untouched (never linked)
         assert_eq!(f.pool.reserve(), U512::zero());
     }
@@ -6290,14 +6399,19 @@ mod tests {
         let bond = U512::from(10 * ONE_CSPR);
 
         setup_eval_fail_integration(
-            &mut f, lote_id, producer,
-            signer_a, buyer_b,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            lote_id,
+            producer,
+            signer_a,
+            buyer_b,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
 
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6342,13 +6456,18 @@ mod tests {
             sign_attestation(l1_id, 1, false, vc_addr, chain_id, u64::MAX);
         let buyer_b1 = f.env.get_account(9);
         setup_eval_fail_integration(
-            &mut f, l1_id, producer,
-            signer_a1, buyer_b1,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            l1_id,
+            producer,
+            signer_a1,
+            buyer_b1,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(l1_id, 1, false, u64::MAX, pk1, sig1);
+        f.vault
+            .verify_attestation(l1_id, 1, false, u64::MAX, pk1, sig1);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6357,7 +6476,10 @@ mod tests {
         f.vault.settle_failure(l1_id);
 
         // C-2: indemnity = min(100, 80) = 80, excess=20 freed
-        assert_eq!(f.vault.lote_indemnity_pool(l1_id), U512::from(80 * ONE_CSPR));
+        assert_eq!(
+            f.vault.lote_indemnity_pool(l1_id),
+            U512::from(80 * ONE_CSPR)
+        );
         // Tail = 0: bond >= target
         assert_eq!(f.vault.lote_tail(l1_id), U512::zero());
         // Excess (20) freed from reserved
@@ -6372,13 +6494,18 @@ mod tests {
             sign_attestation(l2_id, 1, false, vc_addr, chain_id, u64::MAX);
         let buyer_b2 = f.env.get_account(10);
         setup_eval_fail_integration(
-            &mut f, l2_id, producer,
-            signer_a2, buyer_b2,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            l2_id,
+            producer,
+            signer_a2,
+            buyer_b2,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(l2_id, 1, false, u64::MAX, pk2, sig2);
+        f.vault
+            .verify_attestation(l2_id, 1, false, u64::MAX, pk2, sig2);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6386,7 +6513,10 @@ mod tests {
         f.vault.settle_failure(l2_id);
 
         // Lote 2: también indemnity=80, tail=0
-        assert_eq!(f.vault.lote_indemnity_pool(l2_id), U512::from(80 * ONE_CSPR));
+        assert_eq!(
+            f.vault.lote_indemnity_pool(l2_id),
+            U512::from(80 * ONE_CSPR)
+        );
         assert_eq!(f.vault.lote_tail(l2_id), U512::zero());
 
         // ── Withdraw L1 buyer A (60 CSPR) ──
@@ -6430,14 +6560,19 @@ mod tests {
         let bond = U512::from(100 * ONE_CSPR); // bond >= target=80
 
         setup_eval_fail_integration(
-            &mut f, lote_id, producer,
-            signer_a, buyer_b,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            lote_id,
+            producer,
+            signer_a,
+            buyer_b,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
 
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6446,7 +6581,10 @@ mod tests {
         f.vault.settle_failure(lote_id);
 
         // C-2: indemnity = min(100, 80) = 80, tail=0, excess=20 freed.
-        assert_eq!(f.vault.lote_indemnity_pool(lote_id), U512::from(80 * ONE_CSPR));
+        assert_eq!(
+            f.vault.lote_indemnity_pool(lote_id),
+            U512::from(80 * ONE_CSPR)
+        );
         assert_eq!(f.vault.lote_tail(lote_id), U512::zero());
         // Excess=20 liberated from reserved
         let excess = U512::from(20 * ONE_CSPR);
@@ -6463,9 +6601,7 @@ mod tests {
                 .unwrap()
                 .checked_add(excess)
                 .unwrap(),
-            U512::from(100 * ONE_CSPR)
-                .checked_add(bond)
-                .unwrap()
+            U512::from(100 * ONE_CSPR).checked_add(bond).unwrap()
         );
 
         // Withdraw buyer A
@@ -6526,10 +6662,7 @@ mod tests {
         f.contract
             .with_tokens(U512::from(ONE_CSPR))
             .deposit_to_lote(1);
-        assert_eq!(
-            f.contract.lote_share(1, buyer),
-            U512::from(ONE_CSPR)
-        );
+        assert_eq!(f.contract.lote_share(1, buyer), U512::from(ONE_CSPR));
     }
 
     #[test]
@@ -6589,7 +6722,8 @@ mod tests {
 
         // Negative attestation (60% → EVAL_FAIL)
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6602,7 +6736,10 @@ mod tests {
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
 
         // C-2: indemnity = min(bond=100, target=80) = 80
-        assert_eq!(f.vault.lote_indemnity_pool(lote_id), U512::from(80 * ONE_CSPR));
+        assert_eq!(
+            f.vault.lote_indemnity_pool(lote_id),
+            U512::from(80 * ONE_CSPR)
+        );
         assert_eq!(f.vault.lote_tail(lote_id), U512::zero());
         // Excess freed: 100 - 80 = 20
         assert_eq!(
@@ -6783,9 +6920,13 @@ mod tests {
         // funded=200 CSPR, bond=5 CSPR.
         // Con bps=50: target = 200*50/10000 = 1 CSPR. bond=5 ≥ 1 → FUNDED.
         setup_eval_fail_integration(
-            &mut f, lote_id, producer,
-            signer_a, buyer_b,
-            U512::from(120 * ONE_CSPR), U512::from(80 * ONE_CSPR),
+            &mut f,
+            lote_id,
+            producer,
+            signer_a,
+            buyer_b,
+            U512::from(120 * ONE_CSPR),
+            U512::from(80 * ONE_CSPR),
             U512::from(5 * ONE_CSPR),
         );
 
@@ -6794,7 +6935,8 @@ mod tests {
         assert_eq!(f.vault.lote_target(lote_id), U512::from(ONE_CSPR));
 
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         // Admin SUBE indemnity_target_bps a 8000 (80%) POST-FUNDED.
         f.env.set_caller(f.admin);
@@ -6813,10 +6955,7 @@ mod tests {
         assert_eq!(f.vault.lote_state(lote_id), LOTE_STATE_SETTLED_FAIL);
 
         // Indemnity = min(bond=5, lote_target=1) = 1 CSPR (no 160).
-        assert_eq!(
-            f.vault.lote_indemnity_pool(lote_id),
-            U512::from(ONE_CSPR)
-        );
+        assert_eq!(f.vault.lote_indemnity_pool(lote_id), U512::from(ONE_CSPR));
         // Tail = 0 por construcción (bond=5 >= lote_target=1).
         assert_eq!(f.vault.lote_tail(lote_id), U512::zero());
         // Excess = bond - indemnity = 5 - 1 = 4 CSPR liberado.
@@ -6860,9 +6999,13 @@ mod tests {
         let bond = U512::from(50 * ONE_CSPR);
 
         setup_eval_fail_integration(
-            &mut f, lote_id, producer,
-            signer_a, buyer_b,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            lote_id,
+            producer,
+            signer_a,
+            buyer_b,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
 
@@ -6870,7 +7013,8 @@ mod tests {
         assert_eq!(f.vault.lote_target(lote_id), U512::zero());
 
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6928,14 +7072,19 @@ mod tests {
         let bond = U512::from(50 * ONE_CSPR);
 
         setup_eval_fail_integration(
-            &mut f, lote_id, producer,
-            signer_a, buyer_b,
-            U512::from(60 * ONE_CSPR), U512::from(40 * ONE_CSPR),
+            &mut f,
+            lote_id,
+            producer,
+            signer_a,
+            buyer_b,
+            U512::from(60 * ONE_CSPR),
+            U512::from(40 * ONE_CSPR),
             bond,
         );
 
         f.env.set_caller(f.operator);
-        f.vault.verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
+        f.vault
+            .verify_attestation(lote_id, 1, false, u64::MAX, pk, sig);
 
         f.env.advance_block_time(f.attestation_window_ms + 1);
         f.env.set_caller(f.admin);
@@ -6959,10 +7108,7 @@ mod tests {
             .unwrap()
             .checked_add(excess)
             .unwrap();
-        assert_eq!(
-            total_accounted,
-            funded.checked_add(bond).unwrap()
-        );
+        assert_eq!(total_accounted, funded.checked_add(bond).unwrap());
 
         // Withdraw ambos
         f.env.set_caller(signer_a);
@@ -7001,9 +7147,7 @@ mod tests {
             .with_tokens(U512::from(ONE_CSPR))
             .deposit_to_lote(1);
         f.env.set_caller(producer);
-        f.contract
-            .with_tokens(U512::from(ONE_CSPR))
-            .post_bond(1);
+        f.contract.with_tokens(U512::from(ONE_CSPR)).post_bond(1);
         f.env.set_caller(f.operator);
         f.contract.lock_lote(1);
 
@@ -7220,9 +7364,7 @@ mod tests {
         // Griefer deposits 1 mote
         let griefer = f.env.get_account(10);
         f.env.set_caller(griefer);
-        f.contract
-            .with_tokens(U512::one())
-            .deposit_to_lote(1);
+        f.contract.with_tokens(U512::one()).deposit_to_lote(1);
 
         assert_eq!(f.contract.lote_state(1), LOTE_STATE_OPEN);
         assert_eq!(f.contract.lote_funded(1), U512::one());

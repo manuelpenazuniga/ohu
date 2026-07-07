@@ -164,7 +164,9 @@ impl MutualPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, MutualPool, MutualPoolHostRef, MutualPoolInitArgs, PremiumCollected, TailPaid};
+    use super::{
+        Error, MutualPool, MutualPoolHostRef, MutualPoolInitArgs, PremiumCollected, TailPaid,
+    };
     use odra::casper_types::contracts::ContractPackageHash;
     use odra::casper_types::U512;
     use odra::host::{Deployer, HostEnv, HostRef};
@@ -315,7 +317,9 @@ mod tests {
         fund_pool(&mut f, depositor, fund_amount);
 
         f.env.set_caller(f.vault);
-        let result = f.contract.try_pay_tail(f.depositor, fund_amount + U512::one());
+        let result = f
+            .contract
+            .try_pay_tail(f.depositor, fund_amount + U512::one());
 
         assert_eq!(result.unwrap_err(), Error::InsufficientReserve.into());
         assert_eq!(f.contract.reserve(), fund_amount);

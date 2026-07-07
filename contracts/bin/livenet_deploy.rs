@@ -65,10 +65,10 @@ fn main() {
     // Account hashes (formatted as "account-hash-<hex>").
     let admin_hash =
         std::env::var("OHUVAULT_ADMIN_ACCOUNT_HASH").expect("Missing OHUVAULT_ADMIN_ACCOUNT_HASH");
-    let operator_hash =
-        std::env::var("OHUVAULT_OPERATOR_ACCOUNT_HASH").expect("Missing OHUVAULT_OPERATOR_ACCOUNT_HASH");
-    let approver_hashes_raw =
-        std::env::var("OHUVAULT_APPROVER_ACCOUNT_HASHES").expect("Missing OHUVAULT_APPROVER_ACCOUNT_HASHES");
+    let operator_hash = std::env::var("OHUVAULT_OPERATOR_ACCOUNT_HASH")
+        .expect("Missing OHUVAULT_OPERATOR_ACCOUNT_HASH");
+    let approver_hashes_raw = std::env::var("OHUVAULT_APPROVER_ACCOUNT_HASHES")
+        .expect("Missing OHUVAULT_APPROVER_ACCOUNT_HASHES");
 
     // Scalar params.
     let required_approvals: u8 = std::env::var("OHUVAULT_REQUIRED_APPROVALS")
@@ -83,8 +83,7 @@ fn main() {
     .expect("OHUVAULT_MICROPAYMENT_CAP_MOTES invalid (must be decimal motes)");
 
     let epoch_cap = U512::from_dec_str(
-        &std::env::var("OHUVAULT_EPOCH_CAP_MOTES")
-            .expect("Missing OHUVAULT_EPOCH_CAP_MOTES"),
+        &std::env::var("OHUVAULT_EPOCH_CAP_MOTES").expect("Missing OHUVAULT_EPOCH_CAP_MOTES"),
     )
     .expect("OHUVAULT_EPOCH_CAP_MOTES invalid (must be decimal motes)");
 
@@ -151,7 +150,11 @@ fn main() {
     env.set_gas(DEPLOY_GAS_MOTES);
 
     println!("Deploying OhuVault to Casper Testnet...");
-    println!("  Gas budget: {} motes (~{} CSPR)", DEPLOY_GAS_MOTES, DEPLOY_GAS_MOTES / 1_000_000_000);
+    println!(
+        "  Gas budget: {} motes (~{} CSPR)",
+        DEPLOY_GAS_MOTES,
+        DEPLOY_GAS_MOTES / 1_000_000_000
+    );
     // TODO(verify): confirm deploy signature — Odra example shows
     // ModuleName::deploy(&env, init_args) returning HostRef.
     let mut vault: OhuVaultHostRef = OhuVault::deploy(&env, vault_init_args);
@@ -164,7 +167,11 @@ fn main() {
     env.set_gas(DEPLOY_GAS_MOTES);
 
     println!("Deploying MutualPool to Casper Testnet...");
-    println!("  Gas budget: {} motes (~{} CSPR)", DEPLOY_GAS_MOTES, DEPLOY_GAS_MOTES / 1_000_000_000);
+    println!(
+        "  Gas budget: {} motes (~{} CSPR)",
+        DEPLOY_GAS_MOTES,
+        DEPLOY_GAS_MOTES / 1_000_000_000
+    );
     // TODO(verify): confirm MutualPool::deploy takes &env + MutualPoolInitArgs.
     let pool_init_args = MutualPoolInitArgs {
         admin,
@@ -202,7 +209,13 @@ fn main() {
     println!("MutualPool package hash:   {}", pool_addr.to_string());
     println!();
     println!("  View on-chain:");
-    println!("    https://testnet.cspr.live/contract-package/{}", vault_addr.to_string());
-    println!("    https://testnet.cspr.live/contract-package/{}", pool_addr.to_string());
+    println!(
+        "    https://testnet.cspr.live/contract-package/{}",
+        vault_addr.to_string()
+    );
+    println!(
+        "    https://testnet.cspr.live/contract-package/{}",
+        pool_addr.to_string()
+    );
     println!("  (replace the hash segment with the contract-package hash after deployment)");
 }

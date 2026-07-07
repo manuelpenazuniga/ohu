@@ -61,11 +61,15 @@ fn main() {
 
     // 2. deposit_to_lote — el comprador deposita su share (payable, earmarked INV-7).
     step(&env, buyer, "deposit_to_lote (share)");
-    contract.with_tokens(U512::from(SHARE_MOTES)).deposit_to_lote(LOTE_ID);
+    contract
+        .with_tokens(U512::from(SHARE_MOTES))
+        .deposit_to_lote(LOTE_ID);
 
     // 3. post_bond — el productor deposita el bono (payable). Sigue en OPEN.
     step(&env, producer, "post_bond (bono) -> sigue OPEN");
-    contract.with_tokens(U512::from(BOND_MOTES)).post_bond(LOTE_ID);
+    contract
+        .with_tokens(U512::from(BOND_MOTES))
+        .post_bond(LOTE_ID);
 
     // 4. lock_lote — admin cierra la ventana de fondeo -> FUNDED (W2-4).
     step(&env, admin, "lock_lote -> FUNDED");
@@ -86,7 +90,10 @@ fn main() {
     //    el tally, no un humano ni M-de-N).
     step(&env, admin, "evaluate_lote -> EVAL_OK");
     contract.evaluate_lote(LOTE_ID);
-    println!("   lote_state = {} (esperado 4 = EVAL_OK)", contract.lote_state(LOTE_ID));
+    println!(
+        "   lote_state = {} (esperado 4 = EVAL_OK)",
+        contract.lote_state(LOTE_ID)
+    );
 
     // 7. release_to_producer — admin ejecuta (state==EVAL_OK) -> SETTLED_OK (+ prima al pool).
     step(&env, admin, "release_to_producer -> SETTLED_OK");
@@ -94,7 +101,9 @@ fn main() {
 
     let bal_after = env.balance_of(&producer);
     println!("\nproducer balance final: {bal_after}");
-    println!("delta bruto esperado: share+bond - prima = {} - {} (premium_bps) motes",
-        SHARE_MOTES + BOND_MOTES, "0.5%·funded");
+    println!(
+        "delta bruto esperado: share+bond - prima = {} - 0.5%·funded (premium_bps) motes",
+        SHARE_MOTES + BOND_MOTES
+    );
     println!("\n✅ E2E FELIZ (vía tally) COMPLETO: lote {LOTE_ID} liquidado (SETTLED_OK), escrow al producer, prima al MutualPool.");
 }

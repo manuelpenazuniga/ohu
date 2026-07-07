@@ -54,15 +54,12 @@ fn main() {
     let admin = env.get_account(1);
     let producer = env.get_account(4);
 
-    let vault_pkg = std::env::var("OHUVAULT_PACKAGE_HASH")
-        .expect("Missing OHUVAULT_PACKAGE_HASH");
-    let pool_pkg = std::env::var("MUTUALPOOL_PACKAGE_HASH")
-        .expect("Missing MUTUALPOOL_PACKAGE_HASH");
+    let vault_pkg = std::env::var("OHUVAULT_PACKAGE_HASH").expect("Missing OHUVAULT_PACKAGE_HASH");
+    let pool_pkg =
+        std::env::var("MUTUALPOOL_PACKAGE_HASH").expect("Missing MUTUALPOOL_PACKAGE_HASH");
 
-    let vault_addr = Address::from_str(&vault_pkg)
-        .expect("OHUVAULT_PACKAGE_HASH invalido");
-    let pool_addr = Address::from_str(&pool_pkg)
-        .expect("MUTUALPOOL_PACKAGE_HASH invalido");
+    let vault_addr = Address::from_str(&vault_pkg).expect("OHUVAULT_PACKAGE_HASH invalido");
+    let pool_addr = Address::from_str(&pool_pkg).expect("MUTUALPOOL_PACKAGE_HASH invalido");
 
     // TODO(verify): confirm Odra HostRefLoader::load works with contract
     // package hash Address in livenet env.
@@ -97,17 +94,21 @@ fn main() {
         .with_tokens(U512::from(SHARE_MOTES))
         .deposit_to_lote(LOTE_ID);
     println!("   lote_funded = {}", vault.lote_funded(LOTE_ID));
-    println!("   lote_share(buyer) = {}", vault.lote_share(LOTE_ID, buyer));
+    println!(
+        "   lote_share(buyer) = {}",
+        vault.lote_share(LOTE_ID, buyer)
+    );
 
     // 3. post_bond — el productor deposita el bono (>= target).
     //    Con indemnity_target_bps=8000: target = 10*8000/10000 = 8 CSPR.
     //    BOND=10 CSPR >= 8 CSPR. Sigue en OPEN; lock_lote transiciona a FUNDED.
     step(&env, producer, "post_bond (bono) -> sigue OPEN");
-    vault
-        .with_tokens(U512::from(BOND_MOTES))
-        .post_bond(LOTE_ID);
+    vault.with_tokens(U512::from(BOND_MOTES)).post_bond(LOTE_ID);
     println!("   lote_bond = {}", vault.lote_bond(LOTE_ID));
-    println!("   lote_state = {} (OPEN, pending lock)", vault.lote_state(LOTE_ID));
+    println!(
+        "   lote_state = {} (OPEN, pending lock)",
+        vault.lote_state(LOTE_ID)
+    );
 
     // 4. lock_lote — admin cierra el lote -> FUNDED.
     step(&env, admin, "lock_lote -> FUNDED");
@@ -127,13 +128,12 @@ fn main() {
     // Load buyer's Ed25519 secret key from file.
     // TODO(verify): confirm SecretKey::from_file API in casper-types 6.x
     // and that it correctly reads PEM files from the Odra 2.8.2 toolchain.
-    let sk_path = std::env::var("BUYER_SECRET_KEY_PATH")
-        .unwrap_or_else(|_| {
-            std::env::var("ODRA_CASPER_LIVENET_SECRET_KEY_PATH")
-                .expect("Missing BUYER_SECRET_KEY_PATH or ODRA_CASPER_LIVENET_SECRET_KEY_PATH")
-        });
-    let sk = SecretKey::from_file(&sk_path)
-        .expect("Failed to load buyer Ed25519 secret key from file");
+    let sk_path = std::env::var("BUYER_SECRET_KEY_PATH").unwrap_or_else(|_| {
+        std::env::var("ODRA_CASPER_LIVENET_SECRET_KEY_PATH")
+            .expect("Missing BUYER_SECRET_KEY_PATH or ODRA_CASPER_LIVENET_SECRET_KEY_PATH")
+    });
+    let sk =
+        SecretKey::from_file(&sk_path).expect("Failed to load buyer Ed25519 secret key from file");
     let pk = PublicKey::from(&sk);
 
     // Build the attestation message (same format as on-chain build_attestation_message).
@@ -173,14 +173,7 @@ fn main() {
 
     // Relay: admin pays gas, calls verify_attestation.
     step(&env, admin, "verify_attestation (admin relay)");
-    let ok = vault.verify_attestation(
-        LOTE_ID,
-        nonce,
-        received,
-        valid_before,
-        pk_bytes,
-        sig_bytes,
-    );
+    let ok = vault.verify_attestation(LOTE_ID, nonce, received, valid_before, pk_bytes, sig_bytes);
     println!("   verify_attestation returned: {ok}");
     println!("   tally_negative = {}", vault.lote_tally_negative(LOTE_ID));
 
@@ -188,7 +181,10 @@ fn main() {
     //    evaluar. evaluate_lote exige now >= deadline; verify_attestation exigia
     //    now < deadline — por eso el sleep va DESPUES de atestar.
     let sleep_ms = attestation_window_ms + 10_000; // window + 10s buffer
-    println!("\nWaiting {} ms for attestation window to close...", sleep_ms);
+    println!(
+        "\nWaiting {} ms for attestation window to close...",
+        sleep_ms
+    );
     std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
     println!("Done waiting.");
 
@@ -196,12 +192,18 @@ fn main() {
     step(&env, admin, "evaluate_lote -> EVAL_FAIL");
     vault.evaluate_lote(LOTE_ID);
     let eval_state = vault.lote_state(LOTE_ID);
-    println!("   lote_state = {eval_state} (expected {} = EVAL_FAIL)", 5u8);
+    println!(
+        "   lote_state = {eval_state} (expected {} = EVAL_FAIL)",
+        5u8
+    );
 
     // 8. settle_failure — admin cierra el lote fallido.
     step(&env, admin, "settle_failure -> SETTLED_FAIL");
     vault.settle_failure(LOTE_ID);
-    println!("   lote_state = {} (SETTLED_FAIL)", vault.lote_state(LOTE_ID));
+    println!(
+        "   lote_state = {} (SETTLED_FAIL)",
+        vault.lote_state(LOTE_ID)
+    );
     println!(
         "   lote_indemnity_pool = {}",
         vault.lote_indemnity_pool(LOTE_ID)
@@ -213,9 +215,7 @@ fn main() {
     vault.withdraw_settlement(LOTE_ID);
 
     let buyer_bal_after = env.balance_of(&buyer);
-    println!(
-        "\nbuyer balance final: {buyer_bal_after} (antes: {buyer_bal_before})"
-    );
+    println!("\nbuyer balance final: {buyer_bal_after} (antes: {buyer_bal_before})");
 
     // Expected delta: refund(SHARE) + indemnity(min(bond,target)).
     // With SHARE=10 CSPR, bps=8000: target = 10*8000/10000 = 8 CSPR.
@@ -233,7 +233,9 @@ fn main() {
     println!("delta esperado (refund+indemnity): {expected_delta}");
     println!(
         "delta real: {}",
-        buyer_bal_after.checked_sub(buyer_bal_before).unwrap_or(U512::zero())
+        buyer_bal_after
+            .checked_sub(buyer_bal_before)
+            .unwrap_or(U512::zero())
     );
 
     println!("\nE2E FALLO COMPLETO: lote {LOTE_ID} indemnizado por regla.");
