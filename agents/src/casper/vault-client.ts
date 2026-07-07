@@ -29,6 +29,28 @@ export interface VaultCallResult {
   readonly success: boolean;
   /** Código de error de Odra si la tx revirtió, o `null`. */
   readonly userError: number | null;
+  /**
+   * `true` si la tx se envió (`putTransaction` OK) pero no se confirmó dentro del
+   * timeout (finality lag). El caller NO debe re-enviar: debe re-consultar o abortar.
+   */
+  readonly pending: boolean;
+}
+
+/** Timeout total de confirmación de una tx (el Testnet tarda en indexar). */
+const CONFIRM_TIMEOUT_MS = 150_000;
+/** Intervalo de sondeo de la confirmación. */
+const CONFIRM_POLL_MS = 4_000;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * `true` si el error RPC es `-32014 "No such transaction"` — la tx aún no fue
+ * indexada por el nodo. NO es un fallo: hay que seguir esperando la MISMA tx.
+ */
+function isNoSuchTransaction(err: unknown): boolean {
+  const e = err as { code?: number; sourceErr?: { code?: number } } | null;
+  return e?.code === -32014 || e?.sourceErr?.code === -32014;
 }
 
 /**
@@ -85,24 +107,42 @@ export async function callVaultEntrypoint(
   const putResult = await rpc.putTransaction(tx);
   const txHash = putResult.transactionHash.toHex();
 
-  let success = false;
-  let userError: number | null = null;
-
-  try {
-    const info = await rpc.waitForTransaction(tx, 180000);
-    const errorMessage =
-      info.executionInfo?.executionResult?.errorMessage ?? undefined;
-    if (errorMessage) {
-      success = false;
-      userError = parseUserError(errorMessage);
-    } else {
-      success = true;
+  // ── Confirmación robusta (E2E hardening) ───────────────────────────────
+  // `putTransaction` ya envió la tx: NUNCA se re-envía. El nodo del Testnet
+  // tarda en indexar la tx recién enviada y responde `-32014 "No such
+  // transaction"` durante ~30-60s (finality lag). Se espera ESTA misma tx por
+  // su hash, con backoff, tolerando -32014, hasta un timeout generoso.
+  const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const info = await rpc.getTransactionByTransactionHash(txHash);
+      if (info.executionInfo) {
+        // La tx ya ejecutó: errorMessage vacío = éxito; poblado = revert Odra.
+        const errorMessage =
+          info.executionInfo.executionResult?.errorMessage ?? undefined;
+        if (errorMessage) {
+          return {
+            txHash,
+            success: false,
+            userError: parseUserError(errorMessage),
+            pending: false,
+          };
+        }
+        return { txHash, success: true, userError: null, pending: false };
+      }
+      // Aceptada pero aún sin executionInfo: seguir esperando.
+    } catch (err) {
+      // -32014 = tx aún no visible → seguir esperando (NO re-enviar).
+      // Cualquier otro error (red / RPC distinto) sí es terminal: propagar.
+      if (!isNoSuchTransaction(err)) {
+        throw err;
+      }
     }
-  } catch (waitErr) {
-    success = false;
+    await sleep(CONFIRM_POLL_MS);
   }
 
-  return { txHash, success, userError };
+  // Enviada pero no confirmada en el timeout: pending. El caller NO re-envía.
+  return { txHash, success: false, userError: null, pending: true };
 }
 
 /**

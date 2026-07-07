@@ -66,6 +66,7 @@ async function main(): Promise<void> {
   for (const loteId of targets) {
     if (done.has(loteId)) continue;
 
+    let pendingCount = 0;
     while (true) {
       console.log(`Tesorería: evaluando lote ${loteId}…`);
       const result = await evaluateLote(key, loteId, config);
@@ -116,6 +117,23 @@ async function main(): Promise<void> {
           `FATAL: la llave cargada NO es operator (userError=${result.userError}). ` +
             `Verifica OPERATOR_SECRET_KEY_PATH. Abortando.`,
         );
+      }
+
+      // Tx enviada pero no confirmada en el timeout (finality lag). NO se
+      // re-envía en ráfaga: se re-consulta de forma idempotente (si ya evaluó,
+      // el próximo intento dará LOTE_NOT_FUNDED → skip), con un límite.
+      if (result.pending) {
+        pendingCount += 1;
+        if (pendingCount > 3) {
+          throw new Error(
+            `Lote ${loteId}: tx ${result.txHash.slice(0, 12)}… no confirmada tras ${pendingCount} intentos. ` +
+              `Revisar manualmente en el explorer. Abortando.`,
+          );
+        }
+        console.log(
+          `  Lote ${loteId}: tx ${result.txHash.slice(0, 12)}… enviada; confirmación pendiente (${pendingCount}/3). Re-consultando…`,
+        );
+        continue;
       }
 
       // Error desconocido — reintentar tras poll interval

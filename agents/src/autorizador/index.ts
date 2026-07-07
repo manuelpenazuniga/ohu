@@ -75,6 +75,7 @@ async function main(): Promise<void> {
   for (const loteId of targets) {
     if (done.has(loteId)) continue;
 
+    let pendingCount = 0;
     while (true) {
       console.log(`Autorizador: intentando release_to_producer para lote ${loteId}…`);
       const releaseResult = await releaseToProducer(key, loteId, config);
@@ -137,6 +138,18 @@ async function main(): Promise<void> {
           );
         }
 
+        // Tx enviada pero no confirmada (finality lag): re-consultar idempotente, sin ráfaga.
+        if (failResult.pending) {
+          pendingCount += 1;
+          if (pendingCount > 3) {
+            throw new Error(
+              `Lote ${loteId}: settle_failure ${failResult.txHash.slice(0, 12)}… no confirmada tras ${pendingCount} intentos. Revisar en el explorer. Abortando.`,
+            );
+          }
+          console.log(`  Lote ${loteId}: settle_failure enviada; confirmación pendiente (${pendingCount}/3). Re-consultando…`);
+          continue;
+        }
+
         // Error desconocido en settle — reintentar
         console.log(
           `  Error inesperado en settle_failure lote ${loteId} (userError=${failResult.userError}). ` +
@@ -154,6 +167,18 @@ async function main(): Promise<void> {
           `FATAL: la llave cargada NO es admin (userError=${releaseResult.userError}). ` +
             `Verifica ADMIN_SECRET_KEY_PATH. Abortando.`,
         );
+      }
+
+      // Tx enviada pero no confirmada (finality lag): re-consultar idempotente, sin ráfaga.
+      if (releaseResult.pending) {
+        pendingCount += 1;
+        if (pendingCount > 3) {
+          throw new Error(
+            `Lote ${loteId}: release ${releaseResult.txHash.slice(0, 12)}… no confirmada tras ${pendingCount} intentos. Revisar en el explorer. Abortando.`,
+          );
+        }
+        console.log(`  Lote ${loteId}: release enviada; confirmación pendiente (${pendingCount}/3). Re-consultando…`);
+        continue;
       }
 
       // Error desconocido — reintentar
