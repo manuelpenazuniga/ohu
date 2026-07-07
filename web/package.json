@@ -2,9 +2,11 @@
   "name": "@ohu/web",
   "version": "0.1.0",
   "type": "module",
-  "description": "Ohu web dashboard (placeholder for Fase 3)",
+  "description": "Ohu web dashboard — Swarm Control Room (P1-5)",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run"
   },
