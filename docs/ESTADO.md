@@ -50,7 +50,11 @@
 > reales on-chain. Ohu como mercado para agentes. **F3 ✅ atestación móvil gasless** (`web/attest.html`):
 > el comprador toca ✓/✗ y firma Ed25519 EN EL NAVEGADOR (@noble/ed25519) el mensaje exacto de 80 bytes
 > del contrato; la llave nunca sale del navegador, jamás toca CSPR (el agente retransmite). 7 tests web
-> (firma válida verificada). **F5/F8 diferidos** (token CEP-18 / seeding payable). **Pendiente menor:**
+> (firma válida verificada). **F8 ✅ simulador de semana** (`infra/scripts/simulate-week.sh` + `SIM_LOTE_ID`):
+> siembra lotes a FUNDED y los liquida con los agentes TS — validado on-chain (lote 6: EVAL_OK `8a1fe443`
+> → SETTLED_OK `5216f412`); para el run completo (3-5 lotes) hay que refondear las cuentas de prueba.
+> **F5 diferido** (token CEP-18). **Próximo grande: rediseño del web a "El Almanaque"** (CLAUDE.md) —
+> incluye el panel 'lotes recientes' live. **Pendiente menor:**
 > multisig admin (Parte B); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
@@ -292,7 +296,8 @@ Del vault genérico al **modelo de LOTE**. Hito: **un lote feliz liquida E2E en 
 | `docs/ESTADO.md` | **Este doc** — estado + roadmap + cómo retomar |
 | `docs/plan/fase-0-derisk.md` | Spec de la Fase 0 (4 spikes) + invariantes §1 |
 | `docs/plan/semana-1.md` | Spec de Semana 1 (núcleo de liquidación) |
-| `docs/plan/auditoria-y-plan-de-victoria.md` | **Auditoría vs. rúbrica del jurado + plan de cierre P0/P1/P2** (2026-07-06) — léelo antes de planificar nada nuevo |
+| `docs/plan/auditoria-y-plan-de-victoria.md` | Auditoría vs. rúbrica del jurado + plan P0/P1/P2 (v1, 2026-07-06) — vigente solo su §4.2 (teoremas del pitch), §6 (materiales) y §8 (reglas) |
+| `docs/plan/auditoria-y-plan-de-victoria-v2.md` | **Re-auditoría + plan VIGENTE** (2026-07-07): sprint de sumisión S-1/S-2/S-3 (video+BUIDL+hygiene, lo único que falta) + cola de calidad Q-1…Q-8 para la Final Round |
 | `docs/plan/model-routing.md` | Routing de modelos por tarea (derivado del bench) |
 | `docs/plan/_wrapper.md` | Wrapper obligatorio para briefs de opencode |
 
