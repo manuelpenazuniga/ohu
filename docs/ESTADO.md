@@ -47,7 +47,10 @@
 > 1-mote, fuga de llaves, éxito-falso) + los 7 invariantes. **F9 ✅ MCP server** (`agents/src/mcp/`):
 > servidor MCP read-only sobre stdio con 4 tools (get_lote_status, list_open_lotes,
 > get_producer_reputation, get_pool_solvency) — validado con un cliente MCP externo que recibe datos
-> reales on-chain. Ohu como mercado para agentes. **F5 diferido** (necesita token CEP-18). **Pendiente menor:**
+> reales on-chain. Ohu como mercado para agentes. **F3 ✅ atestación móvil gasless** (`web/attest.html`):
+> el comprador toca ✓/✗ y firma Ed25519 EN EL NAVEGADOR (@noble/ed25519) el mensaje exacto de 80 bytes
+> del contrato; la llave nunca sale del navegador, jamás toca CSPR (el agente retransmite). 7 tests web
+> (firma válida verificada). **F5/F8 diferidos** (token CEP-18 / seeding payable). **Pendiente menor:**
 > multisig admin (Parte B); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
