@@ -51,6 +51,21 @@ export const LOTE: Lote = {
   ],
 };
 
+/** F2 · red-team: ataques REALES a Testnet que el contrato rechazó on-chain. */
+export interface RedTeamAttempt {
+  readonly attack: string;
+  readonly by: string;
+  readonly entrypoint: string;
+  readonly error: string;
+  readonly protection: string;
+  readonly tx: string;
+}
+export const REDTEAM: readonly RedTeamAttempt[] = [
+  { attack: "El agente gasta sobre su límite", by: "operator", entrypoint: "route_micropayment(5 CSPR)", error: "CapExceeded", protection: "spending cap (INV-1)", tx: "89354977b39d58c2b21403a7032e7ca10ef8a7e4c16105100e0d8d64c6e2b27f" },
+  { attack: "El agente ejecuta un retiro", by: "operator", entrypoint: "execute()", error: "NotAdmin", protection: "role separation", tx: "67dc7eb30beff8d0f633da2d5cdfeed9dc9040f93e912d4e5dc81ea94a8da0b9" },
+  { attack: "Liquidar un lote que no falló", by: "admin", entrypoint: "settle_failure(4)", error: "LoteNotFailable", protection: "state machine", tx: "979b6c3eda28f76e8f5a0cbc40667936e9a1c99d9443a3c6ce0a35d41e6fad9a" },
+];
+
 export const shortHash = (h: string, n = 10): string =>
   h.length > n * 2 ? `${h.slice(0, n)}…${h.slice(-4)}` : h;
 

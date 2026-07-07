@@ -6,10 +6,12 @@ import {
   ADMIN,
   AGENTS,
   MUTUAL,
+  REDTEAM,
   shortHash,
   explorerUrl,
   type LoteStep,
   type Agent,
+  type RedTeamAttempt,
 } from "./data.js";
 
 /** Enlace monospace a una tx en el explorer (nueva pestaña). */
@@ -97,6 +99,34 @@ function mutualSection(): string {
   </section>`;
 }
 
+/** F2 · una fila de intento de red-team (el contrato lo rechazó). */
+function redAttempt(a: RedTeamAttempt): string {
+  return `
+    <li class="rt">
+      <div class="rt__main">
+        <span class="rt__attack">${a.attack}</span>
+        <code class="rt__ep">${a.by} → ${a.entrypoint}</code>
+      </div>
+      <div class="rt__verdict">
+        <span class="rt__badge">REVERT · ${a.error}</span>
+        <span class="rt__prot">${a.protection}</span>
+        <a class="tx rt__tx" href="${explorerUrl(a.tx)}" target="_blank" rel="noopener noreferrer">${shortHash(a.tx)}</a>
+      </div>
+    </li>`;
+}
+
+/** F2 · sección "Try to drain the vault": ataques reales que revirtieron. */
+function redteamSection(): string {
+  return `
+  <section class="card">
+    <div class="card__head"><h2>Red-team · try to drain the vault</h2><span class="hint">3 real attacks · all reverted on-chain</span></div>
+    <p class="note">Each of these was <strong>sent to Testnet</strong> and the contract <strong>rejected it</strong> on-chain — three different protections. The most reassuring test is the one that fails on purpose.</p>
+    <ol class="rt-list">
+      ${REDTEAM.map(redAttempt).join("")}
+    </ol>
+  </section>`;
+}
+
 function render(): string {
   return `
   <header class="hero">
@@ -136,6 +166,8 @@ function render(): string {
   </section>
 
   ${mutualSection()}
+
+  ${redteamSection()}
 
   <footer class="foot">
     Every hash is a real transaction on Casper Testnet · <code>error_message=None</code> · lote #${LOTE.id} settled hands-free by the agent swarm.
