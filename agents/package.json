@@ -14,17 +14,20 @@
     "agent:autorizador": "tsx --env-file=../.env src/autorizador/index.ts",
     "agent:mutual": "tsx --env-file=../.env src/mutual/index.ts",
     "agent:agregador": "tsx --env-file=../.env src/agregador/index.ts",
-    "redteam": "tsx --env-file=../.env src/redteam/index.ts"
+    "redteam": "tsx --env-file=../.env src/redteam/index.ts",
+    "mcp:server": "tsx --env-file=../.env src/mcp/server.ts"
   },
   "dependencies": {
     "@make-software/casper-x402": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@x402/core": "^2.16.0",
     "@x402/express": "^2.16.0",
     "@x402/fetch": "^2.16.0",
     "casper-js-sdk": "5.0.12",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

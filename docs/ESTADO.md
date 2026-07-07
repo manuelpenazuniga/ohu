@@ -44,7 +44,10 @@
 > the vault"** — 3 ataques REALES a Testnet rechazados on-chain (CapExceeded / NotAdmin / LoteNotFailable),
 > con sección en el dashboard y `pnpm --dir agents redteam` para correrlos en vivo. **F10 ✅ Trust**:
 > sección del dashboard con las 3 lentes de audit + los 3 bugs reales que el proceso cazó (drenaje
-> 1-mote, fuga de llaves, éxito-falso) + los 7 invariantes. **Pendiente menor:**
+> 1-mote, fuga de llaves, éxito-falso) + los 7 invariantes. **F9 ✅ MCP server** (`agents/src/mcp/`):
+> servidor MCP read-only sobre stdio con 4 tools (get_lote_status, list_open_lotes,
+> get_producer_reputation, get_pool_solvency) — validado con un cliente MCP externo que recibe datos
+> reales on-chain. Ohu como mercado para agentes. **F5 diferido** (necesita token CEP-18). **Pendiente menor:**
 > multisig admin (Parte B); P0-3 vídeo + P0-4 BUIDL/redes (operador).
 > **Entorno verificado en macOS** (Apple Silicon, arm64) tras clonar desde GitHub — ver §3.1.
 
