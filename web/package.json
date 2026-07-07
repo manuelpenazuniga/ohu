@@ -16,6 +16,10 @@
     "vitest": "4.1.9"
   },
   "dependencies": {
+    "@fontsource-variable/fraunces": "^5.2.9",
+    "@fontsource/ibm-plex-mono": "^5.2.7",
+    "@fontsource/instrument-sans": "^5.2.8",
+    "@fontsource/silkscreen": "^5.2.8",
     "@noble/ed25519": "^3.1.0"
   }
 }

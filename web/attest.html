@@ -6,41 +6,79 @@
     <title>Ohu · Atestar recepción</title>
     <style>
       :root {
-        --bg: #0b0e13; --panel: #141a24; --line: #26313f; --text: #e6ebf2;
-        --muted: #8a97a8; --accent: #2dd4bf; --green: #34d399; --red: #e0684f;
-        --mono: ui-monospace, "SF Mono", Menlo, monospace;
-        --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        --bg: #f6f1e3; --panel: #fdfaf1; --ink: #26221a; --line: #d8cdb4; --ink-2: #6b5f49;
+        --green: #3d6b35; --clay: #c65530; --wheat: #e0a32e;
+        --green-soft: #e7ecdd; --clay-soft: #f3ddd2; --wheat-soft: #f6e9cc;
+        --radius: 6px; --shadow: 3px 3px 0 var(--ink); --shadow-line: 3px 3px 0 var(--line);
+        --display: "Fraunces Variable", Georgia, serif;
+        --sans: "Instrument Sans", system-ui, sans-serif;
+        --mono: "IBM Plex Mono", ui-monospace, monospace;
+        --pixel: "Silkscreen", monospace;
       }
-      @media (prefers-color-scheme: light) {
-        :root { --bg: #f6f8fb; --panel: #fff; --line: #dde3ec; --text: #0f141c; --muted: #566374; --accent: #0d9488; --green: #059669; --red: #c4553c; }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1a1712; --panel: #221e18; --ink: #efe7d4; --line: #3a3327; --ink-2: #a8997c;
+          --green: #8fb872; --clay: #e08256; --wheat: #e6b34a;
+          --green-soft: #2a3122; --clay-soft: #3a2a20; --wheat-soft: #3a301c;
+          --shadow: 3px 3px 0 #000; --shadow-line: 3px 3px 0 var(--line);
+        }
+      }
+      :root[data-theme="dark"] {
+        --bg: #1a1712; --panel: #221e18; --ink: #efe7d4; --line: #3a3327; --ink-2: #a8997c;
+        --green: #8fb872; --clay: #e08256; --wheat: #e6b34a;
+        --green-soft: #2a3122; --clay-soft: #3a2a20; --wheat-soft: #3a301c;
+        --shadow: 3px 3px 0 #000; --shadow-line: 3px 3px 0 var(--line);
+      }
+      :root[data-theme="light"] {
+        --bg: #f6f1e3; --panel: #fdfaf1; --ink: #26221a; --line: #d8cdb4; --ink-2: #6b5f49;
+        --green: #3d6b35; --clay: #c65530; --wheat: #e0a32e;
+        --green-soft: #e7ecdd; --clay-soft: #f3ddd2; --wheat-soft: #f6e9cc;
+        --shadow: 3px 3px 0 var(--ink); --shadow-line: 3px 3px 0 var(--line);
       }
       * { box-sizing: border-box; }
-      body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans);
-        -webkit-font-smoothing: antialiased; min-height: 100dvh; display: flex; align-items: center; justify-content: center; }
+      body {
+        margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans);
+        background-image: radial-gradient(var(--line) 0.5px, transparent 0.5px);
+        background-size: 14px 14px;
+        -webkit-font-smoothing: antialiased; min-height: 100dvh;
+        display: flex; align-items: center; justify-content: center;
+      }
       .wrap { width: 100%; max-width: 420px; padding: 24px 20px; }
-      .brand { text-align: center; font-weight: 700; letter-spacing: .06em; color: var(--accent); text-transform: uppercase; font-size: 14px; margin-bottom: 16px; }
-      .card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 26px 22px; }
-      .q { font-size: 21px; font-weight: 620; text-align: center; line-height: 1.35; text-wrap: balance; }
+      .brand {
+        text-align: center; font-family: var(--pixel); letter-spacing: .08em; color: var(--green);
+        text-transform: uppercase; font-size: 13px; margin-bottom: 16px;
+      }
+      .card {
+        background: var(--panel); border: 2px solid var(--ink); border-radius: var(--radius);
+        box-shadow: var(--shadow); padding: 26px 22px;
+      }
+      .q { font-family: var(--display); font-size: 23px; font-weight: 560; text-align: center; line-height: 1.3; text-wrap: balance; }
       .btns { display: grid; gap: 12px; margin: 24px 0 8px; }
-      .b { font: inherit; font-size: 17px; font-weight: 600; padding: 18px; border-radius: 12px; border: 1px solid var(--line); cursor: pointer; transition: transform .06s ease; }
-      .b:active { transform: scale(.98); }
-      .b--ok { background: color-mix(in srgb, var(--green) 16%, transparent); border-color: color-mix(in srgb, var(--green) 40%, transparent); color: var(--green); }
-      .b--no { background: color-mix(in srgb, var(--red) 14%, transparent); border-color: color-mix(in srgb, var(--red) 38%, transparent); color: var(--red); }
-      .b--again { background: transparent; color: var(--muted); width: 100%; margin-top: 18px; font-size: 15px; padding: 14px; }
-      .foot { color: var(--muted); font-size: 13px; text-align: center; margin: 14px 2px 0; line-height: 1.5; }
-      .foot code { font-family: var(--mono); font-size: 12px; color: var(--accent); }
-      .done { text-align: center; font-size: 22px; font-weight: 650; }
-      .done--ok { color: var(--green); } .done--no { color: var(--red); }
-      .sub { text-align: center; color: var(--muted); font-size: 14px; margin: 8px 0 18px; }
-      .payload { display: grid; gap: 8px; background: color-mix(in srgb, var(--muted) 8%, transparent); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+      .b {
+        font: inherit; font-size: 16px; font-weight: 600; padding: 17px; border-radius: var(--radius);
+        border: 2px solid var(--ink); cursor: pointer; transition: transform .06s ease; box-shadow: var(--shadow-line);
+      }
+      .b:active { transform: translate(2px, 2px); box-shadow: none; }
+      .b--ok { background: var(--green-soft); color: var(--green); }
+      .b--no { background: var(--clay-soft); color: var(--clay); }
+      .b--again { background: transparent; color: var(--ink-2); width: 100%; margin-top: 18px; font-size: 14px; padding: 13px; box-shadow: none; border-style: dashed; }
+      .foot { color: var(--ink-2); font-size: 13px; text-align: center; margin: 14px 2px 0; line-height: 1.5; }
+      .foot code { font-family: var(--mono); font-size: 12px; color: var(--green); }
+      .done { text-align: center; font-family: var(--display); font-size: 22px; font-weight: 560; }
+      .done--ok { color: var(--green); } .done--no { color: var(--clay); }
+      .sub { text-align: center; color: var(--ink-2); font-size: 14px; margin: 8px 0 18px; }
+      .payload {
+        display: grid; gap: 8px; background: var(--bg); border: 1.5px solid var(--line);
+        border-radius: var(--radius); padding: 14px;
+      }
       .payload > div { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-      .payload span { color: var(--muted); font-size: 12.5px; }
-      .payload code { font-family: var(--mono); font-size: 12.5px; color: var(--text); }
+      .payload span { color: var(--ink-2); font-size: 12.5px; font-family: var(--pixel); font-size: 9px; text-transform: uppercase; letter-spacing: .03em; }
+      .payload code { font-family: var(--mono); font-size: 12.5px; color: var(--ink); }
     </style>
   </head>
   <body>
     <main class="wrap">
-      <div class="brand">Ohu</div>
+      <div class="brand">Ohu · Atestación</div>
       <div id="app" class="card" aria-busy="false"></div>
     </main>
     <script type="module" src="/src/attest.ts"></script>
