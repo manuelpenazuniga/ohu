@@ -28,7 +28,7 @@ use std::str::FromStr;
 
 use ohu_contracts::ohu_vault::{OhuVault, OhuVaultHostRef};
 
-const LOTE_ID: u64 = 4; // lote 4 fresco para el E2E limpio de agentes P1-2 (bicolumna PROPONE→AUTORIZA)
+// lote_id se lee de SIM_LOTE_ID (default 4) en main — para el simulador de semana (F8).
 const SHARE_MOTES: u64 = 10_000_000_000; // 10 CSPR — share del comprador
 const BOND_MOTES: u64 = 10_000_000_000; // 10 CSPR — bono >= target (8 CSPR con indemnity_bps=8000)
 const CALL_GAS: u64 = 10_000_000_000; // 10 CSPR techo de gas por llamada
@@ -42,6 +42,12 @@ fn step(env: &HostEnv, caller: Address, label: &str) {
 fn main() {
     let env = odra_casper_livenet_env::env();
 
+    // F8: lote_id configurable por SIM_LOTE_ID (default 4) para sembrar varios lotes.
+    let lote_id: u64 = std::env::var("SIM_LOTE_ID")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(4);
+
     // Camino feliz vía tally (W2-4): NO usa approvers (el M-de-N quedó vestigial).
     let buyer = env.get_account(0);
     let admin = env.get_account(1);
@@ -51,30 +57,30 @@ fn main() {
     let address = Address::from_str(&pkg).expect("OHUVAULT_PACKAGE_HASH inválido");
     let mut contract: OhuVaultHostRef = OhuVault::load(&env, address);
 
-    println!("== Lote E2E (id={LOTE_ID}) sobre {pkg} ==");
+    println!("== Lote E2E (id={lote_id}) sobre {pkg} ==");
     let bal_before = env.balance_of(&producer);
     println!("producer balance inicial: {bal_before}");
 
     // 1. open_lote — admin registra el lote y su productor.
     step(&env, admin, "open_lote");
-    contract.open_lote(LOTE_ID, producer);
+    contract.open_lote(lote_id, producer);
 
     // 2. deposit_to_lote — el comprador deposita su share (payable, earmarked INV-7).
     step(&env, buyer, "deposit_to_lote (share)");
     contract
         .with_tokens(U512::from(SHARE_MOTES))
-        .deposit_to_lote(LOTE_ID);
+        .deposit_to_lote(lote_id);
 
     // 3. post_bond — el productor deposita el bono (payable). Sigue en OPEN.
     step(&env, producer, "post_bond (bono) -> sigue OPEN");
     contract
         .with_tokens(U512::from(BOND_MOTES))
-        .post_bond(LOTE_ID);
+        .post_bond(lote_id);
 
     // 4. lock_lote — admin cierra la ventana de fondeo -> FUNDED (W2-4).
     step(&env, admin, "lock_lote -> FUNDED");
-    contract.lock_lote(LOTE_ID);
-    println!("   lote_state = {} (FUNDED)", contract.lote_state(LOTE_ID));
+    contract.lock_lote(lote_id);
+    println!("   lote_state = {} (FUNDED)", contract.lote_state(lote_id));
 
     // 5. Esperar el cierre de la ventana de atestación. CAMINO FELIZ: NADIE atesta
     //    negativo -> silencio = recibido -> tally negativo = 0 -> EVAL_OK.
@@ -89,15 +95,15 @@ fn main() {
     // 6. evaluate_lote — disparador PARAMÉTRICO: silencio -> EVAL_OK (INV-2: lo autoriza
     //    el tally, no un humano ni M-de-N).
     step(&env, admin, "evaluate_lote -> EVAL_OK");
-    contract.evaluate_lote(LOTE_ID);
+    contract.evaluate_lote(lote_id);
     println!(
         "   lote_state = {} (esperado 4 = EVAL_OK)",
-        contract.lote_state(LOTE_ID)
+        contract.lote_state(lote_id)
     );
 
     // 7. release_to_producer — admin ejecuta (state==EVAL_OK) -> SETTLED_OK (+ prima al pool).
     step(&env, admin, "release_to_producer -> SETTLED_OK");
-    contract.release_to_producer(LOTE_ID);
+    contract.release_to_producer(lote_id);
 
     let bal_after = env.balance_of(&producer);
     println!("\nproducer balance final: {bal_after}");
@@ -105,5 +111,5 @@ fn main() {
         "delta bruto esperado: share+bond - prima = {} - 0.5%·funded (premium_bps) motes",
         SHARE_MOTES + BOND_MOTES
     );
-    println!("\n✅ E2E FELIZ (vía tally) COMPLETO: lote {LOTE_ID} liquidado (SETTLED_OK), escrow al producer, prima al MutualPool.");
+    println!("\n✅ E2E FELIZ (vía tally) COMPLETO: lote {lote_id} liquidado (SETTLED_OK), escrow al producer, prima al MutualPool.");
 }
