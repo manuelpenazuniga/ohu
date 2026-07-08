@@ -1,27 +1,45 @@
-# Ohu — agentic cooperative procurement + a parametric mutual, on Casper
+<div align="center">
 
-> Small buyers pool weekly demand; small producers bid and post a performance bond; delivery is
-> confirmed by **gasless multi-party attestations**; settlement and indemnification are **arithmetic
-> over weighted attestations, never human claims adjustment**. An LLM swarm orchestrates — **the
-> contract authorizes. No capital ever moves on a model's judgment.**
+<img src="img/A3%20logo_ohu.png" alt="The Ohu tui, wearing its straw hat" width="130" />
+
+# Ohu
+
+**Harvests are better bought together.**
+
+Agentic cooperative procurement + a parametric mutual, on Casper.
+An LLM swarm runs the season — **the contract authorizes. No capital ever moves on a model's judgment.**
 
 ![Odra tests](https://img.shields.io/badge/odra%20tests-206%20passing-brightgreen)
 ![Agent tests](https://img.shields.io/badge/agent%20tests-24%20passing-brightgreen)
+![Web tests](https://img.shields.io/badge/web%20tests-8%20passing-brightgreen)
 ![Network](https://img.shields.io/badge/live-Casper%20Testnet-blue)
+![Design](https://img.shields.io/badge/design-El%20Almanaque-C65530)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-Built for the **Casper Agentic Buildathon 2026**. Everything below is built on what is **live on
-Casper Testnet today** — no dependency on unreleased tech.
+[**Why Ohu**](#why-ohu-exists) · [**Tour**](#the-tour) · [**How it works**](#how-a-batch-works) · [**Can't rug you**](#why-an-agent-cant-rug-you) · [**On Testnet**](#live-on-casper-testnet) · [**Quickstart**](#quickstart) · [**Roadmap**](#roadmap)
+
+*Built for the Casper Agentic Buildathon 2026 — on what is live on Casper Testnet **today**, no unreleased tech on the critical path.*
+
+</div>
 
 ---
 
-## The problem
+<div align="center">
+
+<img src="img/screenshots/landing.png" alt="The Ohu Almanac — landing page with pixel-art field, real on-chain season figures" width="820" />
+
+*The Cooperative Almanac. Every figure printed on it is a real `casper-test` transaction — nothing fictional.*
+
+</div>
+
+## Why Ohu exists
 
 Small restaurants and producers who pool purchasing already exist (buying clubs, WhatsApp groups) and
 die at the same three points — exactly the three Ohu puts on-chain, and *only* those:
 
 1. **Who holds the money?** A human coordinator with the group's bank account is counterparty risk no
-   small business accepts at scale. → escrow in a contract `purse`, **earmarked per batch**.
+   small business accepts at scale. → escrow in a contract `purse`, **earmarked per batch** — a batch's
+   funds go to its producer or back to its buyers, nowhere else.
 2. **What happens when the order doesn't arrive?** On a $4,000 batch, a claims adjuster or a lawsuit
    costs more than the batch. Nobody insures this — so it doesn't exist. → **parametric** settlement
    over weighted multi-party attestations: arithmetic, not adjudication.
@@ -32,9 +50,33 @@ Everything else (batch formation, RFQ, communication) stays **off-chain**, where
 points only at the fly that is actually a tank: **enforcement between distrusting small parties who
 can't afford traditional enforcement.**
 
----
+## The tour
 
-## How it works
+Three chapters, one demo — from a restaurant joining the crew to a batch settled hands-free by agents:
+
+| ii · Join the ohu | i · The cooperative cycle |
+|---|---|
+| <img src="img/screenshots/onboarding.png" alt="Onboarding: a tui mascot guides a 4-step planting wizard" width="420" /> | <img src="img/screenshots/cycle.png" alt="The cooperative cycle: seed to barn, with the contract entrypoint of every stage" width="420" /> |
+| A restaurant joins in 4 planting steps — sow your demand, **stamp the ledger** (Ed25519, gasless). Every step opens an honest *"under the hood"* of what happens on-chain. | Seed → Sprout → Flower → Harvest → Barn. Each stage names the **exact entrypoint** that runs it, and three rubber stamps explain why nobody can rug you. |
+
+<div align="center">
+
+<img src="img/screenshots/control-room.png" alt="Swarm Control Room: the full batch lifecycle with real transaction hashes and a SETTLED stamp" width="820" />
+
+*iii · The Swarm Control Room — batch #4's full season, every row a real Testnet transaction, sealed `SETTLED ON CASPER`.*
+
+</div>
+
+Run it locally and click through:
+
+```bash
+pnpm --dir web install && pnpm --dir web dev
+# /               → The Almanac (landing)
+# /onboarding.html → Join the ohu (deep-linkable: ?step=3&name=Cafe%20Aroha&demand=tomato:20)
+# /dashboard.html  → Swarm Control Room   ·   append ?theme=dark for the night-field palette
+```
+
+## How a batch works
 
 ```
    buyers                producer            operator (agent)         admin (native multisig)
@@ -66,20 +108,17 @@ OPEN ──lock_lote(operator/admin)──▶ FUNDED ──evaluate_lote(after w
 
 - **Attestations are gasless.** A buyer signs off-chain (Ed25519 + domain separation over
   `verifying_contract` + `chain_id` + `valid_before`) and the operator relays it on-chain, paying gas.
-  The buyer never needs CSPR. *(This is the pre-agreed, on-chain-verified signature scheme;* ***EIP-712
-  typed-data is on the roadmap***, *not yet implemented — see Honest scope.)*
+  The buyer never needs CSPR. *(EIP-712 typed-data is on the roadmap — see [Honest scope](#honest-scope).)*
 - **Silence = received.** Not attesting counts as "delivered fine." Only an active, weighted negative
   attestation opens the claim path. This reflects reality and eliminates griefing-by-inaction.
 - **The producer's bond is the primary payer of a failure.** It must cover the indemnity target
   (`bond ≥ target`, enforced at `lock_lote`). The mutual is a tail backstop — the one who failed pays
   first.
 
----
-
 ## Why an agent can't rug you
 
 The whole point of an *agentic* system that moves money: a jailbroken LLM must not be able to touch
-capital. Ohu enforces this on-chain, not by trust. The invariants:
+capital. Ohu enforces this on-chain, not by trust:
 
 | # | Invariant | How it's enforced |
 |---|---|---|
@@ -94,7 +133,9 @@ capital. Ohu enforces this on-chain, not by trust. The invariants:
 > **The LLM orchestrates; the contract authorizes.** This is the answer to the buildathon's core
 > question: *how do you let autonomous agents operate real money without a jailbreak ruining anyone?*
 
----
+And we didn't just claim it — we attacked it. **3 real attacks were sent to Testnet and reverted by the
+contract** (`CapExceeded`, `NotAdmin`, `LoteNotFailable`), hashes included, in the Control Room's
+red-team section.
 
 ## Live on Casper Testnet
 
@@ -115,45 +156,38 @@ Two full batch lifecycles were executed end-to-end on-chain:
   `withdraw_settlement` (buyer refunded + indemnified from the slashed bond). **No human evaluated a
   claim.**
 
-All 14 transaction hashes are in [`infra/deployments/testnet.md`](infra/deployments/testnet.md).
-
----
+All transaction hashes are in [`infra/deployments/testnet.md`](infra/deployments/testnet.md).
 
 ## The agent swarm
 
-Three agents, each with its own Casper account (on-chain identity). The split is deliberate:
+Four agents, each with its own on-chain identity and a deliberately narrow authority — the split is the
+security model:
 
 | Agent | LLM does (well) | Deterministic / on-chain (authoritative) |
 |---|---|---|
-| **Agregador** | normalize fuzzy demand → structured spec; form batches; run RFQ dialogue; explain | RFQ clearing; spec validation |
-| **Tesorería** | monitor windows; handle exceptions; narrate decisions | triggers `evaluate_lote` / `release_to_producer` / `settle_failure` — **all gated on-chain; if the agent lies, they revert** |
-| **Mutual/Riesgo** | draft solvency reports; propose premium changes to governance | collect premium; slash bond; watch reserve |
+| **Aggregator** | normalize fuzzy natural-language demand → structured spec; explain | batching is deterministic bin-packing; RFQ clearing picks the winner; `open_lote` |
+| **Treasury** | watch the delivery window; narrate decisions | fires `evaluate_lote` — can only **propose** what the tally already says (INV-2) |
+| **Authorizer** | — (it's the admin identity, not a model) | executes `release_to_producer` / `settle_failure` after the on-chain tally (INV-1) |
+| **Mutual / Risk** | draft solvency reports; propose premium changes to governance | read-only observer — the premium is changed by the admin, not the model |
 
-> **Honest status:** the three agents are on the **roadmap** (next milestone). What exists today is the
-> **contract layer** (fully deployed + exercised on Testnet) and the **x402 rail**. The security
-> guarantee they rely on (INV-1/INV-2) is *already enforced on-chain*, independent of any agent.
+A batch (#4) was **settled hands-free** by this swarm on Testnet: the Treasury proposed, the Authorizer
+executed, the mutual banked its premium — the full trace is the Control Room's opening screen.
 
----
-
-## x402: the reputation oracle (Rail B)
+## x402: the reputation oracle
 
 A genuine [x402](https://www.casper.network/ai) pay-per-request service: producers' reputation sold
 per HTTP request, using `@make-software/casper-x402` with a failover facilitator (hosted → local).
 The server declares its **non-escrow semantics** at `/health` (INV-4): x402 charges for an HTTP
-service, it *never* settles escrow. 24 tests cover the 402-shape, failover, idempotent settle, and the
-non-escrow invariant. The oracle now derives each producer's score from **real on-chain settlement
-history** (via CSPR.cloud: `open_lote` → producer, `release_to_producer` = OK, `settle_failure` = FAIL),
-with a seed fallback only when no CSPR.cloud key is configured. Verified live: producer `33518b62…`
-returns `4 lotes · 2 OK · 1 FAIL · score 73` `asOfBlock 8425485`.
-
----
+service, it *never* settles escrow. The oracle derives each producer's score from **real on-chain
+settlement history** (via CSPR.cloud), with a seed fallback only when no key is configured.
+Verified live: producer `33518b62…` returns `4 lotes · 2 OK · 1 FAIL · score 73` `asOfBlock 8425485`.
 
 ## Quickstart
 
 ```bash
 just setup     # Rust + wasm32 + cargo-odra, Node/pnpm
 just build     # build contracts + agents
-just test      # 206 Odra tests + 24 agent tests + 1 web
+just test      # 206 Odra tests + 24 agent tests + 8 web tests
 just lint      # clippy (-D warnings) + typecheck
 ```
 
@@ -161,52 +195,54 @@ Deploy + run the on-chain batch lifecycle (requires `casper-client`, `binaryen`/
 Testnet account, and a `.env` — see `infra/.env.example`):
 
 ```bash
-bash infra/scripts/deploy_testnet.sh                       # deploy OhuVault v2 + MutualPool (MVP-lowered wasm)
+bash infra/scripts/deploy_testnet.sh                       # deploy OhuVault v2 + MutualPool
 cargo run --bin ohu_livenet_e2e --features livenet         # happy path E2E
 cargo run --bin ohu_livenet_e2e_fail --features livenet    # failure path E2E (indemnifies by rule)
 ```
 
 **Repo layout:** `contracts/` (Odra/Rust — `OhuVault`, `MutualPool`, `attestation`) ·
-`agents/` (TypeScript — x402 rail) · `web/` (dashboard, roadmap) · `infra/` (deploy, deployment
-records) · `docs/` (product spec `ohu.md`, tech due-diligence `techs-specs.md`, state `docs/ESTADO.md`).
-
----
+`agents/` (TypeScript — swarm + x402 rail) · `web/` (the almanac: landing, onboarding, control room) ·
+`infra/` (deploy, deployment records) · `docs/` (product spec [`ohu.md`](ohu.md), tech due-diligence
+[`techs-specs.md`](techs-specs.md), state [`docs/ESTADO.md`](docs/ESTADO.md)).
 
 ## Honest scope
 
 What is **100% real** (deployed + exercised on Testnet): the contracts, the earmarked purse escrow, the
 weighted-attestation parametric settlement (both happy and failure paths), the native account multisig
-model, and the x402 oracle rail.
+model, the 4-agent swarm settling a batch hands-free, the web almanac, and the x402 oracle rail.
 
 **Honestly bounded / on the roadmap:**
 
 - **Attestations are Ed25519 + domain separation** (gasless, verified on-chain) — the pre-agreed scheme
   from the tech due-diligence. **EIP-712 typed-data is on the roadmap**, not yet implemented. (The x402
   rail *does* use real EIP-712 for its payment authorizations — that's a separate, correct thing.)
-- **The 3 agents and the dashboard are on the roadmap.** The contract layer that makes them safe is
-  already live.
 - **`Reputation` and `CoopRegistry` contracts are on the roadmap.** Governance params currently live in
   `OhuVault::init`.
 - The demo runs a small seeded panel of buyers/producers; delivery is represented by signed
   attestations — which is the *real* mechanism, not a shortcut.
 
----
-
 ## Roadmap
 
-- **Live now:** the contract layer + on-chain E2E, the **Tesorería/Autorizador agents** (a batch settled
-  hands-free on Testnet), the **Swarm Control Room dashboard**, and the **reputation oracle over real
-  on-chain history** (CSPR.cloud).
-- **Live now (cont.):** the **Agregador** agent — natural-language demand → 1 LLM call (Gemini) → batch
-  → RFQ → `open_lote` on-chain (the LLM only normalizes; a deterministic clearing picks the winner, proven
-  by an adversarial test) — and the **Mutual/Riesgo** solvency agent. The 4-agent swarm is live.
-- **Next:** QR gasless mobile attestation; native admin multisig (Part B).
-- **Later:** EIP-712 typed-data attestations; `Reputation`/`CoopRegistry` contracts; Ohu as an **MCP
-  server** (a market for other agents).
-
-<!-- TODO(human): demo video link · DoraHacks BUIDL page · X / Telegram -->
+- [x] Contract layer on Testnet: earmarked escrow, parametric settlement, both E2E paths
+- [x] Red-team: 3 real attacks reverted on-chain
+- [x] 4-agent swarm — a batch settled hands-free (Treasury proposes, Authorizer executes)
+- [x] Aggregator: natural-language demand → deterministic batching → `open_lote`
+- [x] Reputation oracle over real on-chain history (x402, CSPR.cloud)
+- [x] QR gasless mobile attestation (Ed25519 in the browser)
+- [x] Ohu MCP server — Ohu as a market for other agents
+- [x] "El Almanaque" web: landing + onboarding + Swarm Control Room
+- [ ] Native admin multisig (associated keys, Part B)
+- [ ] EIP-712 typed-data attestations
+- [ ] `Reputation` / `CoopRegistry` contracts
 
 ---
 
-Docs: [`ohu.md`](ohu.md) (product) · [`techs-specs.md`](techs-specs.md) (feasibility due-diligence) ·
-[`docs/ESTADO.md`](docs/ESTADO.md) (build state). License: MIT.
+<div align="center">
+
+*Set in Fraunces & Instrument Sans · figures in IBM Plex Mono · pixel art grown in-house · no purple gradients were harmed making this repo.*
+
+**ohu** *(Māori, noun)* — a communal work party called to get a hard job done.
+
+[`ohu.md`](ohu.md) (product) · [`techs-specs.md`](techs-specs.md) (feasibility) · [`docs/ESTADO.md`](docs/ESTADO.md) (build state) · MIT license
+
+</div>
